@@ -4,6 +4,8 @@ Thumbs.db
 .env.*
 !.env.example
 node_modules/
+.venv*/
+__pycache__/
 dist/
 coverage/
 *.log
