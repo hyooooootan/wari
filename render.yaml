@@ -13,19 +13,13 @@ services:
         value: 3.11.10
       - key: OCR_HOST
         value: 0.0.0.0
+      - key: OCR_BACKEND
+        value: gemini
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GEMINI_OCR_MODEL
+        value: gemini-2.5-flash
       - key: OCR_CORS_ORIGIN
         value: "*"
       - key: OCR_MAX_BODY_SIZE
         value: "10485760"
-      - key: LOCAL_OCR_MAX_SIDE
-        value: "720"
-      - key: LOCAL_OCR_DET_LIMIT
-        value: "480"
-      - key: LOCAL_OCR_DET_MODEL
-        value: PP-OCRv6_tiny_det
-      - key: LOCAL_OCR_REC_MODEL
-        value: PP-OCRv6_small_rec
-      - key: PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK
-        value: "True"
-      - key: PADDLE_PDX_ENABLE_MKLDNN_BYDEFAULT
-        value: "0"

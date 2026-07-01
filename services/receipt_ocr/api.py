@@ -3,19 +3,20 @@ import json
 import os
 import re
 import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
-
-try:
-    from services.receipt_ocr.core import read_receipt_from_data_url, read_receipt_from_path
-except ImportError:
-    from core import read_receipt_from_data_url, read_receipt_from_path
 
 
 HOST = os.environ.get("OCR_HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT", os.environ.get("OCR_PORT", "4190")))
 MAX_BODY_SIZE = int(os.environ.get("OCR_MAX_BODY_SIZE", str(10 * 1024 * 1024)))
+OCR_BACKEND = os.environ.get("OCR_BACKEND", "gemini").lower()
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+GEMINI_OCR_MODEL = os.environ.get("GEMINI_OCR_MODEL", "gemini-2.5-flash")
 
 
 class ReceiptOcrHandler(BaseHTTPRequestHandler):
@@ -39,6 +40,7 @@ class ReceiptOcrHandler(BaseHTTPRequestHandler):
                 200,
                 {
                     "service": "receipt-ocr",
+                    "backend": OCR_BACKEND,
                     "endpoints": {
                         "POST /ocr": "multipart image, raw image body, or JSON image_path/image_data_url",
                         "GET /health": "health check",
@@ -58,6 +60,9 @@ class ReceiptOcrHandler(BaseHTTPRequestHandler):
             result = self.read_ocr_request()
             result.pop("ocr_lines", None)
             self.send_json(200, result)
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            self.send_json(502, {"error": "ocr_provider_error", "message": detail[:1000]})
         except Exception as exc:
             self.send_json(400, {"error": "ocr_failed", "message": str(exc)})
 
@@ -80,11 +85,15 @@ class ReceiptOcrHandler(BaseHTTPRequestHandler):
             raise ValueError("JSON must include image_path or image_data_url")
 
         if content_type.startswith("multipart/form-data"):
-            image_bytes, suffix = parse_multipart_image(body, content_type)
+            image_bytes, media_type, suffix = parse_multipart_image(body, content_type)
+            if use_gemini_backend():
+                return read_receipt_from_data_url(to_data_url_from_bytes(image_bytes, media_type))
             return read_temp_image(image_bytes, suffix)
 
         if content_type.startswith("image/") or content_type == "application/octet-stream":
             suffix = suffix_from_content_type(content_type)
+            if use_gemini_backend():
+                return read_receipt_from_data_url(to_data_url_from_bytes(body, content_type))
             return read_temp_image(body, suffix)
 
         raise ValueError(f"unsupported content type: {content_type}")
@@ -117,9 +126,17 @@ def parse_multipart_image(body, content_type):
             continue
         content = content.rstrip(b"\r\n")
         suffix = suffix_from_headers(headers)
-        return content, suffix
+        media_type = media_type_from_headers(headers)
+        return content, media_type, suffix
 
     raise ValueError("multipart field named image or file is required")
+
+
+def media_type_from_headers(headers):
+    type_match = re.search(r"Content-Type:\s*([^\r\n;]+)", headers, re.I)
+    if type_match:
+        return type_match.group(1).strip()
+    return "image/jpeg"
 
 
 def suffix_from_headers(headers):
@@ -164,6 +181,158 @@ def read_temp_image(image_bytes, suffix):
             pass
 
 
+def read_receipt_from_data_url(image_data_url):
+    if use_gemini_backend():
+        return read_receipt_with_gemini(image_data_url)
+    if OCR_BACKEND not in ("local", "auto"):
+        raise RuntimeError("OCR_BACKEND must be gemini, local, or auto.")
+    return read_receipt_from_data_url_local(image_data_url)
+
+
+def read_receipt_from_path(path):
+    if use_gemini_backend():
+        return read_receipt_with_gemini(to_data_url(path))
+    if OCR_BACKEND not in ("local", "auto"):
+        raise RuntimeError("OCR_BACKEND must be gemini, local, or auto.")
+    return read_receipt_from_path_local(path)
+
+
+def use_gemini_backend():
+    if OCR_BACKEND == "gemini":
+        return True
+    if OCR_BACKEND == "auto" and GEMINI_API_KEY:
+        return True
+    return False
+
+
+def read_receipt_from_data_url_local(image_data_url):
+    try:
+        from services.receipt_ocr.core import read_receipt_from_data_url as read_local
+    except ImportError:
+        from core import read_receipt_from_data_url as read_local
+    return read_local(image_data_url)
+
+
+def read_receipt_from_path_local(path):
+    try:
+        from services.receipt_ocr.core import read_receipt_from_path as read_local
+    except ImportError:
+        from core import read_receipt_from_path as read_local
+    return read_local(path)
+
+
+def read_receipt_with_gemini(image_data_url):
+    if not GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY is not set")
+    mime_type, base64_data = split_data_url(image_data_url)
+    request_payload = {
+        "contents": [
+            {
+                "parts": [
+                    {"text": receipt_prompt()},
+                    {"inlineData": {"mimeType": mime_type, "data": base64_data}},
+                ]
+            }
+        ],
+        "generationConfig": {
+            "responseMimeType": "application/json",
+            "responseSchema": receipt_schema(),
+        },
+    }
+    model = urllib.parse.quote(GEMINI_OCR_MODEL, safe="")
+    api_key = urllib.parse.quote(GEMINI_API_KEY, safe="")
+    req = urllib.request.Request(
+        f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}",
+        data=json.dumps(request_payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=60) as response:
+        response_json = json.loads(response.read().decode("utf-8"))
+
+    parsed = json.loads(extract_gemini_text(response_json))
+    return {
+        "store_name": parsed.get("store_name"),
+        "total_amount": parsed.get("total_amount"),
+        "subtotal_amount": parsed.get("subtotal_amount"),
+        "paid_at": parsed.get("paid_at"),
+        "paid_time": parsed.get("paid_time"),
+        "items": parsed.get("items", []),
+        "confidence": parsed.get("confidence", 0),
+        "notes": parsed.get("notes", ""),
+        "model": GEMINI_OCR_MODEL,
+    }
+
+
+def receipt_prompt():
+    return (
+        "日本のレシート画像から、店名、購入日時、小計または合計、商品名を読み取ってください。"
+        "合計より下、支払い方法、お預り、お釣り、ポイント、カード控えは無視してください。"
+        "total_amountには、支払い情報ではなくレシート上部の合計または小計を入れてください。"
+        "読めない項目はnullまたは空配列にしてください。"
+    )
+
+
+def receipt_schema():
+    return {
+        "type": "object",
+        "properties": {
+            "store_name": {"type": "string", "nullable": True},
+            "total_amount": {"type": "integer", "nullable": True},
+            "subtotal_amount": {"type": "integer", "nullable": True},
+            "paid_at": {"type": "string", "nullable": True},
+            "paid_time": {"type": "string", "nullable": True},
+            "items": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "amount": {"type": "integer", "nullable": True},
+                    },
+                    "required": ["name", "amount"],
+                },
+            },
+            "confidence": {"type": "number"},
+            "notes": {"type": "string"},
+        },
+        "required": [
+            "store_name",
+            "total_amount",
+            "subtotal_amount",
+            "paid_at",
+            "paid_time",
+            "items",
+            "confidence",
+            "notes",
+        ],
+    }
+
+
+def split_data_url(image_data_url):
+    header, _, base64_data = image_data_url.partition(",")
+    if not base64_data or ";base64" not in header:
+        raise ValueError("invalid image data URL")
+    mime_type = header.removeprefix("data:").split(";")[0] or "image/jpeg"
+    return mime_type, base64_data
+
+
+def extract_gemini_text(response_json):
+    for candidate in response_json.get("candidates", []):
+        for part in candidate.get("content", {}).get("parts", []):
+            if part.get("text"):
+                return part["text"]
+    raise ValueError("Gemini response has no text")
+
+
+def to_data_url_from_bytes(image_bytes, media_type):
+    media_type = media_type.split(";", 1)[0].strip().lower()
+    if media_type == "application/octet-stream":
+        media_type = "image/jpeg"
+    data = base64.b64encode(image_bytes).decode("ascii")
+    return f"data:{media_type};base64,{data}"
+
+
 def to_data_url(path):
     suffix = Path(path).suffix.lower().lstrip(".")
     if suffix == "jpg":
@@ -175,6 +344,7 @@ def to_data_url(path):
 def main():
     server = ThreadingHTTPServer((HOST, PORT), ReceiptOcrHandler)
     print(f"Receipt OCR server running at http://{HOST}:{PORT}/")
+    print(f"OCR backend: {OCR_BACKEND}")
     print("POST an image to /ocr as multipart field 'image', raw image body, or JSON image_path/image_data_url.")
     server.serve_forever()
 

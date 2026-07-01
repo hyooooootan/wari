@@ -25,12 +25,13 @@
 │  └─ styles.css
 ├─ functions/api/[[path]].js   # Cloudflare Pages Functions API
 ├─ db/schema.sql               # Cloudflare D1 / SQLite schema
-├─ services/receipt_ocr/       # Render等に載せるローカルOCRサーバー候補
+├─ services/receipt_ocr/       # Render Free向けGemini OCR中継
 │  ├─ api.py                   # HTTP API: /ocr, /api/ocr-receipt
-│  ├─ core.py                  # PaddleOCR読み取り・レシート解析
+│  ├─ core.py                  # ローカル実験用PaddleOCR読み取り・レシート解析
 │  ├─ probe.py                 # 画像がレシートっぽいか確認する実験CLI
 │  ├─ .python-version
-│  └─ requirements.txt
+│  ├─ requirements.txt         # Render Free向けGemini中継
+│  └─ requirements-local.txt   # ローカル実験用PaddleOCR
 ├─ server.py                   # ローカル確認用の静的サーバー + OCRプロキシ
 ├─ render.yaml                 # Render Free向けOCRサービスBlueprint
 ├─ wrangler.toml               # Cloudflare Pages / D1 設定
@@ -123,14 +124,16 @@ OCR_BACKEND=auto
 
 `local` は `services/receipt_ocr/` の PaddleOCR を使います。`openai` は `OPENAI_API_KEY`、`gemini` は `GEMINI_API_KEY` が必要です。
 
-### 3. ローカル/Render向けのPaddleOCR
+### 3. Render Free向けのGemini中継
 
-OpenAI APIを使わない実験用に、PaddleOCR版を `services/receipt_ocr/` に分離しています。
+Render Free では `services/receipt_ocr/` を Gemini API へ画像を渡す中継サーバーとして使います。Render 側でPaddleOCRのモデル読み込みは行いません。
 
 ```powershell
 python -m venv .venv
 .\\.venv\\Scripts\\Activate.ps1
 pip install -r services/receipt_ocr/requirements.txt
+$env:OCR_BACKEND="gemini"
+$env:GEMINI_API_KEY="..."
 python -m services.receipt_ocr.api
 ```
 
@@ -141,7 +144,15 @@ POST http://127.0.0.1:4190/ocr
 POST http://127.0.0.1:4190/api/ocr-receipt
 ```
 
-Render Free に載せる場合は、この `services/receipt_ocr` をサービス単位として扱う想定です。ただし PaddleOCR は重いので、無料枠では起動が遅い・スリープ復帰が遅い・メモリ不足になる可能性があります。
+OpenAI APIやGemini APIを使わない検証用に、PaddleOCR版も同じ入口から起動できます。その場合は `services/receipt_ocr/requirements-local.txt` を使います。
+
+```powershell
+pip install -r services/receipt_ocr/requirements-local.txt
+$env:OCR_BACKEND="local"
+python -m services.receipt_ocr.api
+```
+
+Render Free に載せる場合は、この `services/receipt_ocr` をサービス単位として扱います。
 
 Render Blueprintを使う場合は、ルートの `render.yaml` を選べば `wari-receipt-ocr` というWeb Serviceが作られます。手動作成する場合は以下です。
 
@@ -151,6 +162,14 @@ Build Command: pip install -r requirements.txt
 Start Command: python api.py
 Health Check Path: /health
 Plan: Free
+```
+
+Render の環境変数には以下を設定します。
+
+```text
+OCR_BACKEND=gemini
+GEMINI_API_KEY=...
+GEMINI_OCR_MODEL=gemini-2.5-flash
 ```
 
 ## データ構成
