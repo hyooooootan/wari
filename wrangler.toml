@@ -5,4 +5,4 @@ pages_build_output_dir = "public"
 [[d1_databases]]
 binding = "DB"
 database_name = "wari-db"
-database_id = "replace-with-cloudflare-d1-database-id"
+database_id = "ed1dac53-aa0c-4a31-a2e8-3ebb29b68e38"

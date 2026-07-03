@@ -40,6 +40,18 @@
 
 OCR本体は `services/receipt_ocr/` に寄せています。ルート直下には、アプリ本体の設定・ローカル起動・Cloudflare設定を置く方針です。
 
+## 三段方式
+
+公開前の基本構成は以下です。
+
+```text
+public/                      # フロントエンド
+functions/api/[[path]].js     # バックエンド
+db/schema.sql                 # DB
+```
+
+詳しくは [docs/three-tier.md](docs/three-tier.md) にまとめています。
+
 ## ローカル起動
 
 軽い確認には、Pythonのローカルサーバーで起動できます。
@@ -54,8 +66,8 @@ Cloudflare Pages Functions と D1 をローカル確認する場合は Wrangler 
 
 ```powershell
 npm install
-npm run d1:migrate:local
-npm run dev
+npm run db:local
+npm run dev:cloudflare
 ```
 
 ## Cloudflare設定

@@ -4,6 +4,7 @@ const db = loadLocal();
 let draftNames = [];
 let currentSlide = 0;
 let selectedStoreId = null;
+let activeProjectId = null;
 let isCloud = false;
 let isSaving = false;
 
@@ -224,7 +225,7 @@ function nav() {
 }
 
 function membersSlide(p, d) {
-  return `<section class="slide" data-index="0"><h2>参加者</h2><form id="member-form" class="sheet"><div class="name-add"><input id="member-name" class="input" required placeholder="名前を入力"><button class="square-btn" aria-label="参加者を追加">＋</button></div></form><div class="stack">${d.members.map((m, i) => `<div class="row"><span class="avatar">${i + 1}</span><div class="row-main"><b>${esc(m.name)}</b></div><button class="btn danger small" data-del-member="${m.id}">削除</button></div>`).join("") || `<div class="empty">参加者を追加</div>`}</div></section>`;
+  return `<section class="slide" data-index="0"><h2>参加者</h2><form id="member-form" class="sheet"><div class="name-add"><input id="member-name" class="input" required placeholder="名前を入力"><button class="square-btn" aria-label="参加者を追加">＋</button></div></form><div class="stack">${d.members.map((m, i) => `<div class="row"><span class="avatar">${i + 1}</span><div class="row-main"><b class="editable-text" data-edit-member="${m.id}" title="ダブルクリックで修正">${esc(m.name)}</b></div><button class="btn danger small" data-del-member="${m.id}">削除</button></div>`).join("") || `<div class="empty">参加者を追加</div>`}</div></section>`;
 }
 
 function storesSlide(p, d) {
@@ -233,13 +234,13 @@ function storesSlide(p, d) {
     const payments = d.payments.filter((x) => x.expense_id === store.id);
     const paymentTotal = payments.reduce((s, x) => s + x.amount, 0);
     const memberOptions = d.members.map((m) => `<option value="${m.id}">${esc(m.name)}</option>`).join("");
-    return `<section class="slide store-detail" data-index="1"><button class="detail-back" data-store-back>← お店一覧</button><div class="store-heading"><div><h2>${esc(store.store_name)}</h2><div class="meta">${store.paid_at}</div></div><div class="store-total"><small>合計</small><b class="amount">${yen(store.total_amount)}</b></div></div><section class="account-section"><h3>支払い</h3><form id="payment-form" class="compact-form"><input id="payment-expense" type="hidden" value="${store.id}"><select id="payment-member" required>${memberOptions}</select><input id="payment-amount" class="input" type="number" min="1" inputmode="numeric" required placeholder="金額"><button class="square-btn" aria-label="支払いを追加">＋</button></form><div class="payment-lines">${payments.map((x) => `<div class="payment-row"><span>${esc(member(d, x.member_id))}</span><b>${yen(x.amount)}</b><button class="ghost" data-del-payment="${x.id}" aria-label="${esc(member(d, x.member_id))}の支払いを削除">×</button></div>`).join("") || `<div class="empty">支払いを入力</div>`}</div></section><div class="receipt-total"><div><span>お店の合計</span><b>${yen(store.total_amount)}</b></div><div><span>支払い合計</span><b>${yen(paymentTotal)}</b></div>${store.total_amount !== paymentTotal ? `<div class="difference"><span>支払いの残り</span><b>${yen(store.total_amount - paymentTotal)}</b></div>` : ""}</div><button class="btn danger store-delete" data-del-expense="${store.id}">このお店を削除</button></section>`;
+    return `<section class="slide store-detail" data-index="1"><button class="detail-back" data-store-back>← お店一覧</button><div class="store-heading"><div><h2 class="editable-text" data-edit-store-name="${store.id}" title="ダブルクリックで修正">${esc(store.store_name)}</h2><div class="meta">${store.paid_at}</div></div><div class="store-total"><small>合計</small><b class="amount editable-amount" data-edit-store-total="${store.id}" title="ダブルクリックで修正">${yen(store.total_amount)}</b></div></div><section class="account-section"><h3>支払い</h3><form id="payment-form" class="compact-form"><input id="payment-expense" type="hidden" value="${store.id}"><select id="payment-member" required>${memberOptions}</select><input id="payment-amount" class="input" type="number" min="1" inputmode="numeric" required placeholder="金額"><button class="square-btn" aria-label="支払いを追加">＋</button></form><div class="payment-lines">${payments.map((x) => `<div class="payment-row"><span>${esc(member(d, x.member_id))}</span><b class="payment-amount editable-amount" data-edit-payment="${x.id}" title="ダブルクリックで修正">${yen(x.amount)}</b><button class="ghost" data-del-payment="${x.id}" aria-label="${esc(member(d, x.member_id))}の支払いを削除">×</button></div>`).join("") || `<div class="empty">支払いを入力</div>`}</div></section><div class="receipt-total"><div><span>お店の合計</span><b class="editable-amount" data-edit-store-total="${store.id}" title="ダブルクリックで修正">${yen(store.total_amount)}</b></div><div><span>支払い合計</span><b>${yen(paymentTotal)}</b></div>${store.total_amount !== paymentTotal ? `<div class="difference"><span>支払いの残り</span><b>${yen(store.total_amount - paymentTotal)}</b></div>` : ""}</div><button class="btn danger store-delete" data-del-expense="${store.id}">このお店を削除</button></section>`;
   }
   const opts = d.members.map((m) => `<option value="${m.id}">${esc(m.name)}</option>`).join("");
   const cards = d.expenses
     .map((e) => {
       const payers = [...new Set(d.payments.filter((x) => x.expense_id === e.id).map((x) => member(d, x.member_id)))].join("・");
-      return `<button class="store-card" data-store="${e.id}"><span class="store-icon">店</span><span class="store-card-main"><b>${esc(e.store_name)}</b><small>${esc(payers || "支払い未入力")}</small></span><span class="amount">${yen(e.total_amount)}</span><span class="chevron">›</span></button>`;
+      return `<div class="store-card" data-store="${e.id}" role="button" tabindex="0"><span class="store-icon">店</span><span class="store-card-main"><b>${esc(e.store_name)}</b><small>${esc(payers || "支払い未入力")}</small></span><span class="amount">${yen(e.total_amount)}</span><span class="chevron">›</span></div>`;
     })
     .join("");
   return `<section class="slide" data-index="1"><div class="section-title"><h2>お店</h2><span>${d.expenses.length}店</span></div><form id="expense-form" class="sheet"><h3>お店を追加</h3><div class="field"><label for="store">店名</label><input id="store" class="input" required placeholder="例：ローソン"></div><div class="two"><div class="field"><label for="amount">合計金額</label><input id="amount" class="input" type="number" min="1" inputmode="numeric" required placeholder="0"></div><div class="field"><label for="payer">最初の支払者</label><select id="payer" required>${opts}</select></div></div>${ocrBox("expense")}<button class="btn primary" ${d.members.length ? "" : "disabled"}>追加</button></form><div class="store-list">${cards || `<div class="empty">お店を追加</div>`}</div></section>`;
@@ -266,8 +267,10 @@ function render() {
   document.querySelector("#app").innerHTML = p ? renderDetail(p) : renderHome();
   if (p) {
     const slides = document.querySelector("#slides");
+    slides.style.scrollBehavior = "auto";
+    slides.scrollLeft = currentSlide * slides.clientWidth;
     requestAnimationFrame(() => {
-      slides.scrollLeft = currentSlide * slides.clientWidth;
+      slides.style.scrollBehavior = "";
     });
     slides.addEventListener(
       "scroll",
@@ -298,6 +301,12 @@ async function route() {
     return;
   }
   const pid = location.hash.match(/^#\/p\/(.+)$/)?.[1];
+  if (pid && activeProjectId !== pid) {
+    activeProjectId = pid;
+    selectedStoreId = null;
+    currentSlide = 2;
+  }
+  if (!pid) activeProjectId = null;
   if (pid && isCloud && !db.members.some((x) => x.project_id === pid)) {
     try {
       await loadProject(pid);
@@ -415,6 +424,13 @@ document.addEventListener("submit", (e) => {
 });
 
 document.addEventListener("click", async (e) => {
+  const storeCard = e.target.closest(".store-card");
+  if (storeCard) {
+    selectedStoreId = storeCard.dataset.store;
+    currentSlide = 1;
+    render();
+    return;
+  }
   const t = e.target.closest("button");
   if (!t) return;
   if (t.dataset.addName !== undefined) addDraftName();
@@ -425,7 +441,7 @@ document.addEventListener("click", async (e) => {
   if (t.dataset.quick) createQuick();
   if (t.dataset.open) {
     selectedStoreId = null;
-    currentSlide = 0;
+    currentSlide = 2;
     location.hash = `#/p/${t.dataset.open}`;
   }
   if (t.dataset.home !== undefined) {
@@ -499,12 +515,141 @@ document.addEventListener("click", async (e) => {
   }
 });
 
+document.addEventListener("dblclick", (e) => {
+  const textEl = e.target.closest("[data-edit-member], [data-edit-store-name]");
+  if (textEl) {
+    const p = project();
+    const record = editableTextRecord(textEl);
+    if (!p || !record) return;
+    const input = document.createElement("input");
+    input.className = "input inline-text";
+    input.type = "text";
+    input.value = record.value;
+    input.dataset.textEditKind = record.kind;
+    input.dataset.textEditId = record.id;
+    textEl.replaceWith(input);
+    input.focus();
+    input.select();
+    return;
+  }
+  const el = e.target.closest("[data-edit-payment], [data-edit-store-total]");
+  const p = project();
+  if (!el || !p) return;
+  const record = editableAmountRecord(el);
+  if (!record) return;
+  const input = document.createElement("input");
+  input.className = "input inline-amount";
+  input.type = "number";
+  input.min = "1";
+  input.inputMode = "numeric";
+  input.value = record.value;
+  input.dataset.amountEditKind = record.kind;
+  input.dataset.amountEditId = record.id;
+  el.replaceWith(input);
+  input.focus();
+  input.select();
+});
+
 document.addEventListener("keydown", (e) => {
   if (e.key === "Enter" && e.target.id === "draft-name") {
     e.preventDefault();
     addDraftName();
   }
+  if (e.target.dataset.amountEditId) {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      e.target.dataset.amountEditDone = "1";
+      commitAmountEdit(e.target);
+    }
+    if (e.key === "Escape") {
+      e.target.dataset.amountEditCancel = "1";
+      render();
+    }
+  }
+  if (e.target.dataset.textEditId) {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      e.target.dataset.textEditDone = "1";
+      commitTextEdit(e.target);
+    }
+    if (e.key === "Escape") {
+      e.target.dataset.textEditCancel = "1";
+      render();
+    }
+  }
 });
+
+document.addEventListener("blur", (e) => {
+  if (e.target.dataset.amountEditCancel || e.target.dataset.amountEditDone) return;
+  if (e.target.dataset.amountEditId) commitAmountEdit(e.target);
+  if (e.target.dataset.textEditCancel || e.target.dataset.textEditDone) return;
+  if (e.target.dataset.textEditId) commitTextEdit(e.target);
+}, true);
+
+function editableTextRecord(el) {
+  if (el.dataset.editMember) {
+    const person = db.members.find((x) => x.id === el.dataset.editMember);
+    return person ? { kind: "member", id: person.id, value: person.name } : null;
+  }
+  if (el.dataset.editStoreName) {
+    const store = db.expenses.find((x) => x.id === el.dataset.editStoreName);
+    return store ? { kind: "storeName", id: store.id, value: store.store_name } : null;
+  }
+  return null;
+}
+
+function commitTextEdit(input) {
+  const p = project();
+  if (!p) return render();
+  const value = input.value.trim();
+  if (!value) return render();
+  if (input.dataset.textEditKind === "member") {
+    const person = db.members.find((x) => x.id === input.dataset.textEditId);
+    if (!person) return render();
+    person.name = value;
+    persistProject(p.id, "参加者名を修正しました");
+    return;
+  }
+  if (input.dataset.textEditKind === "storeName") {
+    const store = db.expenses.find((x) => x.id === input.dataset.textEditId);
+    if (!store) return render();
+    store.store_name = value;
+    persistProject(p.id, "お店の名前を修正しました");
+  }
+}
+
+function editableAmountRecord(el) {
+  if (el.dataset.editPayment) {
+    const payment = db.expense_payments.find((x) => x.id === el.dataset.editPayment);
+    return payment ? { kind: "payment", id: payment.id, value: payment.amount } : null;
+  }
+  if (el.dataset.editStoreTotal) {
+    const store = db.expenses.find((x) => x.id === el.dataset.editStoreTotal);
+    return store ? { kind: "store", id: store.id, value: store.total_amount } : null;
+  }
+  return null;
+}
+
+function commitAmountEdit(input) {
+  const p = project();
+  if (!p) return render();
+  const amount = Number(input.value);
+  if (!amount || amount < 1) return render();
+  if (input.dataset.amountEditKind === "payment") {
+    const payment = db.expense_payments.find((x) => x.id === input.dataset.amountEditId);
+    if (!payment) return render();
+    payment.amount = amount;
+    persistProject(p.id, "支払い金額を修正しました");
+    return;
+  }
+  if (input.dataset.amountEditKind === "store") {
+    const store = db.expenses.find((x) => x.id === input.dataset.amountEditId);
+    if (!store) return render();
+    store.total_amount = amount;
+    persistProject(p.id, "お店の合計を修正しました");
+  }
+}
+
 document.addEventListener("change", (e) => {
   if (e.target.matches("[data-ocr-target]")) handleReceiptOcr(e.target);
 });
