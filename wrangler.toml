@@ -5,4 +5,4 @@ pages_build_output_dir = "public"
 [[d1_databases]]
 binding = "DB"
 database_name = "wari-db"
-database_id = "ed1dac53-aa0c-4a31-a2e8-3ebb29b68e38"
+database_id = "413a32b9-7357-4569-b487-a0080bca4e36"
