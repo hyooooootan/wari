@@ -223,10 +223,23 @@ async function readReceiptWithOpenAI(imageDataUrl, env) {
       store_name: { type: ["string", "null"], description: "レシートの店名。読めない場合はnull。" },
       total_amount: { type: ["integer", "null"], description: "税込の最終支払金額。円単位。読めない場合はnull。" },
       paid_at: { type: ["string", "null"], description: "支払日。YYYY-MM-DD形式。読めない場合はnull。" },
+      items: {
+        type: "array",
+        description: "レシートの購入品目。合計、税、値引、支払い方法、預り金、釣銭、ポイントは含めない。",
+        items: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            name: { type: "string", description: "品目名。" },
+            amount: { type: "integer", description: "品目の税込金額。円単位。" },
+          },
+          required: ["name", "amount"],
+        },
+      },
       confidence: { type: "number", description: "0から1の推定信頼度。" },
       notes: { type: "string", description: "読み取り時の注意点。なければ空文字。" },
     },
-    required: ["store_name", "total_amount", "paid_at", "confidence", "notes"],
+    required: ["store_name", "total_amount", "paid_at", "items", "confidence", "notes"],
   };
   const openaiRes = await fetch("https://api.openai.com/v1/responses", {
     method: "POST",
@@ -299,9 +312,11 @@ async function readReceiptWithGemini(imageDataUrl, env) {
 
 function receiptOcrPrompt() {
   return (
-    "日本のレシート画像から、店名、税込の最終支払金額、支払日を読み取ってください。" +
+    "日本のレシート画像から、店名、税込の最終支払金額、支払日、購入品目を読み取ってください。" +
     "合計、総合計、現計、クレジット支払額、電子マネー支払額など最終的に支払った金額を優先してください。" +
-    "預り金、釣銭、ポイント、税額、小計をtotal_amountにしないでください。"
+    "預り金、釣銭、ポイント、税額、小計をtotal_amountにしないでください。" +
+    "itemsには購入した商品の名前と税込金額を入れてください。合計、税、値引、支払い方法、預り金、釣銭、ポイントはitemsに含めないでください。" +
+    "品目が読めない場合はitemsを空配列にしてください。"
   );
 }
 
@@ -312,10 +327,22 @@ function geminiReceiptSchema() {
       store_name: { type: "string", nullable: true, description: "レシートの店名。読めない場合はnull。" },
       total_amount: { type: "integer", nullable: true, description: "税込の最終支払金額。円単位。読めない場合はnull。" },
       paid_at: { type: "string", nullable: true, description: "支払日。YYYY-MM-DD形式。読めない場合はnull。" },
+      items: {
+        type: "array",
+        description: "レシートの購入品目。合計、税、値引、支払い方法、預り金、釣銭、ポイントは含めない。",
+        items: {
+          type: "object",
+          properties: {
+            name: { type: "string", description: "品目名。" },
+            amount: { type: "integer", description: "品目の税込金額。円単位。" },
+          },
+          required: ["name", "amount"],
+        },
+      },
       confidence: { type: "number", description: "0から1の推定信頼度。" },
       notes: { type: "string", description: "読み取り時の注意点。なければ空文字。" },
     },
-    required: ["store_name", "total_amount", "paid_at", "confidence", "notes"],
+    required: ["store_name", "total_amount", "paid_at", "items", "confidence", "notes"],
   };
 }
 

@@ -5,6 +5,7 @@ let draftNames = [];
 let currentSlide = 0;
 let selectedStoreId = null;
 let activeProjectId = null;
+const ocrDraftItems = { draft: [], expense: [] };
 let isCloud = false;
 let isSaving = false;
 
@@ -159,13 +160,32 @@ function calculate(pid) {
   const shares = {};
   d.payments.forEach((p) => (advances[p.member_id] = (advances[p.member_id] || 0) + p.amount));
   d.expenses.forEach((expense) => {
+    const expenseItems = d.items.filter((x) => x.expense_id === expense.id);
+    shares[expense.id] = [];
+    if (expenseItems.length) {
+      expenseItems.forEach((item) => {
+        const linked = d.links.filter((x) => x.item_id === item.id).map((x) => x.member_id);
+        const mids = linked.length ? linked : d.members.map((m) => m.id);
+        shares[item.id] = splitAmount(item.amount, mids).map((share) => {
+          burdens[share.mid] = (burdens[share.mid] || 0) + share.amount;
+          return share;
+        });
+      });
+      const itemSum = expenseItems.reduce((s, x) => s + Number(x.amount || 0), 0);
+      const rest = Number(expense.total_amount || 0) - itemSum;
+      if (rest > 0) {
+        const mids = d.members.map((m) => m.id);
+        shares[expense.id] = splitAmount(rest, mids).map((share) => {
+          burdens[share.mid] = (burdens[share.mid] || 0) + share.amount;
+          return share;
+        });
+      }
+      return;
+    }
     const mids = d.members.map((m) => m.id);
-    const base = mids.length ? Math.floor(expense.total_amount / mids.length) : 0;
-    let rem = mids.length ? expense.total_amount % mids.length : 0;
-    shares[expense.id] = mids.map((mid) => {
-      const amount = base + (rem-- > 0 ? 1 : 0);
-      burdens[mid] = (burdens[mid] || 0) + amount;
-      return { mid, amount };
+    shares[expense.id] = splitAmount(expense.total_amount, mids).map((share) => {
+      burdens[share.mid] = (burdens[share.mid] || 0) + share.amount;
+      return share;
     });
   });
   const balances = d.members.map((m) => ({
@@ -190,6 +210,12 @@ function calculate(pid) {
   return { ...d, shares, balances, transfers };
 }
 
+function splitAmount(amount, mids) {
+  const base = mids.length ? Math.floor(Number(amount || 0) / mids.length) : 0;
+  let rem = mids.length ? Number(amount || 0) % mids.length : 0;
+  return mids.map((mid) => ({ mid, amount: base + (rem-- > 0 ? 1 : 0) }));
+}
+
 function shell(body) {
   return `<div class="app"><header class="topbar"><div class="brand"><span class="logo">W</span>Wari</div><span id="save-status" class="meta">${statusText()}</span></header>${body}</div>`;
 }
@@ -205,7 +231,61 @@ function renderStatus() {
 }
 
 function ocrBox(target) {
-  return `<div class="ocr-box"><div class="ocr-actions"><label class="ocr-button"><input type="file" accept="image/*" data-ocr-target="${target}"><span>写真を選択</span></label><label class="ocr-button secondary"><input type="file" accept="image/*" capture="environment" data-ocr-target="${target}"><span>撮影する</span></label></div><div id="${target}-ocr-status" class="ocr-status"></div></div>`;
+  return `<div class="ocr-box"><div class="ocr-actions"><label class="ocr-button"><input type="file" accept="image/*" data-ocr-target="${target}"><span>写真を選択</span></label><label class="ocr-button secondary"><input type="file" accept="image/*" capture="environment" data-ocr-target="${target}"><span>撮影する</span></label></div><div id="${target}-ocr-status" class="ocr-status"></div><div id="${target}-ocr-items" class="ocr-items">${ocrItemsHtml(target)}</div></div>`;
+}
+
+function ocrItemsHtml(target) {
+  const items = ocrDraftItems[target] || [];
+  if (!items.length) return "";
+  const sum = items.reduce((s, x) => s + Number(x.amount || 0), 0);
+  return `<div class="ocr-items-head"><span>読み取り品目</span><b>${yen(sum)}</b></div>${items.map((item, i) => `<div class="ocr-item-row" data-ocr-row="${i}"><input class="input" data-ocr-item-name="${i}" value="${esc(item.name)}" placeholder="品目"><input class="input" data-ocr-item-amount="${i}" type="number" min="0" inputmode="numeric" value="${Number(item.amount || 0)}" placeholder="金額"><button class="ghost" type="button" data-remove-ocr-item="${target}:${i}" aria-label="${esc(item.name)}を外す">×</button></div>`).join("")}<div class="ocr-items-note">保存時は全員負担として登録します</div>`;
+}
+
+function setOcrItems(target, items) {
+  ocrDraftItems[target] = cleanReceiptItems(items);
+  renderOcrItems(target);
+}
+
+function renderOcrItems(target) {
+  const el = document.querySelector(`#${target}-ocr-items`);
+  if (el) el.innerHTML = ocrItemsHtml(target);
+}
+
+function cleanReceiptItems(items) {
+  return (Array.isArray(items) ? items : [])
+    .map((item) => ({ name: String(item.name || "").trim(), amount: Math.round(Number(item.amount || 0)) }))
+    .filter((item) => item.name && item.amount > 0)
+    .slice(0, 30);
+}
+
+function collectOcrItems(target) {
+  const rows = [...document.querySelectorAll(`#${target}-ocr-items [data-ocr-row]`)];
+  if (!rows.length) return ocrDraftItems[target] || [];
+  return rows
+    .map((row) => ({
+      name: row.querySelector("[data-ocr-item-name]")?.value.trim() || "",
+      amount: Math.round(Number(row.querySelector("[data-ocr-item-amount]")?.value || 0)),
+    }))
+    .filter((item) => item.name && item.amount > 0);
+}
+
+function addExpenseItems(projectId, expenseId, items, memberIds) {
+  cleanReceiptItems(items).forEach((item) => {
+    const itemId = id("itm");
+    db.items.push({ id: itemId, project_id: projectId, expense_id: expenseId, name: item.name, amount: item.amount, created_at: now() });
+    memberIds.forEach((memberId) => db.item_members.push({ id: id("im"), project_id: projectId, item_id: itemId, member_id: memberId, created_at: now() }));
+  });
+}
+
+function storeItemsHtml(store, d, c) {
+  const items = d.items.filter((x) => x.expense_id === store.id);
+  if (!items.length) return "";
+  const sum = items.reduce((s, x) => s + Number(x.amount || 0), 0);
+  return `<section class="account-section"><h3>読み取り品目</h3><div class="receipt-lines">${items.map((item) => {
+    const names = d.links.filter((x) => x.item_id === item.id).map((x) => member(d, x.member_id));
+    const per = c.shares[item.id]?.length ? Math.max(...c.shares[item.id].map((x) => x.amount)) : 0;
+    return `<div class="receipt-item"><div><b>${esc(item.name)}</b><div class="mini-chips">${(names.length ? names : d.members.map((m) => m.name)).map((name) => `<span class="mini">${esc(name)}</span>`).join("")}</div><div class="meta">一人あたり ${yen(per)}</div></div><b>${yen(item.amount)}</b><button class="ghost" data-del-item="${item.id}" aria-label="${esc(item.name)}を削除">×</button></div>`;
+  }).join("")}</div><div class="receipt-total"><div><span>品目合計</span><b>${yen(sum)}</b></div>${sum !== store.total_amount ? `<div class="difference"><span>お店合計との差</span><b>${yen(store.total_amount - sum)}</b></div>` : ""}</div></section>`;
 }
 
 function renderHome() {
@@ -231,10 +311,11 @@ function membersSlide(p, d) {
 function storesSlide(p, d) {
   const store = d.expenses.find((e) => e.id === selectedStoreId);
   if (store) {
+    const c = calculate(p.id);
     const payments = d.payments.filter((x) => x.expense_id === store.id);
     const paymentTotal = payments.reduce((s, x) => s + x.amount, 0);
     const memberOptions = d.members.map((m) => `<option value="${m.id}">${esc(m.name)}</option>`).join("");
-    return `<section class="slide store-detail" data-index="1"><button class="detail-back" data-store-back>← お店一覧</button><div class="store-heading"><div><h2 class="editable-text" data-edit-store-name="${store.id}" title="ダブルクリックで修正">${esc(store.store_name)}</h2><div class="meta">${store.paid_at}</div></div><div class="store-total"><small>合計</small><b class="amount editable-amount" data-edit-store-total="${store.id}" title="ダブルクリックで修正">${yen(store.total_amount)}</b></div></div><section class="account-section"><h3>支払い</h3><form id="payment-form" class="compact-form"><input id="payment-expense" type="hidden" value="${store.id}"><select id="payment-member" required>${memberOptions}</select><input id="payment-amount" class="input" type="number" min="1" inputmode="numeric" required placeholder="金額"><button class="square-btn" aria-label="支払いを追加">＋</button></form><div class="payment-lines">${payments.map((x) => `<div class="payment-row"><span>${esc(member(d, x.member_id))}</span><b class="payment-amount editable-amount" data-edit-payment="${x.id}" title="ダブルクリックで修正">${yen(x.amount)}</b><button class="ghost" data-del-payment="${x.id}" aria-label="${esc(member(d, x.member_id))}の支払いを削除">×</button></div>`).join("") || `<div class="empty">支払いを入力</div>`}</div></section><div class="receipt-total"><div><span>お店の合計</span><b class="editable-amount" data-edit-store-total="${store.id}" title="ダブルクリックで修正">${yen(store.total_amount)}</b></div><div><span>支払い合計</span><b>${yen(paymentTotal)}</b></div>${store.total_amount !== paymentTotal ? `<div class="difference"><span>支払いの残り</span><b>${yen(store.total_amount - paymentTotal)}</b></div>` : ""}</div><button class="btn danger store-delete" data-del-expense="${store.id}">このお店を削除</button></section>`;
+    return `<section class="slide store-detail" data-index="1"><button class="detail-back" data-store-back>← お店一覧</button><div class="store-heading"><div><h2 class="editable-text" data-edit-store-name="${store.id}" title="ダブルクリックで修正">${esc(store.store_name)}</h2><div class="meta">${store.paid_at}</div></div><div class="store-total"><small>合計</small><b class="amount editable-amount" data-edit-store-total="${store.id}" title="ダブルクリックで修正">${yen(store.total_amount)}</b></div></div><section class="account-section"><h3>支払い</h3><form id="payment-form" class="compact-form"><input id="payment-expense" type="hidden" value="${store.id}"><select id="payment-member" required>${memberOptions}</select><input id="payment-amount" class="input" type="number" min="1" inputmode="numeric" required placeholder="金額"><button class="square-btn" aria-label="支払いを追加">＋</button></form><div class="payment-lines">${payments.map((x) => `<div class="payment-row"><span>${esc(member(d, x.member_id))}</span><b class="payment-amount editable-amount" data-edit-payment="${x.id}" title="ダブルクリックで修正">${yen(x.amount)}</b><button class="ghost" data-del-payment="${x.id}" aria-label="${esc(member(d, x.member_id))}の支払いを削除">×</button></div>`).join("") || `<div class="empty">支払いを入力</div>`}</div></section>${storeItemsHtml(store, d, c)}<div class="receipt-total"><div><span>お店の合計</span><b class="editable-amount" data-edit-store-total="${store.id}" title="ダブルクリックで修正">${yen(store.total_amount)}</b></div><div><span>支払い合計</span><b>${yen(paymentTotal)}</b></div>${store.total_amount !== paymentTotal ? `<div class="difference"><span>支払いの残り</span><b>${yen(store.total_amount - paymentTotal)}</b></div>` : ""}</div><button class="btn danger store-delete" data-del-expense="${store.id}">このお店を削除</button></section>`;
   }
   const opts = d.members.map((m) => `<option value="${m.id}">${esc(m.name)}</option>`).join("");
   const cards = d.expenses
@@ -362,7 +443,9 @@ async function handleReceiptOcr(input) {
     const amountInput = document.querySelector(target === "draft" ? "#draft-amount" : "#amount");
     if (data.store_name && storeInput) storeInput.value = data.store_name;
     if (data.total_amount && amountInput) amountInput.value = data.total_amount;
-    setOcrStatus(target, `読み取りました。確認してください。${data.notes || ""}`, "ok");
+    setOcrItems(target, data.items || []);
+    const itemCount = cleanReceiptItems(data.items).length;
+    setOcrStatus(target, `読み取りました。${itemCount ? `${itemCount}品目を候補にしました。` : ""}確認してください。${data.notes || ""}`, "ok");
     toast("レシートを読み取りました");
   } catch (err) {
     setOcrStatus(target, err.message || "読み取りに失敗しました", "error");
@@ -385,6 +468,8 @@ async function createQuick() {
   db.members.push(...members);
   db.expenses.push(expense);
   db.expense_payments.push({ id: id("pay"), project_id: p.id, expense_id: expense.id, member_id: members[payerIndex].id, amount, created_at: now() });
+  addExpenseItems(p.id, expense.id, collectOcrItems("draft"), members.map((m) => m.id));
+  ocrDraftItems.draft = [];
   draftNames = [];
   selectedStoreId = null;
   currentSlide = 2;
@@ -414,6 +499,8 @@ document.addEventListener("submit", (e) => {
     const expense = { id: id("exp"), project_id: p.id, payer_member_id: null, store_name: document.querySelector("#store").value.trim(), total_amount: amount, paid_at: now().slice(0, 10), receipt_image_url: null, created_at: now() };
     db.expenses.push(expense);
     db.expense_payments.push({ id: id("pay"), project_id: p.id, expense_id: expense.id, member_id: document.querySelector("#payer").value, amount, created_at: now() });
+    addExpenseItems(p.id, expense.id, collectOcrItems("expense"), db.members.filter((m) => m.project_id === p.id).map((m) => m.id));
+    ocrDraftItems.expense = [];
     selectedStoreId = expense.id;
     persistProject(p.id, "お店を追加しました");
   }
@@ -437,6 +524,11 @@ document.addEventListener("click", async (e) => {
   if (t.dataset.removeName !== undefined) {
     draftNames.splice(Number(t.dataset.removeName), 1);
     render();
+  }
+  if (t.dataset.removeOcrItem) {
+    const [target, rawIndex] = t.dataset.removeOcrItem.split(":");
+    ocrDraftItems[target]?.splice(Number(rawIndex), 1);
+    renderOcrItems(target);
   }
   if (t.dataset.quick) createQuick();
   if (t.dataset.open) {
@@ -470,6 +562,11 @@ document.addEventListener("click", async (e) => {
   if (t.dataset.delPayment && p) {
     db.expense_payments = db.expense_payments.filter((x) => x.id !== t.dataset.delPayment);
     persistProject(p.id, "支払いを削除しました");
+  }
+  if (t.dataset.delItem && p) {
+    db.items = db.items.filter((x) => x.id !== t.dataset.delItem);
+    db.item_members = db.item_members.filter((x) => x.item_id !== t.dataset.delItem);
+    persistProject(p.id, "品目を削除しました");
   }
   if (t.dataset.delExpense && p) {
     const ids = db.items.filter((x) => x.expense_id === t.dataset.delExpense).map((x) => x.id);

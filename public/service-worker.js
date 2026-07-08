@@ -1,9 +1,9 @@
-const CACHE_NAME = "wari-pwa-20260708-photo1";
+const CACHE_NAME = "wari-pwa-20260708-items1";
 const APP_SHELL = [
   "/",
   "/index.html",
-  "/styles.css?v=20260708-photo1",
-  "/app.js?v=20260708-photo1",
+  "/styles.css?v=20260708-items1",
+  "/app.js?v=20260708-items1",
   "/manifest.webmanifest",
   "/icons/icon.svg",
   "/icons/icon-192.png",
