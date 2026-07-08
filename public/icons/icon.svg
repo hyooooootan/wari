@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Wari">
+  <rect width="512" height="512" rx="112" fill="#2f6f4e"/>
+  <circle cx="256" cy="256" r="172" fill="#f7f5ef"/>
+  <path fill="#2f6f4e" d="M142 174h56l32 155 41-155h46l41 155 32-155h56l-58 210h-57l-37-133-37 133h-57L142 174z"/>
+  <rect x="132" y="392" width="248" height="24" rx="12" fill="#2f6f4e" opacity=".28"/>
+</svg>

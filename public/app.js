@@ -657,3 +657,9 @@ window.addEventListener("hashchange", route);
 if (!location.hash) location.hash = "#/";
 render();
 bootCloud().then(route);
+
+if ("serviceWorker" in navigator) {
+  window.addEventListener("load", () => {
+    navigator.serviceWorker.register("/service-worker.js").catch(() => {});
+  });
+}
