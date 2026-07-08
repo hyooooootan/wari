@@ -205,7 +205,7 @@ function renderStatus() {
 }
 
 function ocrBox(target) {
-  return `<div class="ocr-box"><label class="ocr-button"><input type="file" accept="image/*" capture="environment" data-ocr-target="${target}"><span>レシートから入力</span></label><div id="${target}-ocr-status" class="ocr-status"></div></div>`;
+  return `<div class="ocr-box"><div class="ocr-actions"><label class="ocr-button"><input type="file" accept="image/*" data-ocr-target="${target}"><span>写真を選択</span></label><label class="ocr-button secondary"><input type="file" accept="image/*" capture="environment" data-ocr-target="${target}"><span>撮影する</span></label></div><div id="${target}-ocr-status" class="ocr-status"></div></div>`;
 }
 
 function renderHome() {
