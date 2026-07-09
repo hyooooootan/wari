@@ -202,6 +202,7 @@ async function handleReceiptOcr(request, env) {
   }
 
   const backend = String(env.OCR_BACKEND || "auto").toLowerCase();
+  if (backend === "remote" || backend === "tesseract_ollama") return readReceiptWithRemoteOcr(imageDataUrl, env);
   if (backend === "openai") return readReceiptWithOpenAI(imageDataUrl, env);
   if (backend === "gemini") return readReceiptWithGemini(imageDataUrl, env);
   if (backend === "auto") {
@@ -210,6 +211,26 @@ async function handleReceiptOcr(request, env) {
     return json({ error: "missing_api_key", message: "OPENAI_API_KEY または GEMINI_API_KEY を Cloudflare Pages の環境変数に設定してください。" }, 503);
   }
   return json({ error: "unsupported_ocr_backend", message: "Cloudflareでは OCR_BACKEND に auto、openai、gemini を指定してください。" }, 400);
+}
+
+async function readReceiptWithRemoteOcr(imageDataUrl, env) {
+  const baseUrl = String(env.RECEIPT_OCR_API_URL || env.OCR_API_URL || "").replace(/\/+$/, "");
+  if (!baseUrl) {
+    return json({ error: "missing_receipt_ocr_api_url", message: "RECEIPT_OCR_API_URL is not set." }, 503);
+  }
+  const remoteRes = await fetch(`${baseUrl}/api/ocr-receipt`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ image_data_url: imageDataUrl }),
+  });
+  const text = await remoteRes.text();
+  let data = null;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    return json({ error: "invalid_remote_ocr_response", message: text.slice(0, 1000) }, 502);
+  }
+  return json(data, remoteRes.ok ? 200 : 502);
 }
 
 async function readReceiptWithOpenAI(imageDataUrl, env) {

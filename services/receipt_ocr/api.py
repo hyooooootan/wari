@@ -33,7 +33,14 @@ class ReceiptOcrHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = urlparse(self.path).path
         if path == "/health":
-            self.send_json(200, {"ok": True, "service": "receipt-ocr"})
+            payload = {"ok": True, "service": "receipt-ocr", "backend": OCR_BACKEND}
+            if use_tesseract_ollama_backend():
+                try:
+                    from services.receipt_ocr.tesseract_ollama import health as tesseract_ollama_health
+                except ImportError:
+                    from tesseract_ollama import health as tesseract_ollama_health
+                payload["tesseract_ollama"] = tesseract_ollama_health()
+            self.send_json(200, payload)
             return
         if path == "/":
             self.send_json(
@@ -182,18 +189,22 @@ def read_temp_image(image_bytes, suffix):
 
 
 def read_receipt_from_data_url(image_data_url):
+    if use_tesseract_ollama_backend():
+        return read_receipt_from_data_url_tesseract_ollama(image_data_url)
     if use_gemini_backend():
         return read_receipt_with_gemini(image_data_url)
     if OCR_BACKEND not in ("local", "auto"):
-        raise RuntimeError("OCR_BACKEND must be gemini, local, or auto.")
+        raise RuntimeError("OCR_BACKEND must be gemini, local, tesseract_ollama, or auto.")
     return read_receipt_from_data_url_local(image_data_url)
 
 
 def read_receipt_from_path(path):
+    if use_tesseract_ollama_backend():
+        return read_receipt_from_path_tesseract_ollama(path)
     if use_gemini_backend():
         return read_receipt_with_gemini(to_data_url(path))
     if OCR_BACKEND not in ("local", "auto"):
-        raise RuntimeError("OCR_BACKEND must be gemini, local, or auto.")
+        raise RuntimeError("OCR_BACKEND must be gemini, local, tesseract_ollama, or auto.")
     return read_receipt_from_path_local(path)
 
 
@@ -203,6 +214,26 @@ def use_gemini_backend():
     if OCR_BACKEND == "auto" and GEMINI_API_KEY:
         return True
     return False
+
+
+def use_tesseract_ollama_backend():
+    return OCR_BACKEND == "tesseract_ollama"
+
+
+def read_receipt_from_data_url_tesseract_ollama(image_data_url):
+    try:
+        from services.receipt_ocr.tesseract_ollama import read_receipt_from_data_url as read_ocr
+    except ImportError:
+        from tesseract_ollama import read_receipt_from_data_url as read_ocr
+    return read_ocr(image_data_url)
+
+
+def read_receipt_from_path_tesseract_ollama(path):
+    try:
+        from services.receipt_ocr.tesseract_ollama import read_receipt_from_path as read_ocr
+    except ImportError:
+        from tesseract_ollama import read_receipt_from_path as read_ocr
+    return read_ocr(path)
 
 
 def read_receipt_from_data_url_local(image_data_url):

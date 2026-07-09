@@ -1,56 +1,6 @@
-# Receipt OCR service
+# Receipt OCR Service
 
-Render Free では Gemini API へ画像を渡す中継サーバーとして使います。PaddleOCR はローカル実験用として同じ入口から切り替えられます。
-
-## 起動
-
-Gemini 中継として起動する場合:
-
-```powershell
-pip install -r services/receipt_ocr/requirements.txt
-$env:OCR_BACKEND="gemini"
-$env:GEMINI_API_KEY="..."
-python -m services.receipt_ocr.api
-```
-
-PaddleOCR をローカルで試す場合:
-
-```powershell
-pip install -r services/receipt_ocr/requirements-local.txt
-$env:OCR_BACKEND="local"
-python -m services.receipt_ocr.api
-```
-
-`services/receipt_ocr` をカレントディレクトリにして起動する場合:
-
-```powershell
-pip install -r requirements.txt
-python api.py
-```
-
-環境変数:
-
-```text
-PORT=4190
-OCR_HOST=0.0.0.0
-OCR_BACKEND=gemini
-GEMINI_API_KEY=...
-GEMINI_OCR_MODEL=gemini-2.5-flash
-OCR_MAX_BODY_SIZE=10485760
-OCR_CORS_ORIGIN=*
-```
-
-PaddleOCR 実験時の環境変数:
-
-```text
-OCR_BACKEND=local
-LOCAL_OCR_MAX_SIDE=720
-LOCAL_OCR_DET_LIMIT=480
-LOCAL_OCR_DET_MODEL=PP-OCRv6_tiny_det
-LOCAL_OCR_REC_MODEL=PP-OCRv6_small_rec
-```
-
-## エンドポイント
+This service exposes the same OCR entry points used by Wari:
 
 ```text
 GET  /health
@@ -58,28 +8,119 @@ POST /ocr
 POST /api/ocr-receipt
 ```
 
-`POST` は以下の形式を受け取れます。
+`POST` accepts:
 
-- `multipart/form-data` の `image` または `file`
-- `image/*` の生バイナリ
+- `multipart/form-data` field `image` or `file`
+- raw `image/*` request body
 - JSON `{ "image_data_url": "data:image/..." }`
-- JSON `{ "image_path": "C:/..." }`（ローカル検証用）
+- JSON `{ "image_path": "/path/to/image" }` for local testing
 
-## 注意
+## Tesseract + Ollama backend
 
-Render Free では `OCR_BACKEND=gemini` を使います。PaddleOCR のモデル読み込みを Render 側で行わないため、起動時の負荷を抑えられます。
+Use this backend on Oracle Cloud A1 or another VM where Tesseract and Ollama can run locally.
 
-`GEMINI_API_KEY` は Render の環境変数として登録します。リポジトリには入れません。
-
-## Render Free 用設定
-
-ルートの `render.yaml` からこのディレクトリを `rootDir` として使います。
-
-```yaml
-rootDir: services/receipt_ocr
-buildCommand: pip install -r requirements.txt
-startCommand: python api.py
-healthCheckPath: /health
+```bash
+export OCR_BACKEND=tesseract_ollama
+export OLLAMA_BASE_URL=http://127.0.0.1:11434
+export OLLAMA_MODEL=qwen2.5:3b
+export TESSERACT_LANG=jpn+eng
+python -m services.receipt_ocr.api
 ```
 
-RenderのWeb Serviceを手動作成する場合も、同じ値を設定してください。
+The API calls Ollama only through `127.0.0.1:11434`. Do not expose Ollama directly to the internet.
+
+Required system packages:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y tesseract-ocr tesseract-ocr-jpn tesseract-ocr-eng
+```
+
+Useful runtime settings:
+
+```text
+TESSERACT_CMD=tesseract
+TESSERACT_LANG=jpn+eng
+TESSERACT_TIMEOUT=30
+TESSERACT_PSM=6
+TESSERACT_OEM=1
+TESSERACT_MAX_SIDE=1800
+TESSERACT_THRESHOLD=auto
+OLLAMA_BASE_URL=http://127.0.0.1:11434
+OLLAMA_MODEL=qwen2.5:3b
+```
+
+Environment check:
+
+```bash
+python -m services.receipt_ocr.check_env
+```
+
+Expected result:
+
+```json
+{
+  "tesseract": {
+    "available": true,
+    "configured_langs_available": true
+  },
+  "ollama": {
+    "available": true
+  }
+}
+```
+
+## Response shape
+
+The canonical response is:
+
+```json
+{
+  "store_name": null,
+  "purchased_at": null,
+  "total_amount": null,
+  "items": [
+    {
+      "name": null,
+      "amount": null,
+      "quantity": null,
+      "confidence": null
+    }
+  ],
+  "warnings": []
+}
+```
+
+For existing Wari compatibility, the service also includes:
+
+```json
+{
+  "paid_at": null,
+  "paid_time": null,
+  "confidence": 0.0,
+  "notes": ""
+}
+```
+
+## Other backends
+
+Gemini image OCR:
+
+```bash
+export OCR_BACKEND=gemini
+export GEMINI_API_KEY=...
+export GEMINI_OCR_MODEL=gemini-2.5-flash
+python -m services.receipt_ocr.api
+```
+
+PaddleOCR local test backend:
+
+```bash
+pip install -r services/receipt_ocr/requirements-local.txt
+export OCR_BACKEND=local
+python -m services.receipt_ocr.api
+```
+
+## Deployment recommendation
+
+For `tesseract_ollama`, prefer Oracle Cloud A1 or another VM. Render Free is suitable for the Gemini relay backend, but it is not a good target for Ollama model residency. Cloudflare Workers should remain an API edge/storage layer, not the OCR/Ollama execution host.
