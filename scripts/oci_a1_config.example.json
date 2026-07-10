@@ -12,6 +12,7 @@
   "boot_volume_gb": 50,
   "ssh_public_key_path": "C:/Users/89bi4/.ssh/wari_oracle_codex.pub",
   "ssh_private_key_path": "C:/Users/89bi4/.ssh/wari_oracle_codex",
+  "cloud_init_script_path": "scripts/oracle_a1_bootstrap_wari_ocr.sh",
   "ssh_user": "ubuntu",
   "retry_wait_seconds": 300,
   "image_name": "Ubuntu 24.04"

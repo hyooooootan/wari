@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import base64
 import json
 import sys
 import time
@@ -39,6 +40,8 @@ CAPACITY_ERROR_MARKERS = [
     "not enough capacity",
     "capacity is not available",
     "insufficient capacity",
+    "too many requests",
+    "toomanyrequests",
 ]
 
 
@@ -100,6 +103,22 @@ def read_ssh_public_key(path):
     if "PRIVATE KEY" in public_key:
         raise ValueError("秘密鍵ではなく、SSH公開鍵 .pub を指定してください。")
     return public_key
+
+
+def read_cloud_init_user_data(settings):
+    script_path = settings.get("cloud_init_script_path")
+    if not script_path:
+        return None
+
+    path = Path(script_path).expanduser()
+    if not path.exists():
+        raise ValueError(f"cloud_init_script_path was not found: {path}")
+
+    content = path.read_bytes()
+    if not content:
+        raise ValueError("cloud_init_script_path is empty.")
+
+    return base64.b64encode(content).decode("ascii")
 
 
 def load_oci_config(settings):
@@ -194,6 +213,13 @@ def ssh_command(private_key_path, ssh_user, public_ip):
 
 
 def launch_instance(compute_client, settings, ssh_public_key):
+    metadata = {
+        "ssh_authorized_keys": ssh_public_key,
+    }
+    user_data = read_cloud_init_user_data(settings)
+    if user_data:
+        metadata["user_data"] = user_data
+
     launch_details = oci.core.models.LaunchInstanceDetails(
         availability_domain=settings["availability_domain"],
         compartment_id=settings["compartment_id"],
@@ -211,9 +237,7 @@ def launch_instance(compute_client, settings, ssh_public_key):
             subnet_id=settings["subnet_id"],
             assign_public_ip=True,
         ),
-        metadata={
-            "ssh_authorized_keys": ssh_public_key,
-        },
+        metadata=metadata,
     )
     return compute_client.launch_instance(launch_details).data
 

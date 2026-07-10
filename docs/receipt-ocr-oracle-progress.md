@@ -195,6 +195,44 @@ OCR誤字補正表の追加
 実レシートで前処理とOllama指示の調整
 ```
 
+## A1作成後の自動導入
+
+`scripts/oracle_a1_bootstrap_wari_ocr.sh` を追加した。このファイルはA1インスタンス作成時のcloud-init `user_data` として渡す。
+
+実行内容は次の通り。
+
+```text
+git
+curl
+Python
+Tesseract日本語・英語
+Ollama
+qwen2.5:3b
+Wari repository
+services/receipt_ocr Python environment
+wari-receipt-ocr systemd service
+```
+
+作成スクリプト側では `scripts/oci_create_a1_retry.py` が `cloud_init_script_path` を読み、Base64化してOCIの `user_data` へ渡す。
+
+設定例。
+
+```json
+{
+  "cloud_init_script_path": "scripts/oracle_a1_bootstrap_wari_ocr.sh"
+}
+```
+
+A1作成に成功した後、A1側で確認するコマンド。
+
+```bash
+sudo cloud-init status --long
+sudo tail -n 200 /var/log/wari-ocr-bootstrap.log
+cat /opt/wari-ocr-bootstrap-status.txt
+systemctl status wari-receipt-ocr
+curl http://127.0.0.1:4190/health
+```
+
 ## 判断
 
 Oracle A1へ追加するコードと配備手順は用意できている。次の作業は、Oracle A1へ実際に置いて実行結果を見る段階。
