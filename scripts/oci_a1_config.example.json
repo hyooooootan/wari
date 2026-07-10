@@ -1,0 +1,18 @@
+{
+  "profile": "DEFAULT",
+  "oci_config_file": "~/.oci/config",
+  "compartment_id": "ocid1.compartment.oc1..xxxxx",
+  "availability_domain": "xxxxx:AP-TOKYO-1-AD-1",
+  "subnet_id": "ocid1.subnet.oc1.ap-tokyo-1.xxxxx",
+  "image_id": "ocid1.image.oc1.ap-tokyo-1.xxxxx",
+  "display_name": "wari-ocr-a1",
+  "shape": "VM.Standard.A1.Flex",
+  "ocpus": 1,
+  "memory_gb": 6,
+  "boot_volume_gb": 50,
+  "ssh_public_key_path": "C:/Users/89bi4/.ssh/wari_oracle_codex.pub",
+  "ssh_private_key_path": "C:/Users/89bi4/.ssh/wari_oracle_codex",
+  "ssh_user": "ubuntu",
+  "retry_wait_seconds": 300,
+  "image_name": "Ubuntu 24.04"
+}
