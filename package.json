@@ -1,20 +1,25 @@
 {
   "name": "wari",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
+  "type": "module",
   "scripts": {
     "dev": "wrangler pages dev public",
     "dev:cloudflare": "wrangler pages dev public",
     "dev:static": "python server.py",
+    "test": "node --test tests/*.test.mjs",
+    "check": "npm test && node --check public/app.js && node --check public/household.js && node --check 'functions/api/[[path]].js'",
     "db:local": "wrangler d1 execute wari-db --local --file=./db/schema.sql",
     "db:remote": "wrangler d1 execute wari-db --remote --file=./db/schema.sql",
     "d1:create": "wrangler d1 create wari-db",
-    "d1:migrate:local": "wrangler d1 execute wari-db --local --file=./db/schema.sql",
-    "d1:migrate:remote": "wrangler d1 execute wari-db --remote --file=./db/schema.sql",
+    "db:migrate:local": "wrangler d1 migrations apply wari-db --local",
+    "db:migrate:remote": "wrangler d1 migrations apply wari-db --remote",
+    "d1:migrate:local": "wrangler d1 migrations apply wari-db --local",
+    "d1:migrate:remote": "wrangler d1 migrations apply wari-db --remote",
     "ocr:dev": "python -m services.receipt_ocr.api",
     "deploy": "wrangler pages deploy public --project-name=wari"
   },
   "devDependencies": {
-    "wrangler": "^4.0.0"
+    "wrangler": "^4.110.0"
   }
 }
