@@ -1,85 +1,173 @@
+PRAGMA foreign_keys = ON;
+
 CREATE TABLE IF NOT EXISTS projects (
   id TEXT PRIMARY KEY,
-  name TEXT NOT NULL,
-  created_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS members (
-  id TEXT PRIMARY KEY,
-  project_id TEXT NOT NULL,
-  name TEXT NOT NULL,
+  name TEXT NOT NULL CHECK (length(trim(name)) > 0),
+  project_type TEXT NOT NULL DEFAULT 'split' CHECK (project_type IN ('split', 'household', 'shared_household')),
+  currency TEXT NOT NULL DEFAULT 'JPY' CHECK (length(currency) = 3),
+  share_token TEXT,
+  share_role TEXT NOT NULL DEFAULT 'editor' CHECK (share_role IN ('editor', 'viewer')),
+  share_expires_at TEXT,
+  finalized_at TEXT,
   created_at TEXT NOT NULL,
-  FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+  updated_at TEXT NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_members_project_id ON members(project_id);
-
-CREATE TABLE IF NOT EXISTS expenses (
+CREATE TABLE IF NOT EXISTS project_members (
   id TEXT PRIMARY KEY,
   project_id TEXT NOT NULL,
+  display_name TEXT NOT NULL CHECK (length(trim(display_name)) > 0),
+  role TEXT NOT NULL DEFAULT 'member' CHECK (role IN ('owner', 'editor', 'member', 'viewer')),
+  is_active INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0, 1)),
+  linked_household_project_id TEXT,
+  linked_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY (project_id) REFERENCES projects(id) ON UPDATE CASCADE ON DELETE CASCADE,
+  FOREIGN KEY (linked_household_project_id) REFERENCES projects(id) ON UPDATE CASCADE ON DELETE SET NULL
+);
+
+CREATE TABLE IF NOT EXISTS transactions (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL,
+  merchant_name TEXT NOT NULL,
+  merchant_normalized TEXT NOT NULL DEFAULT '',
+  gross_amount INTEGER NOT NULL CHECK (typeof(gross_amount) = 'integer'),
+  paid_amount INTEGER NOT NULL CHECK (typeof(paid_amount) = 'integer'),
+  discount_amount INTEGER NOT NULL DEFAULT 0 CHECK (typeof(discount_amount) = 'integer'),
+  point_amount INTEGER NOT NULL DEFAULT 0 CHECK (typeof(point_amount) = 'integer'),
+  category TEXT,
+  status TEXT NOT NULL DEFAULT 'confirmed' CHECK (status IN ('provisional', 'confirmed', 'cancelled', 'refunded', 'corrected')),
+  occurred_at TEXT NOT NULL,
+  settled_at TEXT,
+  note TEXT,
+  entry_type TEXT NOT NULL DEFAULT 'purchase' CHECK (entry_type IN ('purchase', 'split_expense', 'advance', 'settlement_out', 'settlement_in', 'refund', 'adjustment')),
+  origin_project_id TEXT,
+  origin_transaction_id TEXT,
+  origin_member_id TEXT,
+  generated_automatically INTEGER NOT NULL DEFAULT 0 CHECK (generated_automatically IN (0, 1)),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY (project_id) REFERENCES projects(id) ON UPDATE CASCADE ON DELETE CASCADE,
+  FOREIGN KEY (origin_project_id) REFERENCES projects(id) ON UPDATE CASCADE ON DELETE SET NULL,
+  FOREIGN KEY (origin_transaction_id) REFERENCES transactions(id) ON UPDATE CASCADE ON DELETE SET NULL,
+  FOREIGN KEY (origin_member_id) REFERENCES project_members(id) ON UPDATE CASCADE ON DELETE SET NULL
+);
+
+CREATE TABLE IF NOT EXISTS transaction_payments (
+  id TEXT PRIMARY KEY,
+  transaction_id TEXT NOT NULL,
   payer_member_id TEXT,
-  store_name TEXT NOT NULL,
-  total_amount INTEGER NOT NULL,
-  paid_at TEXT NOT NULL,
-  receipt_image_url TEXT,
+  amount INTEGER NOT NULL CHECK (typeof(amount) = 'integer'),
+  payment_method TEXT NOT NULL DEFAULT 'other' CHECK (payment_method IN ('cash', 'credit_card', 'paypay', 'suica', 'pasmo', 'bank', 'point', 'other')),
+  provider TEXT,
+  account_label TEXT,
+  external_payment_id TEXT,
+  payment_status TEXT NOT NULL DEFAULT 'confirmed' CHECK (payment_status IN ('provisional', 'confirmed', 'cancelled', 'refunded')),
+  occurred_at TEXT NOT NULL,
   created_at TEXT NOT NULL,
-  FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY (transaction_id) REFERENCES transactions(id) ON UPDATE CASCADE ON DELETE CASCADE,
+  FOREIGN KEY (payer_member_id) REFERENCES project_members(id) ON UPDATE CASCADE ON DELETE SET NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_expenses_project_id ON expenses(project_id);
-
-CREATE TABLE IF NOT EXISTS expense_payments (
+CREATE TABLE IF NOT EXISTS transaction_items (
   id TEXT PRIMARY KEY,
-  project_id TEXT NOT NULL,
-  expense_id TEXT NOT NULL,
-  member_id TEXT NOT NULL,
-  amount INTEGER NOT NULL,
-  created_at TEXT NOT NULL,
-  FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,
-  FOREIGN KEY (expense_id) REFERENCES expenses(id) ON DELETE CASCADE,
-  FOREIGN KEY (member_id) REFERENCES members(id) ON DELETE CASCADE
-);
-
-CREATE INDEX IF NOT EXISTS idx_expense_payments_project_id ON expense_payments(project_id);
-CREATE INDEX IF NOT EXISTS idx_expense_payments_expense_id ON expense_payments(expense_id);
-
-CREATE TABLE IF NOT EXISTS items (
-  id TEXT PRIMARY KEY,
-  project_id TEXT NOT NULL,
-  expense_id TEXT NOT NULL,
+  transaction_id TEXT NOT NULL,
   name TEXT NOT NULL,
-  amount INTEGER NOT NULL,
+  amount INTEGER NOT NULL CHECK (typeof(amount) = 'integer'),
+  quantity REAL NOT NULL DEFAULT 1 CHECK (typeof(quantity) IN ('integer', 'real') AND quantity > 0),
+  item_type TEXT NOT NULL DEFAULT 'product' CHECK (item_type IN ('product', 'summary', 'adjustment')),
+  category TEXT,
+  sort_order INTEGER NOT NULL DEFAULT 0 CHECK (typeof(sort_order) = 'integer' AND sort_order >= 0),
+  is_hidden INTEGER NOT NULL DEFAULT 0 CHECK (is_hidden IN (0, 1)),
   created_at TEXT NOT NULL,
-  FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,
-  FOREIGN KEY (expense_id) REFERENCES expenses(id) ON DELETE CASCADE
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY (transaction_id) REFERENCES transactions(id) ON UPDATE CASCADE ON DELETE CASCADE
 );
 
-CREATE INDEX IF NOT EXISTS idx_items_project_id ON items(project_id);
-CREATE INDEX IF NOT EXISTS idx_items_expense_id ON items(expense_id);
+CREATE TABLE IF NOT EXISTS item_allocations (
+  id TEXT PRIMARY KEY,
+  transaction_item_id TEXT NOT NULL,
+  project_member_id TEXT NOT NULL,
+  allocated_amount INTEGER NOT NULL CHECK (typeof(allocated_amount) = 'integer'),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE (transaction_item_id, project_member_id),
+  FOREIGN KEY (transaction_item_id) REFERENCES transaction_items(id) ON UPDATE CASCADE ON DELETE CASCADE,
+  FOREIGN KEY (project_member_id) REFERENCES project_members(id) ON UPDATE CASCADE ON DELETE RESTRICT
+);
 
-CREATE TABLE IF NOT EXISTS item_members (
+CREATE TABLE IF NOT EXISTS import_records (
   id TEXT PRIMARY KEY,
   project_id TEXT NOT NULL,
-  item_id TEXT NOT NULL,
-  member_id TEXT NOT NULL,
+  transaction_id TEXT,
+  source_type TEXT NOT NULL CHECK (source_type IN ('receipt', 'gmail_notification', 'card_csv', 'paypay_csv', 'bank_csv', 'manual')),
+  source_record_id TEXT,
+  source_status TEXT NOT NULL DEFAULT 'received' CHECK (source_status IN ('received', 'parsed', 'linked', 'review', 'rejected', 'error')),
+  merchant_raw TEXT,
+  merchant_normalized TEXT,
+  gross_amount_raw INTEGER CHECK (gross_amount_raw IS NULL OR typeof(gross_amount_raw) = 'integer'),
+  paid_amount_raw INTEGER CHECK (paid_amount_raw IS NULL OR typeof(paid_amount_raw) = 'integer'),
+  occurred_at_raw TEXT,
+  settled_at_raw TEXT,
+  payment_method_raw TEXT,
+  external_transaction_id TEXT,
+  image_url TEXT,
+  raw_text TEXT,
+  raw_payload TEXT,
+  parse_confidence REAL CHECK (parse_confidence IS NULL OR (typeof(parse_confidence) IN ('integer', 'real') AND parse_confidence BETWEEN 0 AND 1)),
+  parser_version TEXT,
+  match_score INTEGER CHECK (match_score IS NULL OR typeof(match_score) = 'integer'),
+  match_reason_json TEXT,
   created_at TEXT NOT NULL,
-  FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,
-  FOREIGN KEY (item_id) REFERENCES items(id) ON DELETE CASCADE,
-  FOREIGN KEY (member_id) REFERENCES members(id) ON DELETE CASCADE
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY (project_id) REFERENCES projects(id) ON UPDATE CASCADE ON DELETE CASCADE,
+  FOREIGN KEY (transaction_id) REFERENCES transactions(id) ON UPDATE CASCADE ON DELETE SET NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_item_members_project_id ON item_members(project_id);
-CREATE INDEX IF NOT EXISTS idx_item_members_item_id ON item_members(item_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_projects_share_token
+ON projects(share_token)
+WHERE share_token IS NOT NULL;
 
-CREATE TABLE IF NOT EXISTS project_shares (
-  id TEXT PRIMARY KEY,
-  project_id TEXT NOT NULL,
-  token TEXT NOT NULL UNIQUE,
-  role TEXT NOT NULL DEFAULT 'editor',
-  expires_at TEXT,
-  created_at TEXT NOT NULL,
-  FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
-);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_transaction_payments_external_payment
+ON transaction_payments(external_payment_id)
+WHERE external_payment_id IS NOT NULL;
 
-CREATE INDEX IF NOT EXISTS idx_project_shares_project_id ON project_shares(project_id);
-CREATE INDEX IF NOT EXISTS idx_project_shares_token ON project_shares(token);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_import_records_source_record
+ON import_records(project_id, source_type, source_record_id)
+WHERE source_record_id IS NOT NULL;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_generated_household_transaction
+ON transactions(project_id, origin_project_id, origin_transaction_id, origin_member_id, entry_type)
+WHERE generated_automatically = 1;
+
+CREATE INDEX IF NOT EXISTS idx_project_members_project
+ON project_members(project_id, is_active);
+
+CREATE INDEX IF NOT EXISTS idx_transactions_project_date
+ON transactions(project_id, occurred_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_transactions_project_amount_date
+ON transactions(project_id, paid_amount, occurred_at);
+
+CREATE INDEX IF NOT EXISTS idx_transactions_project_status
+ON transactions(project_id, status, occurred_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_transaction_payments_transaction
+ON transaction_payments(transaction_id);
+
+CREATE INDEX IF NOT EXISTS idx_transaction_items_transaction
+ON transaction_items(transaction_id, sort_order);
+
+CREATE INDEX IF NOT EXISTS idx_item_allocations_item
+ON item_allocations(transaction_item_id);
+
+CREATE INDEX IF NOT EXISTS idx_import_records_project_status
+ON import_records(project_id, source_status, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_import_records_project_amount_date
+ON import_records(project_id, paid_amount_raw, occurred_at_raw);
+
+CREATE INDEX IF NOT EXISTS idx_import_records_transaction
+ON import_records(transaction_id);

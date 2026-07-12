@@ -1,391 +1,605 @@
-const emptyData = {
-  projects: [],
-  members: [],
-  expenses: [],
-  expense_payments: [],
-  items: [],
-  item_members: [],
-};
+import {
+  createProject,
+  createProjectMember,
+  createProjectShare,
+  createTransaction,
+  createTransactionItem,
+  createTransactionPayment,
+  deleteProject,
+  deleteProjectMember,
+  deleteTransaction,
+  deleteTransactionItem,
+  deleteTransactionPayment,
+  getProjectGraph,
+  getProjectSummaries,
+  getSharedProject,
+  getTransactionGraph,
+  listProjectMembers,
+  listProjects,
+  listTransactions,
+  markProjectFinalized,
+  markProjectReopened,
+  replaceItemAllocations,
+  requireProject,
+  updateMemberHouseholdLink,
+  updateProject,
+  updateProjectMember,
+  updateTransaction,
+  updateTransactionItem,
+  updateTransactionPayment,
+} from "../lib/api-data.js";
+import {
+  cancelGeneratedForSource,
+  syncSplitProjectToHouseholds,
+  syncSplitTransactionToHouseholds,
+  validateSplitProject,
+} from "../lib/household.js";
+import {
+  createCsvImports,
+  createNotificationImport,
+  createReceiptImport,
+  listImports,
+  reconcileImport,
+} from "../lib/imports.js";
+import { handleReceiptOcr } from "../lib/ocr.js";
+import { ApiError, errorResponse, json, methodNotAllowed, readJson, readOptionalJson } from "../lib/responses.js";
+
+const IMPORT_STATUSES = new Set(["received", "parsed", "linked", "review", "rejected", "error"]);
+const IMPORT_SOURCES = new Set(["receipt", "gmail_notification", "card_csv", "paypay_csv", "bank_csv", "manual"]);
+const CSV_PROFILES = new Set(["generic", "card", "paypay", "bank"]);
+const RECONCILE_ACTIONS = new Set(["link", "create", "reject", "unlink"]);
 
 export async function onRequest(context) {
-  const { request, env } = context;
-  const url = new URL(request.url);
-  const path = url.pathname.replace(/^\/api\/?/, "").split("/").filter(Boolean);
-
+  const request = context.request;
   try {
-    if (request.method === "POST" && path[0] === "ocr-receipt") {
-      return handleReceiptOcr(request, env);
+    const url = new URL(request.url);
+    const path = requestPath(url.pathname);
+    if (path[0] === "ocr-receipt" && path.length === 1) {
+      return await invoke(request, ["POST"], () => handleReceiptOcr(request, context.env || {}));
     }
+    const db = context.env?.DB;
+    if (!db) throw new ApiError(500, "missing_d1_binding");
+    return await dispatch(request, db, url, path);
+  } catch (error) {
+    return errorResponse(error);
+  }
+}
 
-    if (!env.DB) return json({ error: "missing_d1_binding" }, 500);
+async function dispatch(request, db, url, path) {
+  if (path[0] === "projects") return dispatchProjects(request, db, url, path);
+  if (path[0] === "share" && path.length === 2) {
+    return invoke(request, ["GET"], async () => json(await getSharedProject(db, path[1])));
+  }
+  if ((path[0] === "project-members" || path[0] === "members") && path.length >= 2) {
+    return dispatchMember(request, db, path);
+  }
+  if (path[0] === "transactions" && path.length >= 2) {
+    return dispatchTransaction(request, db, path);
+  }
+  if ((path[0] === "transaction-payments" || path[0] === "payments") && path.length === 2) {
+    return dispatchPayment(request, db, path[1]);
+  }
+  if ((path[0] === "transaction-items" || path[0] === "items") && path.length >= 2) {
+    return dispatchItem(request, db, path);
+  }
+  if (path[0] === "imports" && path.length === 3 && path[2] === "reconcile") {
+    return invoke(request, ["POST"], () => handleReconcile(request, db, path[1]));
+  }
+  return json({ error: "not_found" }, 404);
+}
 
-    if (request.method === "GET" && path[0] === "projects" && path.length === 1) {
-      return json(await listProjects(env.DB));
+async function dispatchProjects(request, db, url, path) {
+  if (path.length === 1) {
+    if (request.method === "GET") return json(await listProjects(db));
+    if (request.method === "POST") return json(await createProject(db, await readJson(request)), 201);
+    return methodNotAllowed(["GET", "POST"]);
+  }
+  const projectId = path[1];
+  if (path.length === 2) {
+    if (request.method === "GET") {
+      const graph = await getProjectGraph(db, projectId);
+      if (graph.projects.length === 0) throw new ApiError(404, "not_found");
+      return json(graph);
     }
+    if (request.method === "PATCH") {
+      const result = await updateProject(db, projectId, await readJson(request));
+      if (result.project.project_type !== "split") await cancelGeneratedForSource(db, projectId);
+      else await syncSplitProjectToHouseholds(db, projectId, { validate: false });
+      return json(result);
+    }
+    if (request.method === "DELETE") {
+      await cancelGeneratedForSource(db, projectId);
+      return json(await deleteProject(db, projectId));
+    }
+    return methodNotAllowed(["GET", "PATCH", "DELETE"]);
+  }
+  if (path[2] === "share" && path.length === 3) {
+    return invoke(request, ["POST"], async () => json(await createProjectShare(db, projectId, await readOptionalJson(request))));
+  }
+  if (path[2] === "members") return dispatchProjectMembers(request, db, url, path);
+  if (path[2] === "transactions") return dispatchProjectTransactions(request, db, url, path);
+  if (path[2] === "imports") return dispatchProjectImports(request, db, url, path);
+  if (path[2] === "summaries" && path.length === 3) {
+    return invoke(request, ["GET"], async () => json(await getProjectSummaries(db, projectId)));
+  }
+  if (path[2] === "finalize" && path.length === 3) {
+    return invoke(request, ["POST"], () => finalizeProject(db, projectId));
+  }
+  if (path[2] === "reopen" && path.length === 3) {
+    return invoke(request, ["POST"], () => reopenProject(db, projectId));
+  }
+  return json({ error: "not_found" }, 404);
+}
 
-    if (request.method === "POST" && path[0] === "projects" && path.length === 1) {
-      const data = await request.json();
-      await saveProjectGraph(env.DB, normalizeGraph(data));
+async function dispatchProjectMembers(request, db, url, path) {
+  const projectId = path[1];
+  if (path.length === 3) {
+    if (request.method === "GET") {
+      assertQueryFields(url.searchParams, new Set(["include_inactive"]));
+      const includeInactive = booleanQuery(url.searchParams.get("include_inactive"), "include_inactive", false);
+      return json(await listProjectMembers(db, projectId, includeInactive));
+    }
+    if (request.method === "POST") return json(await createProjectMember(db, projectId, await readJson(request)), 201);
+    return methodNotAllowed(["GET", "POST"]);
+  }
+  if (path.length === 4) {
+    if (request.method === "PATCH") {
+      const result = await updateProjectMember(db, path[3], await readJson(request), projectId);
+      await syncSplitProjectToHouseholds(db, projectId, { validate: false });
+      return json(result);
+    }
+    if (request.method === "DELETE") {
+      const result = await deleteProjectMember(db, path[3], projectId);
+      await syncSplitProjectToHouseholds(db, projectId, { validate: false });
+      return json(result);
+    }
+    return methodNotAllowed(["PATCH", "DELETE"]);
+  }
+  return json({ error: "not_found" }, 404);
+}
+
+async function dispatchMember(request, db, path) {
+  const memberId = path[1];
+  if (path.length === 2) {
+    if (request.method === "PATCH") {
+      const result = await updateProjectMember(db, memberId, await readJson(request));
+      await syncSplitProjectToHouseholds(db, result.project_member.project_id, { validate: false });
+      return json(result);
+    }
+    if (request.method === "DELETE") {
+      const member = await memberProject(db, memberId);
+      const result = await deleteProjectMember(db, memberId);
+      await syncSplitProjectToHouseholds(db, member.project_id, { validate: false });
+      return json(result);
+    }
+    return methodNotAllowed(["PATCH", "DELETE"]);
+  }
+  if (path.length === 3 && path[2] === "household-link") {
+    return invoke(request, ["PATCH"], async () => {
+      const result = await updateMemberHouseholdLink(db, memberId, await readJson(request));
+      await syncSplitProjectToHouseholds(db, result.project_member.project_id, { validate: false });
+      return json(result);
+    });
+  }
+  return json({ error: "not_found" }, 404);
+}
+
+async function dispatchProjectTransactions(request, db, url, path) {
+  const projectId = path[1];
+  if (path.length === 3) {
+    if (request.method === "GET") return json(await listTransactions(db, projectId, url.searchParams));
+    if (request.method === "POST") {
+      const result = await createTransaction(db, projectId, await readJson(request));
+      await syncSplitTransactionToHouseholds(db, result.transaction.id, { validate: false });
+      return json(result, 201);
+    }
+    return methodNotAllowed(["GET", "POST"]);
+  }
+  if (path.length === 4) {
+    await assertTransactionProject(db, path[3], projectId);
+    return dispatchTransaction(request, db, ["transactions", path[3]]);
+  }
+  return json({ error: "not_found" }, 404);
+}
+
+async function dispatchTransaction(request, db, path) {
+  const transactionId = path[1];
+  if (path.length === 2) {
+    if (request.method === "GET") return json(await getTransactionGraph(db, transactionId));
+    if (request.method === "PATCH") {
+      const result = await updateTransaction(db, transactionId, await readJson(request));
+      await syncSplitTransactionToHouseholds(db, transactionId, { validate: false });
+      return json(result);
+    }
+    if (request.method === "DELETE") {
+      const result = await deleteTransaction(db, transactionId);
+      await syncSplitTransactionToHouseholds(db, transactionId, { sourceProjectId: result.project_id, validate: false });
       return json({ ok: true });
     }
-
-    if (path[0] === "projects" && path[1]) {
-      const projectId = path[1];
-      if (request.method === "GET" && path.length === 2) {
-        const graph = await getProjectGraph(env.DB, projectId);
-        if (!graph.projects.length) return json({ error: "not_found" }, 404);
-        return json(graph);
-      }
-      if (request.method === "PUT" && path.length === 2) {
-        const data = await request.json();
-        const graph = normalizeGraph(data);
-        if (!graph.projects.some((p) => p.id === projectId)) return json({ error: "project_id_mismatch" }, 400);
-        await saveProjectGraph(env.DB, graph);
-        return json({ ok: true });
-      }
-      if (request.method === "DELETE" && path.length === 2) {
-        await deleteProject(env.DB, projectId);
-        return json({ ok: true });
-      }
-      if (request.method === "POST" && path[2] === "share") {
-        const share = await createShare(env.DB, projectId);
-        return json(share);
-      }
+    return methodNotAllowed(["GET", "PATCH", "DELETE"]);
+  }
+  if (path[2] === "payments") {
+    if (path.length === 3) {
+      return invoke(request, ["POST"], async () => json(await createTransactionPayment(db, transactionId, await readJson(request)), 201));
     }
-
-    if (request.method === "GET" && path[0] === "share" && path[1]) {
-      const share = await getShare(env.DB, path[1]);
-      if (!share) return json({ error: "not_found" }, 404);
-      const graph = await getProjectGraph(env.DB, share.project_id);
-      return json({ ...graph, share });
+    if (path.length === 4) {
+      await assertPaymentTransaction(db, path[3], transactionId);
+      return dispatchPayment(request, db, path[3]);
     }
+  }
+  if (path[2] === "items") {
+    if (path.length === 3) {
+      return invoke(request, ["POST"], async () => {
+        const result = await createTransactionItem(db, transactionId, await readJson(request));
+        await syncSplitTransactionToHouseholds(db, transactionId, { validate: false });
+        return json(result, 201);
+      });
+    }
+    if (path.length === 4) {
+      await assertItemTransaction(db, path[3], transactionId);
+      return dispatchItem(request, db, ["items", path[3]]);
+    }
+    if (path.length === 5 && path[4] === "allocations") {
+      await assertItemTransaction(db, path[3], transactionId);
+      return replaceAllocations(request, db, path[3]);
+    }
+  }
+  return json({ error: "not_found" }, 404);
+}
 
+async function dispatchPayment(request, db, paymentId) {
+  if (request.method === "PATCH") return json(await updateTransactionPayment(db, paymentId, await readJson(request)));
+  if (request.method === "DELETE") return json(await deleteTransactionPayment(db, paymentId));
+  return methodNotAllowed(["PATCH", "DELETE"]);
+}
+
+async function dispatchItem(request, db, path) {
+  const itemId = path[1];
+  if (path.length === 2) {
+    if (request.method === "PATCH") {
+      const result = await updateTransactionItem(db, itemId, await readJson(request));
+      await syncSplitTransactionToHouseholds(db, result.transaction_item.transaction_id, { validate: false });
+      return json(result);
+    }
+    if (request.method === "DELETE") {
+      const result = await deleteTransactionItem(db, itemId);
+      await syncSplitTransactionToHouseholds(db, result.transaction_id, { sourceProjectId: result.project_id, validate: false });
+      return json({ ok: true });
+    }
+    return methodNotAllowed(["PATCH", "DELETE"]);
+  }
+  if (path.length === 3 && path[2] === "allocations") return replaceAllocations(request, db, itemId);
+  return json({ error: "not_found" }, 404);
+}
+
+async function replaceAllocations(request, db, itemId) {
+  return invoke(request, ["PUT"], async () => {
+    const result = await replaceItemAllocations(db, itemId, await readJson(request));
+    await syncSplitTransactionToHouseholds(db, result.transaction_id, { validate: false });
+    return json(result);
+  });
+}
+
+async function dispatchProjectImports(request, db, url, path) {
+  const projectId = path[1];
+  if (path.length === 3) {
+    return invoke(request, ["GET"], async () => {
+      const options = importListOptions(url.searchParams);
+      await requireProject(db, projectId);
+      return json({ imports: await listImports(db, projectId, options) });
+    });
+  }
+  if (path.length !== 4 || !new Set(["receipt", "csv", "notification"]).has(path[3])) {
     return json({ error: "not_found" }, 404);
-  } catch (error) {
-    return json({ error: "server_error", message: String(error?.message || error) }, 500);
   }
-}
-
-async function listProjects(db) {
-  const { results } = await db
-    .prepare(
-      `SELECT
-        p.id,
-        p.name,
-        p.created_at,
-        (SELECT COUNT(*) FROM members WHERE project_id = p.id) AS member_count,
-        (SELECT COUNT(*) FROM expenses WHERE project_id = p.id) AS expense_count,
-        COALESCE((SELECT SUM(total_amount) FROM expenses WHERE project_id = p.id), 0) AS total_amount
-      FROM projects p
-      ORDER BY p.created_at DESC`
-    )
-    .all();
-  return { projects: results || [] };
-}
-
-async function getProjectGraph(db, projectId) {
-  const data = structuredClone(emptyData);
-  data.projects = (await db.prepare("SELECT * FROM projects WHERE id = ?").bind(projectId).all()).results || [];
-  data.members = (await db.prepare("SELECT * FROM members WHERE project_id = ? ORDER BY created_at").bind(projectId).all()).results || [];
-  data.expenses = (await db.prepare("SELECT * FROM expenses WHERE project_id = ? ORDER BY paid_at, created_at").bind(projectId).all()).results || [];
-  data.expense_payments = (await db.prepare("SELECT * FROM expense_payments WHERE project_id = ? ORDER BY created_at").bind(projectId).all()).results || [];
-  data.items = (await db.prepare("SELECT * FROM items WHERE project_id = ? ORDER BY created_at").bind(projectId).all()).results || [];
-  data.item_members = (await db.prepare("SELECT * FROM item_members WHERE project_id = ? ORDER BY created_at").bind(projectId).all()).results || [];
-  return data;
-}
-
-async function saveProjectGraph(db, data) {
-  const project = data.projects[0];
-  if (!project?.id || !project?.name) throw new Error("project is required");
-  const projectId = project.id;
-  const statements = [
-    db
-      .prepare("INSERT INTO projects (id, name, created_at) VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET name = excluded.name")
-      .bind(project.id, project.name, project.created_at),
-    db.prepare("DELETE FROM item_members WHERE project_id = ?").bind(projectId),
-    db.prepare("DELETE FROM items WHERE project_id = ?").bind(projectId),
-    db.prepare("DELETE FROM expense_payments WHERE project_id = ?").bind(projectId),
-    db.prepare("DELETE FROM expenses WHERE project_id = ?").bind(projectId),
-    db.prepare("DELETE FROM members WHERE project_id = ?").bind(projectId),
-  ];
-
-  for (const m of data.members) {
-    statements.push(db.prepare("INSERT INTO members (id, project_id, name, created_at) VALUES (?, ?, ?, ?)").bind(m.id, projectId, m.name, m.created_at));
-  }
-  for (const e of data.expenses) {
-    statements.push(
-      db
-        .prepare("INSERT INTO expenses (id, project_id, payer_member_id, store_name, total_amount, paid_at, receipt_image_url, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
-        .bind(e.id, projectId, e.payer_member_id || null, e.store_name, Number(e.total_amount || 0), e.paid_at, e.receipt_image_url || null, e.created_at)
-    );
-  }
-  for (const p of data.expense_payments) {
-    statements.push(
-      db
-        .prepare("INSERT INTO expense_payments (id, project_id, expense_id, member_id, amount, created_at) VALUES (?, ?, ?, ?, ?, ?)")
-        .bind(p.id, projectId, p.expense_id, p.member_id, Number(p.amount || 0), p.created_at)
-    );
-  }
-  for (const i of data.items) {
-    statements.push(db.prepare("INSERT INTO items (id, project_id, expense_id, name, amount, created_at) VALUES (?, ?, ?, ?, ?, ?)").bind(i.id, projectId, i.expense_id, i.name, Number(i.amount || 0), i.created_at));
-  }
-  for (const link of data.item_members) {
-    statements.push(db.prepare("INSERT INTO item_members (id, project_id, item_id, member_id, created_at) VALUES (?, ?, ?, ?, ?)").bind(link.id, projectId, link.item_id, link.member_id, link.created_at));
-  }
-
-  await db.batch(statements);
-}
-
-async function deleteProject(db, projectId) {
-  await db.batch([
-    db.prepare("DELETE FROM project_shares WHERE project_id = ?").bind(projectId),
-    db.prepare("DELETE FROM item_members WHERE project_id = ?").bind(projectId),
-    db.prepare("DELETE FROM items WHERE project_id = ?").bind(projectId),
-    db.prepare("DELETE FROM expense_payments WHERE project_id = ?").bind(projectId),
-    db.prepare("DELETE FROM expenses WHERE project_id = ?").bind(projectId),
-    db.prepare("DELETE FROM members WHERE project_id = ?").bind(projectId),
-    db.prepare("DELETE FROM projects WHERE id = ?").bind(projectId),
-  ]);
-}
-
-async function createShare(db, projectId) {
-  const existing = await db.prepare("SELECT * FROM project_shares WHERE project_id = ? LIMIT 1").bind(projectId).first();
-  if (existing) return existing;
-  const share = {
-    id: makeId("shr"),
-    project_id: projectId,
-    token: makeToken(),
-    role: "editor",
-    expires_at: null,
-    created_at: new Date().toISOString(),
-  };
-  await db
-    .prepare("INSERT INTO project_shares (id, project_id, token, role, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?)")
-    .bind(share.id, share.project_id, share.token, share.role, share.expires_at, share.created_at)
-    .run();
-  return share;
-}
-
-async function getShare(db, token) {
-  return db.prepare("SELECT * FROM project_shares WHERE token = ? AND (expires_at IS NULL OR expires_at > ?)").bind(token, new Date().toISOString()).first();
-}
-
-function normalizeGraph(data) {
-  const graph = { ...structuredClone(emptyData), ...data };
-  for (const key of Object.keys(emptyData)) {
-    if (!Array.isArray(graph[key])) graph[key] = [];
-  }
-  const projectId = graph.projects[0]?.id;
-  if (!projectId) throw new Error("project id is required");
-  graph.projects = graph.projects.slice(0, 1).map((p) => ({ id: String(p.id), name: String(p.name || "割り勘"), created_at: p.created_at || new Date().toISOString() }));
-  graph.members = graph.members.filter((x) => x.project_id === projectId).map((x) => ({ id: String(x.id), project_id: projectId, name: String(x.name || "名前なし"), created_at: x.created_at || new Date().toISOString() }));
-  graph.expenses = graph.expenses
-    .filter((x) => x.project_id === projectId)
-    .map((x) => ({ id: String(x.id), project_id: projectId, payer_member_id: x.payer_member_id || null, store_name: String(x.store_name || "お店"), total_amount: Number(x.total_amount || 0), paid_at: x.paid_at || new Date().toISOString().slice(0, 10), receipt_image_url: x.receipt_image_url || null, created_at: x.created_at || new Date().toISOString() }));
-  graph.expense_payments = graph.expense_payments
-    .filter((x) => x.project_id === projectId)
-    .map((x) => ({ id: String(x.id), project_id: projectId, expense_id: String(x.expense_id), member_id: String(x.member_id), amount: Number(x.amount || 0), created_at: x.created_at || new Date().toISOString() }));
-  graph.items = graph.items.filter((x) => x.project_id === projectId).map((x) => ({ id: String(x.id), project_id: projectId, expense_id: String(x.expense_id), name: String(x.name || "品目"), amount: Number(x.amount || 0), created_at: x.created_at || new Date().toISOString() }));
-  graph.item_members = graph.item_members.filter((x) => x.project_id === projectId).map((x) => ({ id: String(x.id), project_id: projectId, item_id: String(x.item_id), member_id: String(x.member_id), created_at: x.created_at || new Date().toISOString() }));
-  return graph;
-}
-
-function makeId(prefix) {
-  return `${prefix}_${Date.now().toString(36)}_${crypto.randomUUID().slice(0, 8)}`;
-}
-
-async function handleReceiptOcr(request, env) {
-  const payload = await request.json().catch(() => ({}));
-  const imageDataUrl = payload.image_data_url;
-  if (!imageDataUrl || typeof imageDataUrl !== "string" || !imageDataUrl.startsWith("data:image/")) {
-    return json({ error: "invalid_image", message: "画像ファイルを選択してください。" }, 400);
-  }
-
-  const backend = String(env.OCR_BACKEND || "auto").toLowerCase();
-  if (backend === "remote" || backend === "tesseract_ollama") return readReceiptWithRemoteOcr(imageDataUrl, env);
-  if (backend === "openai") return readReceiptWithOpenAI(imageDataUrl, env);
-  if (backend === "gemini") return readReceiptWithGemini(imageDataUrl, env);
-  if (backend === "auto") {
-    if (env.OPENAI_API_KEY) return readReceiptWithOpenAI(imageDataUrl, env);
-    if (env.GEMINI_API_KEY) return readReceiptWithGemini(imageDataUrl, env);
-    return json({ error: "missing_api_key", message: "OPENAI_API_KEY または GEMINI_API_KEY を Cloudflare Pages の環境変数に設定してください。" }, 503);
-  }
-  return json({ error: "unsupported_ocr_backend", message: "Cloudflareでは OCR_BACKEND に auto、openai、gemini を指定してください。" }, 400);
-}
-
-async function readReceiptWithRemoteOcr(imageDataUrl, env) {
-  const baseUrl = String(env.RECEIPT_OCR_API_URL || env.OCR_API_URL || "").replace(/\/+$/, "");
-  if (!baseUrl) {
-    return json({ error: "missing_receipt_ocr_api_url", message: "RECEIPT_OCR_API_URL is not set." }, 503);
-  }
-  const remoteRes = await fetch(`${baseUrl}/api/ocr-receipt`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ image_data_url: imageDataUrl }),
+  return invoke(request, ["POST"], async () => {
+    await requireOpenProject(db, projectId);
+    const body = await readJson(request);
+    let result;
+    if (path[3] === "csv") {
+      const csv = csvInput(body);
+      result = await importCall(() => createCsvImports(db, projectId, csv.text, csv.profile, csv.options));
+    } else {
+      validateImportInput(body, path[3]);
+      result = path[3] === "receipt"
+        ? await importCall(() => createReceiptImport(db, projectId, body))
+        : await importCall(() => createNotificationImport(db, projectId, body));
+    }
+    await syncSplitProjectToHouseholds(db, projectId, { validate: false });
+    return json(result, 201);
   });
-  const text = await remoteRes.text();
-  let data = null;
+}
+
+async function handleReconcile(request, db, importId) {
+  const body = await readJson(request);
+  validateReconcileInput(body);
+  const record = await db.prepare("SELECT * FROM import_records WHERE id = ?").bind(importId).first();
+  if (!record) throw new ApiError(404, "not_found");
+  await requireOpenProject(db, record.project_id);
+  if (body.action === "link") {
+    const transactionId = requiredBodyString(body, "transaction_id", 128);
+    await assertTransactionProject(db, transactionId, record.project_id);
+  }
+  if (body.action === "create") {
+    if (!Number.isSafeInteger(record.paid_amount_raw) || !record.occurred_at_raw || !Number.isFinite(Date.parse(record.occurred_at_raw))) {
+      throw new ApiError(422, "import_not_reconcilable");
+    }
+    if (body.new_transaction_id) {
+      const existing = await db.prepare("SELECT id FROM transactions WHERE id = ?").bind(body.new_transaction_id).first();
+      if (existing) throw new ApiError(409, "id_conflict", { field: "new_transaction_id" });
+    }
+  }
+  const result = await reconcileImport(db, record.project_id, importId, body);
+  await syncSplitProjectToHouseholds(db, record.project_id, { validate: false });
+  return json(result);
+}
+
+async function finalizeProject(db, projectId) {
+  const project = await requireProject(db, projectId);
+  if (project.project_type !== "split") throw new ApiError(409, "project_not_split");
+  const validation = await validateSplitProject(db, project.id);
+  if (!validation.valid) throw new ApiError(422, "invalid_project", { validation });
+  const result = await markProjectFinalized(db, project.id);
+  const synchronization = await syncSplitProjectToHouseholds(db, project.id, { validate: false });
+  return json({ ...result, validation, synchronization });
+}
+
+async function reopenProject(db, projectId) {
+  const project = await requireProject(db, projectId);
+  if (project.project_type !== "split") throw new ApiError(409, "project_not_split");
+  const result = await markProjectReopened(db, projectId);
+  const synchronization = await syncSplitProjectToHouseholds(db, projectId, { validate: false });
+  return json({ ...result, synchronization });
+}
+
+async function invoke(request, methods, callback) {
+  if (!methods.includes(request.method)) return methodNotAllowed(methods);
+  return callback();
+}
+
+function requestPath(pathname) {
+  const value = pathname === "/api" ? "" : pathname.startsWith("/api/") ? pathname.slice(5) : pathname.replace(/^\/+/, "");
   try {
-    data = JSON.parse(text);
+    return value.split("/").filter(Boolean).map((part) => decodeURIComponent(part));
   } catch {
-    return json({ error: "invalid_remote_ocr_response", message: text.slice(0, 1000) }, 502);
+    throw new ApiError(400, "invalid_path");
   }
-  return json(data, remoteRes.ok ? 200 : 502);
 }
 
-async function readReceiptWithOpenAI(imageDataUrl, env) {
-  if (!env.OPENAI_API_KEY) {
-    return json({ error: "missing_api_key", message: "OPENAI_API_KEY が未設定です。Cloudflare Pages の環境変数に設定してください。" }, 503);
-  }
-  const schema = {
-    type: "object",
-    additionalProperties: false,
-    properties: {
-      store_name: { type: ["string", "null"], description: "レシートの店名。読めない場合はnull。" },
-      total_amount: { type: ["integer", "null"], description: "税込の最終支払金額。円単位。読めない場合はnull。" },
-      paid_at: { type: ["string", "null"], description: "支払日。YYYY-MM-DD形式。読めない場合はnull。" },
-      items: {
-        type: "array",
-        description: "レシートの購入品目。合計、税、値引、支払い方法、預り金、釣銭、ポイントは含めない。",
-        items: {
-          type: "object",
-          additionalProperties: false,
-          properties: {
-            name: { type: "string", description: "品目名。" },
-            amount: { type: "integer", description: "品目の税込金額。円単位。" },
-          },
-          required: ["name", "amount"],
-        },
-      },
-      confidence: { type: "number", description: "0から1の推定信頼度。" },
-      notes: { type: "string", description: "読み取り時の注意点。なければ空文字。" },
-    },
-    required: ["store_name", "total_amount", "paid_at", "items", "confidence", "notes"],
-  };
-  const openaiRes = await fetch("https://api.openai.com/v1/responses", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      authorization: `Bearer ${env.OPENAI_API_KEY}`,
-    },
-    body: JSON.stringify({
-      model: env.OPENAI_OCR_MODEL || "gpt-5.4-mini",
-      store: false,
-      input: [
-        {
-          role: "user",
-          content: [
-            {
-              type: "input_text",
-              text: receiptOcrPrompt(),
-            },
-            { type: "input_image", image_url: imageDataUrl, detail: "high" },
-          ],
-        },
-      ],
-      text: {
-        format: {
-          type: "json_schema",
-          name: "receipt_ocr",
-          schema,
-          strict: true,
-        },
-      },
-    }),
-  });
-  const data = await openaiRes.json().catch(() => ({}));
-  if (!openaiRes.ok) return json({ error: "openai_error", message: JSON.stringify(data).slice(0, 1000) }, 502);
-  const outputText = data.output_text || data.output?.flatMap((x) => x.content || []).find((x) => x.type === "output_text")?.text;
-  if (!outputText) return json({ error: "empty_ocr_result", message: "読み取り結果が空でした。" }, 502);
-  return json({ ...JSON.parse(outputText), model: data.model || env.OPENAI_OCR_MODEL || "gpt-5.4-mini" });
+async function memberProject(db, memberId) {
+  const row = await db.prepare("SELECT project_id FROM project_members WHERE id = ?").bind(memberId).first();
+  if (!row) throw new ApiError(404, "not_found");
+  return row;
 }
 
-async function readReceiptWithGemini(imageDataUrl, env) {
-  if (!env.GEMINI_API_KEY) {
-    return json({ error: "missing_api_key", message: "GEMINI_API_KEY が未設定です。Cloudflare Pages の環境変数に設定してください。" }, 503);
-  }
-  const image = splitImageDataUrl(imageDataUrl);
-  const model = env.GEMINI_OCR_MODEL || "gemini-2.5-flash";
-  const geminiRes = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(env.GEMINI_API_KEY)}`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      contents: [
-        {
-          parts: [
-            { text: receiptOcrPrompt() },
-            { inlineData: { mimeType: image.mimeType, data: image.base64Data } },
-          ],
-        },
-      ],
-      generationConfig: {
-        responseMimeType: "application/json",
-        responseSchema: geminiReceiptSchema(),
-      },
-    }),
-  });
-  const data = await geminiRes.json().catch(() => ({}));
-  if (!geminiRes.ok) return json({ error: "gemini_error", message: JSON.stringify(data).slice(0, 1000) }, 502);
-  const outputText = data.candidates?.flatMap((x) => x.content?.parts || []).find((x) => x.text)?.text;
-  if (!outputText) return json({ error: "empty_ocr_result", message: "読み取り結果が空でした。" }, 502);
-  return json({ ...JSON.parse(outputText), model });
+async function assertTransactionProject(db, transactionId, projectId) {
+  const row = await db.prepare("SELECT id FROM transactions WHERE id = ? AND project_id = ?").bind(transactionId, projectId).first();
+  if (!row) throw new ApiError(404, "not_found");
 }
 
-function receiptOcrPrompt() {
-  return (
-    "日本のレシート画像から、店名、税込の最終支払金額、支払日、購入品目を読み取ってください。" +
-    "合計、総合計、現計、クレジット支払額、電子マネー支払額など最終的に支払った金額を優先してください。" +
-    "預り金、釣銭、ポイント、税額、小計をtotal_amountにしないでください。" +
-    "itemsには購入した商品の名前と税込金額を入れてください。合計、税、値引、支払い方法、預り金、釣銭、ポイントはitemsに含めないでください。" +
-    "品目が読めない場合はitemsを空配列にしてください。"
-  );
+async function assertPaymentTransaction(db, paymentId, transactionId) {
+  const row = await db.prepare("SELECT id FROM transaction_payments WHERE id = ? AND transaction_id = ?").bind(paymentId, transactionId).first();
+  if (!row) throw new ApiError(404, "not_found");
 }
 
-function geminiReceiptSchema() {
+async function assertItemTransaction(db, itemId, transactionId) {
+  const row = await db.prepare("SELECT id FROM transaction_items WHERE id = ? AND transaction_id = ?").bind(itemId, transactionId).first();
+  if (!row) throw new ApiError(404, "not_found");
+}
+
+async function requireOpenProject(db, projectId) {
+  const project = await requireProject(db, projectId);
+  if (project.finalized_at !== null && project.finalized_at !== undefined) throw new ApiError(409, "project_finalized");
+  return project;
+}
+
+function importListOptions(searchParams) {
+  assertQueryFields(searchParams, new Set(["status", "source_status", "source_type", "transaction_id", "before", "limit"]));
+  const statuses = commaEnums(searchParams.get("status") ?? searchParams.get("source_status"), "status", IMPORT_STATUSES);
+  const sourceTypes = commaEnums(searchParams.get("source_type"), "source_type", IMPORT_SOURCES);
+  const transactionId = optionalQueryString(searchParams.get("transaction_id"), "transaction_id", 128);
+  const before = optionalQueryDate(searchParams.get("before"), "before");
+  const limit = optionalQueryInteger(searchParams.get("limit"), "limit", 1, 100);
   return {
-    type: "object",
-    properties: {
-      store_name: { type: "string", nullable: true, description: "レシートの店名。読めない場合はnull。" },
-      total_amount: { type: "integer", nullable: true, description: "税込の最終支払金額。円単位。読めない場合はnull。" },
-      paid_at: { type: "string", nullable: true, description: "支払日。YYYY-MM-DD形式。読めない場合はnull。" },
-      items: {
-        type: "array",
-        description: "レシートの購入品目。合計、税、値引、支払い方法、預り金、釣銭、ポイントは含めない。",
-        items: {
-          type: "object",
-          properties: {
-            name: { type: "string", description: "品目名。" },
-            amount: { type: "integer", description: "品目の税込金額。円単位。" },
-          },
-          required: ["name", "amount"],
-        },
-      },
-      confidence: { type: "number", description: "0から1の推定信頼度。" },
-      notes: { type: "string", description: "読み取り時の注意点。なければ空文字。" },
-    },
-    required: ["store_name", "total_amount", "paid_at", "items", "confidence", "notes"],
+    status: statuses,
+    source_type: sourceTypes,
+    ...(transactionId ? { transaction_id: transactionId } : {}),
+    ...(before ? { before } : {}),
+    ...(limit !== null ? { limit } : {}),
   };
 }
 
-function splitImageDataUrl(imageDataUrl) {
-  const [header, base64Data] = imageDataUrl.split(",", 2);
-  if (!header || !base64Data || !header.includes(";base64")) throw new Error("画像データの形式が不正です。");
-  const mimeType = header.replace(/^data:/, "").split(";")[0] || "image/jpeg";
-  return { mimeType, base64Data };
+function csvInput(body) {
+  assertAllowedBody(body, new Set(["csv", "csv_text", "text", "profile", "options"]));
+  const text = body.csv ?? body.csv_text ?? body.text;
+  if (typeof text !== "string" || text.length === 0 || new TextEncoder().encode(text).byteLength > 5 * 1024 * 1024) {
+    throw new ApiError(400, "invalid_field", { field: "csv" });
+  }
+  const profile = body.profile ?? "generic";
+  if (typeof profile !== "string" || !CSV_PROFILES.has(profile)) throw new ApiError(400, "invalid_field", { field: "profile" });
+  const options = body.options ?? {};
+  if (!options || typeof options !== "object" || Array.isArray(options)) throw new ApiError(400, "invalid_field", { field: "options" });
+  assertAllowedBody(options, new Set(["delimiter", "maxRows", "max_rows", "provider", "source_type"]));
+  if (options.delimiter !== undefined && !new Set([",", "\t", ";", "|"]).has(options.delimiter)) throw new ApiError(400, "invalid_field", { field: "delimiter" });
+  if (options.maxRows !== undefined) boundedBodyInteger(options.maxRows, "maxRows", 1, 5_000);
+  if (options.max_rows !== undefined) boundedBodyInteger(options.max_rows, "max_rows", 1, 5_000);
+  if (options.provider !== undefined) bodyString(options.provider, "provider", 160);
+  if (options.source_type !== undefined && !IMPORT_SOURCES.has(options.source_type)) throw new ApiError(400, "invalid_field", { field: "source_type" });
+  return { text, profile, options };
 }
 
-function makeToken() {
-  const bytes = new Uint8Array(24);
-  crypto.getRandomValues(bytes);
-  return Array.from(bytes, (b) => b.toString(36).padStart(2, "0")).join("");
+function validateImportInput(body, kind) {
+  const fields = new Set([
+    "id",
+    "source_record_id",
+    "receipt_id",
+    "document_id",
+    "message_id",
+    "notification_id",
+    "merchant_raw",
+    "merchant_name",
+    "store_name",
+    "merchant",
+    "paid_amount_raw",
+    "paid_amount",
+    "total_amount",
+    "amount",
+    "gross_amount_raw",
+    "gross_amount",
+    "occurred_at_raw",
+    "occurred_at",
+    "paid_at",
+    "date",
+    "received_at",
+    "settled_at_raw",
+    "settled_at",
+    "payment_method_raw",
+    "payment_method",
+    "external_transaction_id",
+    "external_payment_id",
+    "transaction_id",
+    "image_url",
+    "receipt_image_url",
+    "raw_text",
+    "text",
+    "raw_payload",
+    "payload",
+    "parse_confidence",
+    "confidence",
+    "parser_version",
+    "account_label",
+    "provider",
+    "payer_member_id",
+    "category",
+    "discount_amount",
+    "point_amount",
+    "status",
+    "valid",
+  ]);
+  assertAllowedBody(body, fields);
+  const encoded = new TextEncoder().encode(JSON.stringify(body)).byteLength;
+  if (encoded > 2 * 1024 * 1024) throw new ApiError(413, "import_payload_too_large");
+  validateNestedValue(body, 0);
+  for (const field of ["paid_amount_raw", "paid_amount", "total_amount", "amount", "gross_amount_raw", "gross_amount", "discount_amount", "point_amount"]) {
+    if (body[field] !== undefined && !Number.isSafeInteger(body[field])) throw new ApiError(400, "invalid_integer", { field });
+  }
+  for (const field of ["merchant_raw", "merchant_name", "store_name", "merchant", "account_label", "provider", "category"]) {
+    if (body[field] !== undefined && body[field] !== null) bodyString(body[field], field, 300);
+  }
+  for (const field of ["id", "source_record_id", "receipt_id", "document_id", "message_id", "notification_id", "external_transaction_id", "external_payment_id", "transaction_id", "payer_member_id", "parser_version"]) {
+    if (body[field] !== undefined && body[field] !== null) bodyString(body[field], field, 300);
+  }
+  for (const field of ["occurred_at_raw", "occurred_at", "paid_at", "date", "received_at", "settled_at_raw", "settled_at"]) {
+    if (body[field] !== undefined && body[field] !== null) bodyString(body[field], field, 64);
+  }
+  for (const field of ["parse_confidence", "confidence"]) {
+    if (body[field] !== undefined && (typeof body[field] !== "number" || !Number.isFinite(body[field]) || body[field] < 0 || body[field] > 1)) {
+      throw new ApiError(400, "invalid_number", { field });
+    }
+  }
+  if (body.valid !== undefined && typeof body.valid !== "boolean") throw new ApiError(400, "invalid_boolean", { field: "valid" });
+  if (kind === "notification" && body.image_url !== undefined) bodyString(body.image_url, "image_url", 500_000);
 }
 
-function json(body, status = 200) {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: {
-      "content-type": "application/json; charset=utf-8",
-      "cache-control": "no-store",
-    },
-  });
+function validateReconcileInput(body) {
+  assertAllowedBody(body, new Set(["action", "transaction_id", "new_transaction_id", "match_score", "match_reason_json"]));
+  if (typeof body.action !== "string" || !RECONCILE_ACTIONS.has(body.action)) throw new ApiError(400, "invalid_field", { field: "action" });
+  if (body.transaction_id !== undefined) bodyString(body.transaction_id, "transaction_id", 128);
+  if (body.new_transaction_id !== undefined) bodyString(body.new_transaction_id, "new_transaction_id", 128);
+  if (body.match_score !== undefined) boundedBodyInteger(body.match_score, "match_score", 0, 100);
+  if (body.match_reason_json !== undefined) {
+    const value = typeof body.match_reason_json === "string" ? body.match_reason_json : JSON.stringify(body.match_reason_json);
+    if (value.length > 20_000) throw new ApiError(400, "invalid_field", { field: "match_reason_json" });
+  }
+  if (body.action === "link" && body.transaction_id === undefined) throw new ApiError(400, "missing_field", { field: "transaction_id" });
+}
+
+async function importCall(callback) {
+  try {
+    return await callback();
+  } catch (error) {
+    if (error instanceof ApiError) throw error;
+    if (error instanceof TypeError) throw new ApiError(400, "invalid_import");
+    throw error;
+  }
+}
+
+function assertAllowedBody(body, allowed) {
+  if (!body || typeof body !== "object" || Array.isArray(body)) throw new ApiError(400, "invalid_json_body");
+  const unknown = Object.keys(body).find((field) => !allowed.has(field));
+  if (unknown) throw new ApiError(400, "unknown_field", { field: unknown });
+}
+
+function validateNestedValue(value, depth) {
+  if (depth > 8) throw new ApiError(400, "invalid_import_payload");
+  if (typeof value === "string") {
+    if (value.length > 500_000) throw new ApiError(400, "invalid_import_payload");
+    return;
+  }
+  if (Array.isArray(value)) {
+    if (value.length > 1_000) throw new ApiError(400, "invalid_import_payload");
+    for (const entry of value) validateNestedValue(entry, depth + 1);
+    return;
+  }
+  if (value && typeof value === "object") {
+    const entries = Object.entries(value);
+    if (entries.length > 200) throw new ApiError(400, "invalid_import_payload");
+    for (const [key, entry] of entries) {
+      if (key.length > 200) throw new ApiError(400, "invalid_import_payload");
+      validateNestedValue(entry, depth + 1);
+    }
+  }
+}
+
+function assertQueryFields(searchParams, allowed) {
+  for (const field of searchParams.keys()) {
+    if (!allowed.has(field)) throw new ApiError(400, "invalid_query_parameter", { field });
+  }
+}
+
+function booleanQuery(value, field, fallback) {
+  if (value === null) return fallback;
+  if (value === "1" || value === "true") return true;
+  if (value === "0" || value === "false") return false;
+  throw new ApiError(400, "invalid_query_parameter", { field });
+}
+
+function commaEnums(value, field, allowed) {
+  if (value === null || value === "") return [];
+  const values = [...new Set(value.split(",").map((entry) => entry.trim()).filter(Boolean))];
+  if (values.length > 10 || values.some((entry) => !allowed.has(entry))) throw new ApiError(400, "invalid_query_parameter", { field });
+  return values;
+}
+
+function optionalQueryString(value, field, maximum) {
+  if (value === null || value === "") return null;
+  if (value.length > maximum) throw new ApiError(400, "invalid_query_parameter", { field });
+  return value;
+}
+
+function optionalQueryDate(value, field) {
+  const result = optionalQueryString(value, field, 64);
+  if (result !== null && !Number.isFinite(Date.parse(result))) throw new ApiError(400, "invalid_query_parameter", { field });
+  return result;
+}
+
+function optionalQueryInteger(value, field, minimum, maximum) {
+  if (value === null || value === "") return null;
+  if (!/^\d+$/.test(value)) throw new ApiError(400, "invalid_query_parameter", { field });
+  return boundedBodyInteger(Number(value), field, minimum, maximum, "invalid_query_parameter");
+}
+
+function requiredBodyString(body, field, maximum) {
+  if (body[field] === undefined) throw new ApiError(400, "missing_field", { field });
+  return bodyString(body[field], field, maximum);
+}
+
+function bodyString(value, field, maximum) {
+  if (typeof value !== "string" || value.trim().length === 0 || value.length > maximum) throw new ApiError(400, "invalid_field", { field });
+  return value.trim();
+}
+
+function boundedBodyInteger(value, field, minimum, maximum, code = "invalid_integer") {
+  if (!Number.isSafeInteger(value) || value < minimum || value > maximum) throw new ApiError(400, code, { field });
+  return value;
 }

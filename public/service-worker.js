@@ -1,9 +1,14 @@
-const CACHE_NAME = "wari-pwa-20260708-items1";
+const CACHE_NAME = "wari-pwa-20260712-ledger6";
 const APP_SHELL = [
   "/",
   "/index.html",
-  "/styles.css?v=20260708-items1",
-  "/app.js?v=20260708-items1",
+  "/styles.css?v=20260712-ledger6",
+  "/app.js?v=20260712-ledger6",
+  "/modules/storage.js?v=20260712-ledger6",
+  "/modules/split.js?v=20260712-ledger6",
+  "/modules/api.js?v=20260712-ledger6",
+  "/modules/imports.js?v=20260712-ledger6",
+  "/modules/household.js?v=20260712-ledger6",
   "/manifest.webmanifest",
   "/icons/icon.svg",
   "/icons/icon-192.png",
@@ -33,12 +38,24 @@ self.addEventListener("fetch", (event) => {
 
   if (event.request.mode === "navigate") {
     event.respondWith(
-      fetch(event.request).catch(() => caches.match("/index.html"))
+      fetch(event.request)
+        .then((response) => {
+          const copy = response.clone();
+          caches.open(CACHE_NAME).then((cache) => cache.put("/index.html", copy));
+          return response;
+        })
+        .catch(() => caches.match("/index.html"))
     );
     return;
   }
 
   event.respondWith(
-    caches.match(event.request).then((cached) => cached || fetch(event.request))
+    caches.match(event.request).then((cached) => cached || fetch(event.request).then((response) => {
+      if (response.ok && url.origin === self.location.origin) {
+        const copy = response.clone();
+        caches.open(CACHE_NAME).then((cache) => cache.put(event.request, copy));
+      }
+      return response;
+    }))
   );
 });
