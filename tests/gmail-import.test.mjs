@@ -95,18 +95,47 @@ test("OAuth callback rejects sharing added after its final read and before conne
   assert.equal(db.raw.prepare("SELECT count(*) AS n FROM gmail_connections").get().n,0);
 });
 
-test("message and candidate batch rollback permits a later sync retry", async (t) => {
+test("multiple message and candidate writes roll back together and permit a later sync retry", async (t) => {
   const db=new Database();t.after(()=>db.close());seed(db);const env=environment(async(url)=>{
     if(String(url).includes("oauth2.googleapis.com/token"))return Response.json({access_token:"access-secret"});
-    if(String(url).includes("/messages?"))return Response.json({messages:[{id:"retry-message"}]});
+    if(String(url).includes("/messages?"))return Response.json({messages:[{id:"retry-message-1"},{id:"retry-message-2"}]});
     return Response.json({payload:{mimeType:"text/plain",headers:[{name:"From",value:"notice@jcb.co.jp"}],body:{data:base64Url("amount 1200 2026/07/10 shop")}}});
   });
   const encrypted=await encryptRefreshToken(env,"retry-connection","user-1","refresh-secret");
   db.raw.prepare(`INSERT INTO gmail_connections (id,user_id,gmail_email,refresh_token_ciphertext,refresh_token_iv,key_generation,aad_version,status,created_at,updated_at) VALUES (?,?,?,?,?,?,1,'active',?,?)`).run("retry-connection","user-1","retry@example.test",encrypted.ciphertext,encrypted.iv,1,"2026-07-12T00:00:00.000Z","2026-07-12T00:00:00.000Z");
-  db.failBatchAt=1;const failed=await syncGmail(db,env,{id:"user-1"},"retry-connection",{days:7,limit:1});
-  assert.equal(failed.run.error_count,1);assert.equal(db.raw.prepare("SELECT count(*) AS n FROM gmail_messages").get().n,0);
-  const retried=await syncGmail(db,env,{id:"user-1"},"retry-connection",{days:7,limit:1});
-  assert.equal(retried.run.candidate_count,1);assert.equal(db.raw.prepare("SELECT count(*) AS n FROM gmail_import_candidates").get().n,1);
+  db.failBatchAt=4;const failed=await syncGmail(db,env,{id:"user-1"},"retry-connection",{days:7,limit:2});
+  assert.equal(failed.run.error_count,1);assert.equal(db.raw.prepare("SELECT count(*) AS n FROM gmail_messages").get().n,0);assert.equal(db.raw.prepare("SELECT count(*) AS n FROM gmail_import_candidates").get().n,0);
+  const retried=await syncGmail(db,env,{id:"user-1"},"retry-connection",{days:7,limit:2});
+  assert.equal(retried.run.candidate_count,2);assert.equal(db.raw.prepare("SELECT count(*) AS n FROM gmail_import_candidates").get().n,2);
+});
+
+test("sync revalidates its selected personal household against each sharing mechanism", async (t) => {
+  const cases=[
+    ["hashed share",(db,now)=>db.raw.prepare("INSERT INTO project_shares (id,project_id,token_hash,role,created_by_user_id,created_at,updated_at) VALUES (?,?,?,?,?,?,?)").run("race-share","personal-home","race-hash","viewer","user-1",now,now)],
+    ["legacy share",(db)=>db.raw.prepare("UPDATE projects SET share_token=?,share_expires_at=NULL WHERE id=?").run("legacy-race-token","personal-home")],
+    ["other user role",(db,now)=>{db.raw.prepare("INSERT INTO users (id,google_sub,email,created_at,updated_at) VALUES (?,?,?,?,?)").run("user-2","sub-2","user2@example.test",now,now);db.raw.prepare("INSERT INTO project_user_roles (project_id,user_id,role,created_at,updated_at) VALUES (?,?,?,?,?)").run("personal-home","user-2","viewer",now,now);}],
+  ];
+  for(const [name,share] of cases){await t.test(name,async()=>{
+    const db=new Database();seed(db);const now="2026-07-12T00:00:00.000Z";
+    db.raw.prepare("INSERT INTO projects (id,name,project_type,created_at,updated_at) VALUES (?,?,?,?,?)").run("later-personal-home","Later","household","2026-07-13T00:00:00.000Z","2026-07-13T00:00:00.000Z");
+    db.raw.prepare("INSERT INTO project_user_roles (project_id,user_id,role,created_at,updated_at) VALUES (?,?,?,?,?)").run("later-personal-home","user-1","owner",now,now);
+    const env=environment(async(url)=>{
+      if(String(url).includes("oauth2.googleapis.com/token"))return Response.json({access_token:"access-secret"});
+      if(String(url).includes("/messages?"))return Response.json({messages:[{id:"race-message-1"},{id:"race-message-2"}]});
+      return Response.json({payload:{mimeType:"text/plain",headers:[{name:"From",value:"notice@jcb.co.jp"}],body:{data:base64Url("amount 1200 2026/07/10 shop")}}});
+    });
+    const encrypted=await encryptRefreshToken(env,"sync-race-connection","user-1","refresh-secret");
+    db.raw.prepare("INSERT INTO gmail_connections (id,user_id,gmail_email,refresh_token_ciphertext,refresh_token_iv,key_generation,aad_version,status,created_at,updated_at) VALUES (?,?,?,?,?,?,1,'active',?,?)").run("sync-race-connection","user-1","race@example.test",encrypted.ciphertext,encrypted.iv,1,now,now);
+    db.beforeBatch=async()=>share(db,now);
+    const result=await syncGmail(db,env,{id:"user-1"},"sync-race-connection",{days:7,limit:2});
+    assert.equal(result.run.status,"failed");
+    assert.equal(result.run.error_code,"gmail_personal_household_lost");
+    assert.equal(result.run.processed_count,0);
+    assert.equal(result.run.candidate_count,0);
+    assert.equal(db.raw.prepare("SELECT count(*) AS n FROM gmail_messages").get().n,0);
+    assert.equal(db.raw.prepare("SELECT count(*) AS n FROM gmail_import_candidates").get().n,0);
+    db.close();
+  });}
 });
 
 test("failed revocation retains encrypted token for retry", async (t) => {

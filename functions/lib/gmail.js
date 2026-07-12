@@ -94,7 +94,7 @@ export async function syncGmail(db, env, user, connectionId, input = {}) {
   const days = Number(input.days ?? 30); const limit = Number(input.limit ?? 100);
   if (!DAYS.has(days)) throw new ApiError(400, "invalid_field", { field: "days" });
   if (!Number.isInteger(limit) || limit < 1 || limit > 500) throw new ApiError(400, "invalid_field", { field: "limit" });
-  await requireAnyPersonalHousehold(db,user.id);
+  const syncProject = await requireAnyPersonalHousehold(db,user.id);
   const connection = await ownedConnection(db, user, connectionId); const started = new Date().toISOString(); const runId = crypto.randomUUID();
   await db.prepare(`INSERT INTO gmail_sync_runs (id,connection_id,user_id,days,message_limit,status,started_at) VALUES (?,?,?,?,?,'running',?)`).bind(runId,connectionId,user.id,days,limit,started).run();
   let listed=0,processed=0,candidates=0,duplicates=0,errors=0,status="completed",errorCode=null;
@@ -104,6 +104,7 @@ export async function syncGmail(db, env, user, connectionId, input = {}) {
     const after = Math.floor((Date.now()-days*86400000)/1000);
     const listing = await googleJson(env, `https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults=${limit}&q=${encodeURIComponent(`after:${after}`)}`, token.access_token);
     const messages=(listing.messages||[]).slice(0,limit); listed=messages.length;
+    const pending=[];
     for (const item of messages) {
       const exists=await db.prepare(`SELECT m.id,c.id AS candidate_id FROM gmail_messages m LEFT JOIN gmail_import_candidates c ON c.gmail_message_row_id=m.id WHERE m.connection_id=? AND m.gmail_message_id=?`).bind(connectionId,item.id).first();
       if(exists?.candidate_id){duplicates++;continue;}
@@ -113,12 +114,24 @@ export async function syncGmail(db, env, user, connectionId, input = {}) {
         const parsed=parsePaymentNotification(extractGmailText(message.payload),headers); const messageRowId=exists?.id||crypto.randomUUID(); const candidateId=crypto.randomUUID();
         const warning=parsed.amount!==null&&parsed.occurred_at?await duplicateWarning(db,user.id,parsed.amount,parsed.occurred_at):0;
         const now=new Date().toISOString();
-        const candidateStatement=db.prepare(`INSERT INTO gmail_import_candidates (id,connection_id,gmail_message_row_id,user_id,status,provider,merchant_name,amount,occurred_at,payment_method,external_transaction_id,duplicate_warning,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
-          .bind(candidateId,connectionId,messageRowId,user.id,parsed.parse_status === "parsed" ? "ready" : parsed.parse_status,parsed.provider,parsed.merchant_name,parsed.amount,parsed.occurred_at,parsed.payment_method,parsed.external_transaction_id,warning,now,now);
-        if(exists) await candidateStatement.run();
-        else await db.batch([db.prepare(`INSERT INTO gmail_messages (id,connection_id,gmail_message_id,sync_run_id,parse_status,provider,received_at,created_at) VALUES (?,?,?,?,?,?,?,?)`).bind(messageRowId,connectionId,item.id,runId,parsed.parse_status,parsed.provider,headers.date&&Number.isFinite(Date.parse(headers.date))?new Date(headers.date).toISOString():null,now),candidateStatement]);
-        processed++;candidates++;
+        pending.push({ exists: Boolean(exists), messageRowId, candidateId, gmailMessageId:item.id, parsed,
+          receivedAt:headers.date&&Number.isFinite(Date.parse(headers.date))?new Date(headers.date).toISOString():null, warning, now });
       } catch(error){errors++;status=error?.status===401?"reauthorization_required":error?.status===429?"rate_limited":"partial";errorCode=safeErrorCode(error);if(status!=="partial")break;}
+    }
+    if(pending.length){
+      const checkedAt=new Date().toISOString();
+      const personalSql=personalHouseholdExistsSql();
+      const personalBindings=personalHouseholdBindings(user.id,syncProject.id,checkedAt);
+      const statements=[db.prepare(`UPDATE gmail_sync_runs SET status=status WHERE id=? AND user_id=? AND EXISTS(${personalSql})`).bind(runId,user.id,...personalBindings)];
+      for(const record of pending){
+        if(!record.exists){statements.push(db.prepare(`INSERT INTO gmail_messages (id,connection_id,gmail_message_id,sync_run_id,parse_status,provider,received_at,created_at)
+          SELECT ?,?,?,?,?,?,?,? WHERE EXISTS(${personalSql})`).bind(record.messageRowId,connectionId,record.gmailMessageId,runId,record.parsed.parse_status,record.parsed.provider,record.receivedAt,record.now,...personalBindings));}
+        statements.push(db.prepare(`INSERT INTO gmail_import_candidates (id,connection_id,gmail_message_row_id,user_id,status,provider,merchant_name,amount,occurred_at,payment_method,external_transaction_id,duplicate_warning,created_at,updated_at)
+          SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,? WHERE EXISTS(${personalSql})`).bind(record.candidateId,connectionId,record.messageRowId,user.id,record.parsed.parse_status === "parsed" ? "ready" : record.parsed.parse_status,record.parsed.provider,record.parsed.merchant_name,record.parsed.amount,record.parsed.occurred_at,record.parsed.payment_method,record.parsed.external_transaction_id,record.warning,record.now,record.now,...personalBindings));
+      }
+      const results=await db.batch(statements);
+      if(!changedRows(results[0]))throw new ApiError(403,"gmail_personal_household_lost");
+      processed+=pending.length;candidates+=pending.length;
     }
   } catch(error) {
     errors++; errorCode=safeErrorCode(error); status=error?.status===401?"reauthorization_required":error?.status===429?"rate_limited":"failed";
@@ -185,7 +198,7 @@ export async function decryptRefreshToken(env,connection){if(connection.aad_vers
 async function ownedConnection(db,user,id){const row=await db.prepare("SELECT * FROM gmail_connections WHERE id=? AND user_id=? AND status!='disconnected'").bind(id,user.id).first();if(!row)throw new ApiError(404,"not_found");return row;}
 async function ownedCandidate(db,user,id){const row=await db.prepare("SELECT * FROM gmail_import_candidates WHERE id=? AND user_id=?").bind(id,user.id).first();if(!row)throw new ApiError(404,"not_found");return row;}
 async function requirePersonalHousehold(db,userId,projectId,errorCode="gmail_personal_household_required"){projectId=bounded(projectId,"project_id",128);const timestamp=new Date().toISOString();const row=await db.prepare(`SELECT p.id FROM projects p JOIN project_user_roles owner ON owner.project_id=p.id AND owner.user_id=? AND owner.role='owner' AND owner.revoked_at IS NULL WHERE ${personalHouseholdPredicate()}`).bind(...personalHouseholdBindings(userId,projectId,timestamp)).first();if(!row)throw new ApiError(403,errorCode);return row;}
-async function requireAnyPersonalHousehold(db,userId){const timestamp=new Date().toISOString();const row=await db.prepare(`SELECT EXISTS(SELECT 1 FROM projects p JOIN project_user_roles owner ON owner.project_id=p.id AND owner.user_id=? AND owner.role='owner' AND owner.revoked_at IS NULL WHERE ${personalHouseholdPredicate(false)}) AS allowed`).bind(...personalHouseholdBindings(userId,null,timestamp)).first();if(!row?.allowed)throw new ApiError(403,"gmail_personal_household_required");}
+async function requireAnyPersonalHousehold(db,userId){const timestamp=new Date().toISOString();const row=await db.prepare(`SELECT p.id FROM projects p JOIN project_user_roles owner ON owner.project_id=p.id AND owner.user_id=? AND owner.role='owner' AND owner.revoked_at IS NULL WHERE ${personalHouseholdPredicate(false)} ORDER BY p.created_at,p.id LIMIT 1`).bind(...personalHouseholdBindings(userId,null,timestamp)).first();if(!row)throw new ApiError(403,"gmail_personal_household_required");return row;}
 function personalHouseholdPredicate(withProjectId=true){return `${withProjectId?"p.id=? AND ":""}p.project_type='household' AND NOT EXISTS(SELECT 1 FROM project_user_roles other WHERE other.project_id=p.id AND other.user_id<>? AND other.revoked_at IS NULL) AND NOT EXISTS(SELECT 1 FROM project_shares s WHERE s.project_id=p.id AND s.revoked_at IS NULL AND (s.expires_at IS NULL OR s.expires_at>?)) AND (p.share_token IS NULL OR (p.share_expires_at IS NOT NULL AND p.share_expires_at<=?))`;}
 function personalHouseholdExistsSql(){return `SELECT 1 FROM projects p JOIN project_user_roles owner ON owner.project_id=p.id AND owner.user_id=? AND owner.role='owner' AND owner.revoked_at IS NULL WHERE ${personalHouseholdPredicate()}`;}
 function personalHouseholdBindings(userId,projectId,timestamp){return projectId===null?[userId,userId,timestamp,timestamp]:[userId,projectId,userId,timestamp,timestamp];}
