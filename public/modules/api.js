@@ -459,7 +459,7 @@ function createApiClient(options = {}) {
       : { ...details, action: actionOrPayload };
     return request(`/imports/${encoded(importId, "importId")}/reconcile`, { method: "POST", json: payload });
   };
-  const startGmailConnection = () => request("/gmail/oauth/start", { method: "POST", json: {} });
+  const startGmailConnection = (projectId) => request("/gmail/oauth/start", { method: "POST", json: { project_id: projectId } });
 
   function gmailConnectionError(error, phase) {
     if (error?.status === 401 || error?.code === "authentication_required") {
@@ -543,7 +543,7 @@ function createApiClient(options = {}) {
     }
     requirePersonalGmailProject(cloudProject, project.id);
     try {
-      return await startGmailConnection();
+      return await startGmailConnection(project.id);
     } catch (error) {
       throw gmailConnectionError(error, "start");
     }

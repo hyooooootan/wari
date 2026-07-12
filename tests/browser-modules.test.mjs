@@ -427,6 +427,7 @@ test("Gmail接続前に画面の個人家計簿と同じ識別子でクラウド
     ["POST", "/api/gmail/oauth/start"],
   ]);
   assert.deepEqual(calls[1].body, { id: "home", name: "生活費", project_type: "household", currency: "JPY" });
+  assert.deepEqual(calls[3].body, { project_id: "home" });
 });
 
 test("作成済みの個人家計簿では重複作成せずGmail接続を開始する", async () => {
@@ -462,6 +463,30 @@ test("個人家計簿の作成競合後に再読込してGmail接続を続行す
     ["POST", "/api/projects"],
     ["GET", "/api/projects"],
     ["POST", "/api/gmail/oauth/start"],
+  ]);
+});
+
+test("個人家計簿の作成競合後に所有者でなければGmail接続を拒否する", async () => {
+  let listCount = 0;
+  const calls = [];
+  const client = WariApi.createApiClient({
+    fetch: async (url, options) => {
+      calls.push([options.method, url]);
+      if (url === "/api/projects" && options.method === "GET") {
+        listCount += 1;
+        return Response.json({ projects: listCount === 1 ? [] : [{ id: "home", project_type: "household", access_role: "editor" }] });
+      }
+      return Response.json({ error: "id_conflict" }, { status: 409 });
+    },
+  });
+  await assert.rejects(
+    () => client.startGmailConnectionForProject({ id: "home", name: "生活費", project_type: "household" }),
+    (error) => error.code === "gmail_shared_household_not_allowed",
+  );
+  assert.deepEqual(calls, [
+    ["GET", "/api/projects"],
+    ["POST", "/api/projects"],
+    ["GET", "/api/projects"],
   ]);
 });
 
@@ -526,5 +551,15 @@ test("Gmail接続準備の認証失効、共有家計簿、作成失敗を日本
   await assert.rejects(
     () => sharedAtStart.startGmailConnectionForProject({ id: "home", project_type: "household" }),
     (error) => error.code === "gmail_personal_household_required" && /共有中の家計簿/.test(error.message),
+  );
+
+  const oauthStartFailure = WariApi.createApiClient({
+    fetch: async (url) => url === "/api/projects"
+      ? Response.json({ projects: [{ id: "home", project_type: "household", access_role: "owner" }] })
+      : Response.json({ error: "server_error" }, { status: 500 }),
+  });
+  await assert.rejects(
+    () => oauthStartFailure.startGmailConnectionForProject({ id: "home", project_type: "household" }),
+    (error) => error.code === "server_error" && /Gmail接続を開始できませんでした/.test(error.message),
   );
 });

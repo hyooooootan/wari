@@ -10,16 +10,17 @@ const STATE_TTL_MS = 10 * 60 * 1000;
 const DAYS = new Set([7, 30, 90]);
 const encoder = new TextEncoder();
 
-export async function startGmailOAuth(db, env, request, user) {
+export async function startGmailOAuth(db, env, request, user, projectId) {
   requireConfig(env);
-  await requirePersonalHousehold(db,user.id);
+  projectId=bounded(projectId,"project_id",128);
+  await requirePersonalHousehold(db,user.id,projectId);
   const state = randomToken(32);
   const verifier = randomToken(48);
   const challenge = await base64Url(new Uint8Array(await crypto.subtle.digest("SHA-256", encoder.encode(verifier))));
   const now = new Date();
   const redirectUri = gmailRedirectUri(env, request);
-  await db.prepare(`INSERT INTO gmail_oauth_states (state_hash, user_id, created_at, expires_at, used_at) VALUES (?, ?, ?, ?, NULL)`)
-    .bind(await sha256Hex(state), user.id, now.toISOString(), new Date(now.getTime() + STATE_TTL_MS).toISOString()).run();
+  await db.prepare(`INSERT INTO gmail_oauth_states (state_hash, user_id, project_id, created_at, expires_at, used_at) VALUES (?, ?, ?, ?, ?, NULL)`)
+    .bind(await sha256Hex(state), user.id, projectId, now.toISOString(), new Date(now.getTime() + STATE_TTL_MS).toISOString()).run();
   const parameters = new URLSearchParams({ client_id: env.GMAIL_CLIENT_ID, redirect_uri: redirectUri, response_type: "code",
     scope: "https://www.googleapis.com/auth/gmail.readonly", access_type: "offline", prompt: "consent", state,
     code_challenge: challenge, code_challenge_method: "S256", include_granted_scopes: "false" });
@@ -42,7 +43,7 @@ export async function finishGmailOAuth(db, env, request, user) {
   const claimed = await db.prepare("UPDATE gmail_oauth_states SET used_at = ? WHERE state_hash = ? AND used_at IS NULL").bind(usedAt, stateHash).run();
   if (!claimed.meta?.changes) throw new ApiError(400, "invalid_gmail_oauth_state");
   if (url.searchParams.get("error")) throw new ApiError(400, "gmail_oauth_denied");
-  await requirePersonalHousehold(db,user.id);
+  await requirePersonalHousehold(db,user.id,state.project_id);
   const code = bounded(url.searchParams.get("code"), "code", 4096);
   const token = await googleForm(env, "https://oauth2.googleapis.com/token", { code, client_id: env.GMAIL_CLIENT_ID,
     client_secret: env.GMAIL_CLIENT_SECRET, redirect_uri: gmailRedirectUri(env, request), grant_type: "authorization_code", code_verifier: verifier });
@@ -86,7 +87,7 @@ export async function syncGmail(db, env, user, connectionId, input = {}) {
   const days = Number(input.days ?? 30); const limit = Number(input.limit ?? 100);
   if (!DAYS.has(days)) throw new ApiError(400, "invalid_field", { field: "days" });
   if (!Number.isInteger(limit) || limit < 1 || limit > 500) throw new ApiError(400, "invalid_field", { field: "limit" });
-  await requirePersonalHousehold(db,user.id);
+  await requireAnyPersonalHousehold(db,user.id);
   const connection = await ownedConnection(db, user, connectionId); const started = new Date().toISOString(); const runId = crypto.randomUUID();
   await db.prepare(`INSERT INTO gmail_sync_runs (id,connection_id,user_id,days,message_limit,status,started_at) VALUES (?,?,?,?,?,'running',?)`).bind(runId,connectionId,user.id,days,limit,started).run();
   let listed=0,processed=0,candidates=0,duplicates=0,errors=0,status="completed",errorCode=null;
@@ -140,7 +141,8 @@ export async function encryptRefreshToken(env,connectionId,userId,token){const g
 export async function decryptRefreshToken(env,connection){if(connection.aad_version!==1)throw new ApiError(500,"unsupported_gmail_token_aad");const key=await tokenKey(env,connection.key_generation);try{const decrypted=await crypto.subtle.decrypt({name:"AES-GCM",iv:fromBase64(connection.refresh_token_iv),additionalData:encoder.encode(`gmail-token:v1:${connection.id}:${connection.user_id}:${connection.key_generation}`)},key,fromBase64(connection.refresh_token_ciphertext));return new TextDecoder().decode(decrypted);}catch{throw new ApiError(500,"gmail_token_decryption_failed");}}
 async function ownedConnection(db,user,id){const row=await db.prepare("SELECT * FROM gmail_connections WHERE id=? AND user_id=? AND status!='disconnected'").bind(id,user.id).first();if(!row)throw new ApiError(404,"not_found");return row;}
 async function ownedCandidate(db,user,id){const row=await db.prepare("SELECT * FROM gmail_import_candidates WHERE id=? AND user_id=?").bind(id,user.id).first();if(!row)throw new ApiError(404,"not_found");return row;}
-async function requirePersonalHousehold(db,userId){const now=new Date().toISOString();const row=await db.prepare(`SELECT p.id FROM projects p JOIN project_user_roles owner ON owner.project_id=p.id AND owner.user_id=? AND owner.role='owner' AND owner.revoked_at IS NULL WHERE p.project_type='household' AND NOT EXISTS(SELECT 1 FROM project_user_roles other WHERE other.project_id=p.id AND other.user_id<>? AND other.revoked_at IS NULL) AND NOT EXISTS(SELECT 1 FROM project_shares s WHERE s.project_id=p.id AND s.revoked_at IS NULL AND (s.expires_at IS NULL OR s.expires_at>?)) LIMIT 1`).bind(userId,userId,now).first();if(!row)throw new ApiError(403,"gmail_personal_household_required");return row;}
+async function requirePersonalHousehold(db,userId,projectId){projectId=bounded(projectId,"project_id",128);const now=new Date().toISOString();const row=await db.prepare(`SELECT p.id FROM projects p JOIN project_user_roles owner ON owner.project_id=p.id AND owner.user_id=? AND owner.role='owner' AND owner.revoked_at IS NULL WHERE p.id=? AND p.project_type='household' AND NOT EXISTS(SELECT 1 FROM project_user_roles other WHERE other.project_id=p.id AND other.user_id<>? AND other.revoked_at IS NULL) AND NOT EXISTS(SELECT 1 FROM project_shares s WHERE s.project_id=p.id AND s.revoked_at IS NULL AND (s.expires_at IS NULL OR s.expires_at>?))`).bind(userId,projectId,userId,now).first();if(!row)throw new ApiError(403,"gmail_personal_household_required");return row;}
+async function requireAnyPersonalHousehold(db,userId){const now=new Date().toISOString();const row=await db.prepare(`SELECT EXISTS(SELECT 1 FROM projects p JOIN project_user_roles owner ON owner.project_id=p.id AND owner.user_id=? AND owner.role='owner' AND owner.revoked_at IS NULL WHERE p.project_type='household' AND NOT EXISTS(SELECT 1 FROM project_user_roles other WHERE other.project_id=p.id AND other.user_id<>? AND other.revoked_at IS NULL) AND NOT EXISTS(SELECT 1 FROM project_shares s WHERE s.project_id=p.id AND s.revoked_at IS NULL AND (s.expires_at IS NULL OR s.expires_at>?))) AS allowed`).bind(userId,userId,now).first();if(!row?.allowed)throw new ApiError(403,"gmail_personal_household_required");}
 async function duplicateWarning(db,userId,amount,occurredAt){const start=new Date(Date.parse(occurredAt)-7*86400000).toISOString(),end=new Date(Date.parse(occurredAt)+7*86400000).toISOString();const row=await db.prepare(`SELECT 1 FROM gmail_import_candidates WHERE user_id=? AND amount=? AND occurred_at BETWEEN ? AND ? LIMIT 1`).bind(userId,amount,start,end).first();return row?1:0;}
 function keyGeneration(env){const value=Number(env.GMAIL_TOKEN_KEY_CURRENT_GENERATION);if(!Number.isInteger(value)||value<1)throw new ApiError(500,"invalid_gmail_token_key_generation");return value;}
 async function tokenKey(env,generation){const raw=env[`GMAIL_TOKEN_KEY_V${generation}`];if(!raw)throw new ApiError(500,"missing_gmail_token_key");const bytes=fromBase64(raw);if(bytes.length!==32)throw new ApiError(500,"invalid_gmail_token_key");return crypto.subtle.importKey("raw",bytes,"AES-GCM",false,["encrypt","decrypt"]);}

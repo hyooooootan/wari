@@ -223,8 +223,8 @@ async function dispatchAccount(request, db, env) {
 async function dispatchGmail(request, db, env, url, path, user) {
   if (path.length === 3 && path[1] === "oauth" && path[2] === "start") {
     return invoke(request, ["POST"], async () => {
-      await readOptionalJson(request);
-      const result = await startGmailOAuth(db, env, request, user);
+      const input = await readJson(request);
+      const result = await startGmailOAuth(db, env, request, user, input.project_id);
       return json({ url: result.url }, 200, { "set-cookie": result.cookie });
     });
   }

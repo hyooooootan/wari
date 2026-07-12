@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import { decryptRefreshToken, disconnectGmail, encryptRefreshToken, importCandidate, syncGmail } from "../functions/lib/gmail.js";
+import { decryptRefreshToken, disconnectGmail, encryptRefreshToken, finishGmailOAuth, importCandidate, startGmailOAuth, syncGmail } from "../functions/lib/gmail.js";
 import { extractGmailText } from "../functions/lib/gmail-mime.js";
 import { parsePaymentNotification } from "../functions/lib/gmail-parsers.js";
 
@@ -55,6 +55,18 @@ test("AES-GCM token storage uses a 12-byte IV and binds connection, user, and ge
   assert.equal(await decryptRefreshToken(env, { id:"connection-1",user_id:"user-1",key_generation:1,aad_version:1,refresh_token_iv:encrypted.iv,refresh_token_ciphertext:encrypted.ciphertext }), "refresh-secret");
   await assert.rejects(() => decryptRefreshToken(env, { id:"connection-2",user_id:"user-1",key_generation:1,aad_version:1,refresh_token_iv:encrypted.iv,refresh_token_ciphertext:encrypted.ciphertext }), /gmail_token_decryption_failed/);
   await assert.rejects(() => decryptRefreshToken({ ...env, GMAIL_TOKEN_KEY_V1: undefined }, { id:"connection-1",user_id:"user-1",key_generation:1,aad_version:1,refresh_token_iv:encrypted.iv,refresh_token_ciphertext:encrypted.ciphertext }), /missing_gmail_token_key/);
+});
+
+test("OAuth callback revalidates the household selected at start", async (t) => {
+  const db=new Database();t.after(()=>db.close());seed(db);let fetchCalls=0;const env=environment(async()=>{fetchCalls+=1;return Response.json({});});
+  const started=await startGmailOAuth(db,env,new Request("https://example.test/api/gmail/oauth/start"),{id:"user-1"},"personal-home");
+  const state=new URL(started.url).searchParams.get("state");
+  const cookie=started.cookie.split(";",1)[0];
+  db.raw.prepare("INSERT INTO project_shares (id,project_id,token_hash,role,created_by_user_id,created_at,updated_at) VALUES (?,?,?,?,?,?,?)").run("share-after-start","personal-home","hash-after-start","viewer","user-1","2026-07-12T00:00:00.000Z","2026-07-12T00:00:00.000Z");
+  await assert.rejects(()=>finishGmailOAuth(db,env,new Request(`https://example.test/api/gmail/oauth/callback?state=${encodeURIComponent(state)}&code=code`,{headers:{cookie}}),{id:"user-1"}),/gmail_personal_household_required/);
+  assert.equal(fetchCalls,0);
+  assert.equal(db.raw.prepare("SELECT project_id FROM gmail_oauth_states").get().project_id,"personal-home");
+  assert.notEqual(db.raw.prepare("SELECT used_at FROM gmail_oauth_states").get().used_at,null);
 });
 
 test("message and candidate batch rollback permits a later sync retry", async (t) => {

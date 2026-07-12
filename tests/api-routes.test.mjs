@@ -192,6 +192,29 @@ test("project CRUD creates a household owner and enforces share expiry", async (
   assert.deepEqual(householdFinalize.body, { error: "project_not_split" });
 });
 
+test("Gmail OAuth start validates the selected household and requires a JSON project identifier", async (t) => {
+  const db = new D1Database();
+  t.after(() => db.close());
+  await createProject(db, { id: "shared-home", name: "共有中", project_type: "household" });
+  await createProject(db, { id: "private-home", name: "個人用", project_type: "household" });
+  await request(db, "POST", "/api/projects/shared-home/share");
+  const env = { GMAIL_CLIENT_ID: "test-client", GMAIL_CLIENT_SECRET: "test-secret" };
+
+  const empty = await request(db, "POST", "/api/gmail/oauth/start", undefined, env);
+  assert.equal(empty.response.status, 400);
+  assert.deepEqual(empty.body, { error: "invalid_json" });
+
+  const shared = await request(db, "POST", "/api/gmail/oauth/start", { project_id: "shared-home" }, env);
+  assert.equal(shared.response.status, 403);
+  assert.deepEqual(shared.body, { error: "gmail_personal_household_required" });
+  assert.equal(db.database.prepare("SELECT COUNT(*) AS total FROM gmail_oauth_states").get().total, 0);
+
+  const personal = await request(db, "POST", "/api/gmail/oauth/start", { project_id: "private-home" }, env);
+  assert.equal(personal.response.status, 200);
+  assert.match(personal.body.url, /^https:\/\/accounts\.google\.com\/o\/oauth2\/v2\/auth\?/);
+  assert.equal(db.database.prepare("SELECT project_id FROM gmail_oauth_states").get().project_id, "private-home");
+});
+
 test("row CRUD stays project-scoped and household records follow finalize and reopen", async (t) => {
   const db = new D1Database();
   t.after(() => db.close());

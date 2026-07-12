@@ -249,8 +249,9 @@ CREATE TABLE IF NOT EXISTS gmail_connections (
   UNIQUE (user_id, gmail_email), FOREIGN KEY (user_id) REFERENCES users(id) ON UPDATE CASCADE ON DELETE CASCADE
 );
 CREATE TABLE IF NOT EXISTS gmail_oauth_states (
-  state_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL, created_at TEXT NOT NULL, expires_at TEXT NOT NULL, used_at TEXT,
-  FOREIGN KEY (user_id) REFERENCES users(id) ON UPDATE CASCADE ON DELETE CASCADE
+  state_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL, project_id TEXT, created_at TEXT NOT NULL, expires_at TEXT NOT NULL, used_at TEXT,
+  FOREIGN KEY (user_id) REFERENCES users(id) ON UPDATE CASCADE ON DELETE CASCADE,
+  FOREIGN KEY (project_id) REFERENCES projects(id) ON UPDATE CASCADE ON DELETE CASCADE
 );
 CREATE TABLE IF NOT EXISTS gmail_sync_runs (
   id TEXT PRIMARY KEY, connection_id TEXT NOT NULL, user_id TEXT NOT NULL,
