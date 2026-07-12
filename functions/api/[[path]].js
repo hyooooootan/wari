@@ -69,6 +69,7 @@ import {
 import { handleReceiptOcr } from "../lib/ocr.js";
 import {
   disconnectGmail,
+  disconnectAllGmail,
   finishGmailOAuth,
   importCandidate,
   listCandidates,
@@ -130,7 +131,7 @@ async function dispatchReceiptOcr(request, db, env, url) {
 
 async function dispatch(request, db, env, url, path) {
   if (path[0] === "auth") return dispatchAuth(request, db, env, url, path);
-  if (path[0] === "account" && path.length === 1) return dispatchAccount(request, db);
+  if (path[0] === "account" && path.length === 1) return dispatchAccount(request, db, env);
   if (path[0] === "share" && path.length === 2) {
     return invoke(request, ["GET"], async () => json(await getSharedProject(db, path[1])));
   }
@@ -201,13 +202,13 @@ async function dispatchAuth(request, db, env, url, path) {
   return json({ error: "not_found" }, 404);
 }
 
-async function dispatchAccount(request, db) {
+async function dispatchAccount(request, db, env) {
   return invoke(request, ["DELETE"], async () => {
     const user = await requireUser(db, request);
     assertCsrf(request, user);
+    await disconnectAllGmail(db, env, user);
     const timestamp = new Date().toISOString();
     await db.batch([
-      db.prepare("UPDATE gmail_connections SET refresh_token_ciphertext = '', refresh_token_iv = '', status = 'disconnected', updated_at = ? WHERE user_id = ?").bind(timestamp, user.id),
       db.prepare("UPDATE users SET deleted_at = ?, updated_at = ? WHERE id = ?").bind(timestamp, timestamp, user.id),
       db.prepare("UPDATE sessions SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL").bind(timestamp, user.id),
       db.prepare("UPDATE project_user_roles SET revoked_at = ?, updated_at = ? WHERE user_id = ? AND revoked_at IS NULL").bind(timestamp, timestamp, user.id),
@@ -229,10 +230,16 @@ async function dispatchGmail(request, db, env, url, path, user) {
   }
   if (path.length === 3 && path[1] === "oauth" && path[2] === "callback") {
     return invoke(request, ["GET"], async () => {
-      const result = await finishGmailOAuth(db, env, request, user);
-      const headers = new Headers({ location: env.APP_ORIGIN || new URL("/", url).toString() });
-      headers.append("set-cookie", result.clearCookie);
-      return new Response(null, { status: 302, headers });
+      try {
+        const result = await finishGmailOAuth(db, env, request, user);
+        const headers = new Headers({ location: env.APP_ORIGIN || new URL("/", url).toString() });
+        headers.append("set-cookie", result.clearCookie);
+        return new Response(null, { status: 302, headers });
+      } catch (error) {
+        const response = errorResponse(error);
+        response.headers.append("set-cookie", clearCookieHeader("wari_gmail_oauth"));
+        return response;
+      }
     });
   }
   if (path.length === 2 && path[1] === "connections") return invoke(request, ["GET"], async () => json(await listConnections(db, user)));

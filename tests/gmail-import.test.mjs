@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import { decryptRefreshToken, encryptRefreshToken, syncGmail } from "../functions/lib/gmail.js";
+import { decryptRefreshToken, disconnectGmail, encryptRefreshToken, importCandidate, syncGmail } from "../functions/lib/gmail.js";
 import { extractGmailText } from "../functions/lib/gmail-mime.js";
 import { parsePaymentNotification } from "../functions/lib/gmail-parsers.js";
 
@@ -15,11 +15,26 @@ class Statement {
   bind(...bindings) { return new Statement(this.database, this.sql, bindings); }
   async first() { return this.database.prepare(this.sql).get(...this.bindings) ?? null; }
   async all() { return { results: this.database.prepare(this.sql).all(...this.bindings) }; }
-  async run() { const value = this.database.prepare(this.sql).run(...this.bindings); return { meta: { changes: Number(value.changes) } }; }
+  async run() { if(this.database.owner?.failSqlOnce&&this.sql.includes(this.database.owner.failSqlOnce)){this.database.owner.failSqlOnce=null;throw new Error("injected_statement_failure");}const value = this.database.prepare(this.sql).run(...this.bindings); return { meta: { changes: Number(value.changes) } }; }
 }
 class Database {
   constructor() { this.raw = new DatabaseSync(":memory:"); this.raw.exec(schema); }
-  prepare(sql) { return new Statement(this.raw, sql); }
+  prepare(sql) { const statement=new Statement(this.raw, sql);statement.database.owner=this;return statement; }
+  async batch(statements) {
+    this.raw.exec("BEGIN");
+    try {
+      const results=[];
+      for (let index=0;index<statements.length;index++) {
+        if (this.failBatchAt===index) throw new Error("injected_batch_failure");
+        results.push(await statements[index].run());
+      }
+      this.raw.exec("COMMIT");
+      return results;
+    } catch (error) {
+      this.raw.exec("ROLLBACK");
+      throw error;
+    } finally { this.failBatchAt=undefined; }
+  }
   close() { this.raw.close(); }
 }
 
@@ -28,6 +43,8 @@ function environment(fetch) { return { GMAIL_CLIENT_ID: "client", GMAIL_CLIENT_S
 function seed(db) {
   const now = "2026-07-12T00:00:00.000Z";
   db.raw.prepare("INSERT INTO users (id,google_sub,email,created_at,updated_at) VALUES (?,?,?,?,?)").run("user-1","sub-1","user@example.test",now,now);
+  db.raw.prepare("INSERT INTO projects (id,name,project_type,created_at,updated_at) VALUES (?,?,?,?,?)").run("personal-home","Personal","household",now,now);
+  db.raw.prepare("INSERT INTO project_user_roles (project_id,user_id,role,created_at,updated_at) VALUES (?,?,?,?,?)").run("personal-home","user-1","owner",now,now);
 }
 
 test("AES-GCM token storage uses a 12-byte IV and binds connection, user, and generation through AAD", async () => {
@@ -38,6 +55,41 @@ test("AES-GCM token storage uses a 12-byte IV and binds connection, user, and ge
   assert.equal(await decryptRefreshToken(env, { id:"connection-1",user_id:"user-1",key_generation:1,aad_version:1,refresh_token_iv:encrypted.iv,refresh_token_ciphertext:encrypted.ciphertext }), "refresh-secret");
   await assert.rejects(() => decryptRefreshToken(env, { id:"connection-2",user_id:"user-1",key_generation:1,aad_version:1,refresh_token_iv:encrypted.iv,refresh_token_ciphertext:encrypted.ciphertext }), /gmail_token_decryption_failed/);
   await assert.rejects(() => decryptRefreshToken({ ...env, GMAIL_TOKEN_KEY_V1: undefined }, { id:"connection-1",user_id:"user-1",key_generation:1,aad_version:1,refresh_token_iv:encrypted.iv,refresh_token_ciphertext:encrypted.ciphertext }), /missing_gmail_token_key/);
+});
+
+test("message and candidate batch rollback permits a later sync retry", async (t) => {
+  const db=new Database();t.after(()=>db.close());seed(db);const env=environment(async(url)=>{
+    if(String(url).includes("oauth2.googleapis.com/token"))return Response.json({access_token:"access-secret"});
+    if(String(url).includes("/messages?"))return Response.json({messages:[{id:"retry-message"}]});
+    return Response.json({payload:{mimeType:"text/plain",headers:[{name:"From",value:"notice@jcb.co.jp"}],body:{data:base64Url("amount 1200 2026/07/10 shop")}}});
+  });
+  const encrypted=await encryptRefreshToken(env,"retry-connection","user-1","refresh-secret");
+  db.raw.prepare(`INSERT INTO gmail_connections (id,user_id,gmail_email,refresh_token_ciphertext,refresh_token_iv,key_generation,aad_version,status,created_at,updated_at) VALUES (?,?,?,?,?,?,1,'active',?,?)`).run("retry-connection","user-1","retry@example.test",encrypted.ciphertext,encrypted.iv,1,"2026-07-12T00:00:00.000Z","2026-07-12T00:00:00.000Z");
+  db.failBatchAt=1;const failed=await syncGmail(db,env,{id:"user-1"},"retry-connection",{days:7,limit:1});
+  assert.equal(failed.run.error_count,1);assert.equal(db.raw.prepare("SELECT count(*) AS n FROM gmail_messages").get().n,0);
+  const retried=await syncGmail(db,env,{id:"user-1"},"retry-connection",{days:7,limit:1});
+  assert.equal(retried.run.candidate_count,1);assert.equal(db.raw.prepare("SELECT count(*) AS n FROM gmail_import_candidates").get().n,1);
+});
+
+test("failed revocation retains encrypted token for retry", async (t) => {
+  const db=new Database();t.after(()=>db.close());seed(db);const env=environment(async()=>new Response("unavailable",{status:503}));
+  const encrypted=await encryptRefreshToken(env,"revoke-connection","user-1","refresh-secret");
+  db.raw.prepare(`INSERT INTO gmail_connections (id,user_id,gmail_email,refresh_token_ciphertext,refresh_token_iv,key_generation,aad_version,status,created_at,updated_at) VALUES (?,?,?,?,?,?,1,'active',?,?)`).run("revoke-connection","user-1","revoke@example.test",encrypted.ciphertext,encrypted.iv,1,"2026-07-12T00:00:00.000Z","2026-07-12T00:00:00.000Z");
+  await assert.rejects(()=>disconnectGmail(db,env,{id:"user-1"},"revoke-connection"),/gmail_revocation_failed/);
+  const row=db.raw.prepare("SELECT status,refresh_token_ciphertext FROM gmail_connections WHERE id=?").get("revoke-connection");assert.equal(row.status,"active");assert.equal(row.refresh_token_ciphertext,encrypted.ciphertext);
+});
+
+test("shared household rejects Gmail candidate import", async (t) => {
+  const db=new Database();t.after(()=>db.close());seed(db);const now="2026-07-12T00:00:00.000Z";
+  db.raw.prepare("INSERT INTO projects (id,name,project_type,created_at,updated_at) VALUES (?,?,?,?,?)").run("shared-home","Home","household",now,now);
+  db.raw.prepare("INSERT INTO project_user_roles (project_id,user_id,role,created_at,updated_at) VALUES (?,?,?,?,?)").run("shared-home","user-1","owner",now,now);
+  db.raw.prepare("INSERT INTO project_shares (id,project_id,token_hash,role,created_by_user_id,created_at,updated_at) VALUES (?,?,?,?,?,?,?)").run("share-1","shared-home","hash-1","viewer","user-1",now,now);
+  db.raw.prepare("INSERT INTO gmail_connections (id,user_id,gmail_email,refresh_token_ciphertext,refresh_token_iv,key_generation,aad_version,status,created_at,updated_at) VALUES (?,?,?,?,?,?,1,'active',?,?)").run("c1","user-1","mail@example.test","x","y",1,now,now);
+  db.raw.prepare("INSERT INTO gmail_sync_runs (id,connection_id,user_id,days,message_limit,status,started_at) VALUES (?,?,?,?,?,'completed',?)").run("run-1","c1","user-1",7,1,now);
+  db.raw.prepare("INSERT INTO gmail_messages (id,connection_id,gmail_message_id,sync_run_id,parse_status,created_at) VALUES (?,?,?,?,?,?)").run("m1","c1","gm1","run-1","parsed",now);
+  db.raw.prepare("INSERT INTO gmail_import_candidates (id,connection_id,gmail_message_row_id,user_id,status,merchant_name,amount,occurred_at,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)").run("candidate-1","c1","m1","user-1","ready","Shop",1000,now,now,now);
+  await assert.rejects(()=>importCandidate(db,{id:"user-1"},"candidate-1",{project_id:"shared-home"}),/gmail_import_target_forbidden/);
+  assert.equal(db.raw.prepare("SELECT count(*) AS n FROM transactions WHERE project_id=?").get("shared-home").n,0);
 });
 
 test("nested mixed and alternative MIME prefers plain text and decodes Base64URL", () => {
@@ -75,10 +127,32 @@ test("sync stores structured candidates, deduplicates Gmail Message ID, and reta
 });
 
 test("401 and 429 produce restrained run states", async (t) => {
-  for (const [status, expected] of [[401,"reauthorization_required"],[429,"rate_limited"]]) {
+  for (const [status, expected] of [[401,"reauthorization_required"],[403,"reauthorization_required"],[429,"rate_limited"]]) {
     const db=new Database(); seed(db); const env=environment(async()=>new Response("denied",{status}));
     const encrypted=await encryptRefreshToken(env,`connection-${status}`,"user-1","refresh-secret");
     db.raw.prepare(`INSERT INTO gmail_connections (id,user_id,gmail_email,refresh_token_ciphertext,refresh_token_iv,key_generation,aad_version,status,created_at,updated_at) VALUES (?,?,?,?,?,?,1,'active',?,?)`).run(`connection-${status}`,"user-1",`${status}@example.test`,encrypted.ciphertext,encrypted.iv,1,"2026-07-12T00:00:00.000Z","2026-07-12T00:00:00.000Z");
     const result=await syncGmail(db,env,{id:"user-1"},`connection-${status}`,{days:7,limit:1}); assert.equal(result.run.status,expected); db.close();
   }
+});
+
+test("token invalid_grant requests reauthorization without Gmail API calls", async (t) => {
+  const db=new Database();t.after(()=>db.close());seed(db);let calls=0;const env=environment(async()=>{calls++;return Response.json({error:"invalid_grant"},{status:400});});
+  const encrypted=await encryptRefreshToken(env,"invalid-grant","user-1","refresh-secret");
+  db.raw.prepare(`INSERT INTO gmail_connections (id,user_id,gmail_email,refresh_token_ciphertext,refresh_token_iv,key_generation,aad_version,status,created_at,updated_at) VALUES (?,?,?,?,?,?,1,'active',?,?)`).run("invalid-grant","user-1","invalid@example.test",encrypted.ciphertext,encrypted.iv,1,"2026-07-12T00:00:00.000Z","2026-07-12T00:00:00.000Z");
+  const result=await syncGmail(db,env,{id:"user-1"},"invalid-grant",{days:7,limit:1});assert.equal(result.run.status,"reauthorization_required");assert.equal(calls,1);
+});
+
+test("candidate import retry repairs its final status without a second transaction", async (t) => {
+  const db=new Database();t.after(()=>db.close());seed(db);const now="2026-07-12T00:00:00.000Z";
+  db.raw.prepare("INSERT INTO projects (id,name,project_type,created_at,updated_at) VALUES (?,?,?,?,?)").run("private-home","Home","household",now,now);
+  db.raw.prepare("INSERT INTO project_user_roles (project_id,user_id,role,created_at,updated_at) VALUES (?,?,?,?,?)").run("private-home","user-1","owner",now,now);
+  db.raw.prepare("INSERT INTO project_members (id,project_id,display_name,role,is_active,created_at,updated_at) VALUES (?,?,?,?,?,?,?)").run("member-1","private-home","Owner","owner",1,now,now);
+  db.raw.prepare("INSERT INTO gmail_connections (id,user_id,gmail_email,refresh_token_ciphertext,refresh_token_iv,key_generation,aad_version,status,created_at,updated_at) VALUES (?,?,?,?,?,?,1,'active',?,?)").run("c2","user-1","mail2@example.test","x","y",1,now,now);
+  db.raw.prepare("INSERT INTO gmail_sync_runs (id,connection_id,user_id,days,message_limit,status,started_at) VALUES (?,?,?,?,?,'completed',?)").run("run-2","c2","user-1",7,1,now);
+  db.raw.prepare("INSERT INTO gmail_messages (id,connection_id,gmail_message_id,sync_run_id,parse_status,created_at) VALUES (?,?,?,?,?,?)").run("m2","c2","gm2","run-2","parsed",now);
+  db.raw.prepare("INSERT INTO gmail_import_candidates (id,connection_id,gmail_message_row_id,user_id,status,merchant_name,amount,occurred_at,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)").run("candidate-2","c2","m2","user-1","ready","Shop",1000,now,now,now);
+  db.failSqlOnce="UPDATE gmail_import_candidates SET status='imported'";
+  await assert.rejects(()=>importCandidate(db,{id:"user-1"},"candidate-2",{project_id:"private-home"}),/injected_statement_failure/);
+  await importCandidate(db,{id:"user-1"},"candidate-2",{project_id:"private-home"});
+  assert.equal(db.raw.prepare("SELECT count(*) AS n FROM transactions WHERE project_id=?").get("private-home").n,1);assert.equal(db.raw.prepare("SELECT status FROM gmail_import_candidates WHERE id=?").get("candidate-2").status,"imported");
 });

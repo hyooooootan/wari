@@ -27,6 +27,10 @@ Local tests use `OAUTH_MOCK_USER_JSON` for provider callback tests when needed. 
 
 The Gmail connection is separate from login OAuth. It uses authorization code flow, S256 PKCE, a single-use state expiring after ten minutes, and `https://www.googleapis.com/auth/gmail.readonly`. Authorization requests use `access_type=offline` and `prompt=consent`.
 
+Gmail connections and imports are available for an owner's personal household. A household with another active user role or an active, unexpired share cannot receive Gmail candidates. Message metadata and candidate creation use one D1 batch, and candidate import uses the shared import path with a stable transaction identity so interrupted work can be retried. Message bodies, HTML, attachments, access tokens, refresh tokens, and encryption keys are not stored in import data or synchronization records.
+
+Disconnect and account deletion revoke each Google grant before removing its encrypted refresh token. A provider failure leaves the ciphertext available for a later retry; an already-invalid grant is treated as revoked. OAuth errors consume a valid state and clear the OAuth cookie. `invalid_grant` and Gmail 401/403 responses mark the connection for reauthorization, while Gmail 429 responses stop the run as rate limited.
+
 Create a separate OAuth client in Google Cloud and register `https://<application-host>/api/gmail/oauth/callback` as an authorized redirect URI. Configure Cloudflare Secrets `GMAIL_CLIENT_ID`, `GMAIL_CLIENT_SECRET`, `GMAIL_TOKEN_KEY_V1` (a Base64-encoded 32-byte key), and `GMAIL_TOKEN_KEY_CURRENT_GENERATION=1`. Set `GMAIL_REDIRECT_URI` where an explicit callback URI is required. Do not commit these values.
 
 The implemented operation is user-initiated synchronization for 7, 30, or 90 days. Scheduled synchronization, notifications, tracking later email edits or deletion, and Google production verification are not implemented.
