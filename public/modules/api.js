@@ -460,6 +460,94 @@ function createApiClient(options = {}) {
     return request(`/imports/${encoded(importId, "importId")}/reconcile`, { method: "POST", json: payload });
   };
   const startGmailConnection = () => request("/gmail/oauth/start", { method: "POST", json: {} });
+
+  function gmailConnectionError(error, phase) {
+    if (error?.status === 401 || error?.code === "authentication_required") {
+      return new ApiError("Googleログインの有効期限が切れています。Googleでログインし直してください", {
+        status: 401,
+        code: "gmail_authentication_required",
+        cause: error,
+      });
+    }
+    if (error?.code === "gmail_personal_household_required") {
+      return new ApiError("共有中の家計簿ではGmailを接続できません。共有していない個人家計簿を開いてください", {
+        status: error.status,
+        code: error.code,
+        cause: error,
+      });
+    }
+    const message = phase === "create"
+      ? "クラウド側に個人家計簿を作成できませんでした。時間をおいて再度お試しください"
+      : phase === "verify"
+        ? "クラウド側の個人家計簿を確認できませんでした。画面を再読み込みして再度お試しください"
+        : "Gmail接続を開始できませんでした。時間をおいて再度お試しください";
+    return new ApiError(message, {
+      status: error?.status ?? 0,
+      code: error?.code || `gmail_${phase}_failed`,
+      cause: error,
+    });
+  }
+
+  function projectRows(result) {
+    return Array.isArray(result) ? result : Array.isArray(result?.projects) ? result.projects : [];
+  }
+
+  function requirePersonalGmailProject(project, projectId) {
+    if (!project) {
+      throw new ApiError("クラウド側の個人家計簿を確認できませんでした。画面を再読み込みして再度お試しください", {
+        status: 409,
+        code: "gmail_household_verification_failed",
+      });
+    }
+    if (project.project_type !== "household" || project.access_role !== "owner") {
+      throw new ApiError("共有家計簿ではGmailを接続できません。個人家計簿を開いてください", {
+        status: 403,
+        code: "gmail_shared_household_not_allowed",
+        details: { project_id: projectId },
+      });
+    }
+    return project;
+  }
+
+  async function startGmailConnectionForProject(project) {
+    if (!project?.id || project.project_type !== "household") {
+      throw new ApiError("共有家計簿ではGmailを接続できません。個人家計簿を開いてください", {
+        status: 403,
+        code: "gmail_shared_household_not_allowed",
+      });
+    }
+    let rows;
+    try {
+      rows = projectRows(await listProjects());
+    } catch (error) {
+      throw gmailConnectionError(error, "verify");
+    }
+    let cloudProject = rows.find((row) => row.id === project.id);
+    if (!cloudProject) {
+      try {
+        await createProject({
+          id: project.id,
+          name: project.name || "個人家計簿",
+          project_type: "household",
+          currency: project.currency || "JPY",
+        });
+      } catch (error) {
+        if (error?.code !== "id_conflict") throw gmailConnectionError(error, "create");
+      }
+      try {
+        rows = projectRows(await listProjects());
+      } catch (error) {
+        throw gmailConnectionError(error, "verify");
+      }
+      cloudProject = rows.find((row) => row.id === project.id);
+    }
+    requirePersonalGmailProject(cloudProject, project.id);
+    try {
+      return await startGmailConnection();
+    } catch (error) {
+      throw gmailConnectionError(error, "start");
+    }
+  }
   const listGmailConnections = () => request("/gmail/connections");
   const disconnectGmail = (connectionId) => request(`/gmail/connections/${encoded(connectionId)}`, { method: "DELETE" });
   const syncGmail = (connectionId, days = 30, limit = 100) => request(`/gmail/connections/${encoded(connectionId)}/sync`, { method: "POST", json: { days, limit } });
@@ -650,6 +738,7 @@ function createApiClient(options = {}) {
     createCsvImports: importCsv,
     reconcileImport,
     startGmailConnection,
+    startGmailConnectionForProject,
     listGmailConnections,
     disconnectGmail,
     syncGmail,

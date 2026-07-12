@@ -1,4 +1,4 @@
-import * as ApiModule from "./modules/api.js?v=20260712-ledger6";
+import * as ApiModule from "./modules/api.js?v=20260713-gmail1";
 import * as ImportsModule from "./modules/imports.js?v=20260712-ledger6";
 import * as HouseholdModule from "./modules/household.js?v=20260712-ledger6";
 
@@ -2037,7 +2037,9 @@ document.addEventListener("click", async (event) => {
       return;
     }
     if (button.dataset.gmailConnect !== undefined) {
-      const result = await Api.startGmailConnection();
+      if (!project) throw new Error("Gmailを接続する個人家計簿が見つかりません");
+      const result = await Api.startGmailConnectionForProject(project);
+      if (!result?.url) throw new Error("Gmailの認可先を取得できませんでした");
       location.assign(result.url);
       return;
     }
