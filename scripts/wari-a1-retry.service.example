@@ -1,0 +1,17 @@
+[Unit]
+Description=Wari OCI A1 retry launcher
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/wari-a1-retry
+EnvironmentFile=/opt/wari-a1-retry/.env
+ExecStart=/opt/wari-a1-retry/.venv/bin/python /opt/wari-a1-retry/run_a1_retry_with_discord.py
+Restart=on-failure
+RestartSec=60
+
+[Install]
+WantedBy=multi-user.target
