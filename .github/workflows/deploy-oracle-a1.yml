@@ -1,0 +1,121 @@
+name: Deploy OCR to Oracle A1
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: Type DEPLOY to run the deployment
+        required: true
+        type: string
+
+concurrency:
+  group: oracle-a1-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    if: ${{ inputs.confirm == 'DEPLOY' }}
+    runs-on: ubuntu-latest
+    environment: oracle-a1
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Validate required secrets
+        shell: bash
+        env:
+          OCI_HOST: ${{ secrets.OCI_HOST }}
+          OCI_USER: ${{ secrets.OCI_USER }}
+          OCI_SSH_PRIVATE_KEY: ${{ secrets.OCI_SSH_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "$OCI_HOST" || { echo "OCI_HOST is missing" >&2; exit 1; }
+          test -n "$OCI_USER" || { echo "OCI_USER is missing" >&2; exit 1; }
+          test -n "$OCI_SSH_PRIVATE_KEY" || { echo "OCI_SSH_PRIVATE_KEY is missing" >&2; exit 1; }
+
+      - name: Prepare SSH
+        shell: bash
+        env:
+          OCI_HOST: ${{ secrets.OCI_HOST }}
+          OCI_SSH_PRIVATE_KEY: ${{ secrets.OCI_SSH_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$OCI_SSH_PRIVATE_KEY" > ~/.ssh/oracle_a1
+          chmod 600 ~/.ssh/oracle_a1
+          ssh-keyscan -H "$OCI_HOST" >> ~/.ssh/known_hosts
+
+      - name: Build deployment archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar \
+            --exclude='.git' \
+            --exclude='.github' \
+            --exclude='node_modules' \
+            --exclude='**/.venv' \
+            --exclude='scripts/oci_a1_config.json' \
+            --exclude='INSTANCE_CREATED.json' \
+            -czf /tmp/wari-release.tar.gz .
+
+      - name: Prepare OCR environment file
+        shell: bash
+        env:
+          OCR_ENV_FILE: ${{ secrets.OCR_ENV_FILE }}
+        run: |
+          set -euo pipefail
+          if [ -n "$OCR_ENV_FILE" ]; then
+            printf '%s\n' "$OCR_ENV_FILE" > /tmp/wari-ocr.env
+            chmod 600 /tmp/wari-ocr.env
+          fi
+
+      - name: Upload release
+        shell: bash
+        env:
+          OCI_HOST: ${{ secrets.OCI_HOST }}
+          OCI_USER: ${{ secrets.OCI_USER }}
+        run: |
+          set -euo pipefail
+          scp -i ~/.ssh/oracle_a1 /tmp/wari-release.tar.gz \
+            "$OCI_USER@$OCI_HOST:/tmp/wari-release.tar.gz"
+          scp -i ~/.ssh/oracle_a1 scripts/deploy_oracle_a1.sh \
+            "$OCI_USER@$OCI_HOST:/tmp/deploy_oracle_a1.sh"
+          if [ -f /tmp/wari-ocr.env ]; then
+            scp -i ~/.ssh/oracle_a1 /tmp/wari-ocr.env \
+              "$OCI_USER@$OCI_HOST:/tmp/wari-ocr.env"
+          fi
+
+      - name: Install and restart OCR service
+        shell: bash
+        env:
+          OCI_HOST: ${{ secrets.OCI_HOST }}
+          OCI_USER: ${{ secrets.OCI_USER }}
+        run: |
+          set -euo pipefail
+          ssh -i ~/.ssh/oracle_a1 "$OCI_USER@$OCI_HOST" 'bash -s' <<'REMOTE'
+          set -euo pipefail
+          rm -rf /tmp/wari-release
+          mkdir -p /tmp/wari-release
+          tar -xzf /tmp/wari-release.tar.gz -C /tmp/wari-release
+          chmod 700 /tmp/deploy_oracle_a1.sh
+          sudo APP_USER="$(id -un)" \
+            RELEASE_SOURCE=/tmp/wari-release \
+            ENV_SOURCE=/tmp/wari-ocr.env \
+            bash /tmp/deploy_oracle_a1.sh
+          rm -rf /tmp/wari-release /tmp/wari-release.tar.gz /tmp/deploy_oracle_a1.sh /tmp/wari-ocr.env
+          REMOTE
+
+      - name: Verify public health endpoint
+        shell: bash
+        env:
+          OCI_HOST: ${{ secrets.OCI_HOST }}
+        run: |
+          set -euo pipefail
+          curl --retry 5 --retry-delay 3 --fail --silent --show-error \
+            "http://$OCI_HOST:4190/health"
+          echo
