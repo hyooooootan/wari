@@ -83,3 +83,49 @@ CREATE TABLE IF NOT EXISTS project_shares (
 
 CREATE INDEX IF NOT EXISTS idx_project_shares_project_id ON project_shares(project_id);
 CREATE INDEX IF NOT EXISTS idx_project_shares_token ON project_shares(token);
+
+CREATE TABLE IF NOT EXISTS gmail_oauth_states (
+  state TEXT PRIMARY KEY,
+  expires_at TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_gmail_oauth_states_expires_at ON gmail_oauth_states(expires_at);
+
+CREATE TABLE IF NOT EXISTS gmail_connections (
+  id TEXT PRIMARY KEY,
+  email TEXT,
+  refresh_token_ciphertext TEXT NOT NULL,
+  scope TEXT NOT NULL,
+  last_sync_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS gmail_payment_candidates (
+  id TEXT PRIMARY KEY,
+  gmail_message_id TEXT NOT NULL UNIQUE,
+  thread_id TEXT,
+  subject TEXT,
+  sender TEXT,
+  received_at TEXT,
+  merchant TEXT,
+  amount INTEGER NOT NULL,
+  currency TEXT NOT NULL DEFAULT 'JPY',
+  paid_at TEXT,
+  payment_method TEXT,
+  confidence REAL NOT NULL DEFAULT 0,
+  body_excerpt TEXT,
+  parser TEXT NOT NULL DEFAULT 'heuristic',
+  status TEXT NOT NULL DEFAULT 'pending',
+  imported_project_id TEXT,
+  imported_expense_id TEXT,
+  imported_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY (imported_project_id) REFERENCES projects(id) ON DELETE SET NULL,
+  FOREIGN KEY (imported_expense_id) REFERENCES expenses(id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_gmail_payment_candidates_status ON gmail_payment_candidates(status);
+CREATE INDEX IF NOT EXISTS idx_gmail_payment_candidates_paid_at ON gmail_payment_candidates(paid_at);
