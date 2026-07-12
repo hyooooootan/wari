@@ -4,13 +4,13 @@ const IMAGE_TYPES = new Set(["image/jpeg", "image/png", "image/webp", "image/gif
 const DEFAULT_MAX_IMAGE_BYTES = 10 * 1024 * 1024;
 const DEFAULT_TIMEOUT_MS = 25_000;
 
-export async function handleReceiptOcr(request, env) {
+export async function handleReceiptOcr(request, env, payload = null) {
   const maximumBytes = maxImageBytes(env);
   const declaredLength = Number(request.headers.get("content-length"));
   if (Number.isFinite(declaredLength) && declaredLength > Math.ceil(maximumBytes * 4 / 3) + 4_096) {
     throw new ApiError(413, "image_too_large", { max_bytes: maximumBytes });
   }
-  const payload = await readJson(request);
+  payload = payload || await readJson(request);
   const image = parseImageDataUrl(payload.image_data_url, maximumBytes);
   const backend = String(env.OCR_BACKEND || "auto").toLowerCase();
   if (backend === "remote" || backend === "tesseract_ollama") return readReceiptWithRemoteOcr(image.dataUrl, env);

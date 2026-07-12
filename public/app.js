@@ -70,6 +70,7 @@ let savingCount = 0;
 let activeProjectId = null;
 let lastToastTimer = 0;
 let remoteSyncQueue = Promise.resolve();
+const shareTokensByProject = new Map();
 const ui = {
   createMode: null,
   draftNames: [],
@@ -1742,11 +1743,14 @@ function rejectImport(project, record) {
   });
 }
 
-async function readReceiptFile(file) {
+async function readReceiptFile(file, projectId) {
   Imports.validateImageFile(file);
   const imageDataUrl = await Imports.readImageAsDataUrl(file);
-  if (typeof Api.readReceipt === "function") return Api.readReceipt(imageDataUrl);
-  return requestApi("/api/ocr-receipt", { method: "POST", json: { image_data_url: imageDataUrl } });
+  const payload = { image_data_url: imageDataUrl, project_id: projectId };
+  const shareToken = shareTokensByProject.get(projectId);
+  if (shareToken) payload.share_token = shareToken;
+  if (typeof Api.readReceipt === "function") return Api.readReceipt(payload);
+  return requestApi("/api/ocr-receipt", { method: "POST", json: payload });
 }
 
 async function handleSplitReceipt(input) {
@@ -1757,7 +1761,9 @@ async function handleSplitReceipt(input) {
   receipt.type = "";
   render();
   try {
-    const result = await readReceiptFile(input.files[0]);
+    const project = target === "createSplit" ? currentProject() || primaryHouseholdProject() : currentProject();
+    if (!project) throw new Error("プロジェクトを選択してください");
+    const result = await readReceiptFile(input.files[0], project.id);
     receipt.items = (result.items || []).map((item) => ({ name: String(item.name || "").trim(), amount: integer(item.amount) })).filter((item) => item.name && item.amount > 0);
     receipt.status = `${receipt.items.length}件を読み取りました`;
     receipt.type = "success";
@@ -1779,7 +1785,7 @@ async function handleHouseholdReceipt(input) {
   if (!project || !input.files?.[0]) return;
   toast("レシートを読み取っています");
   try {
-    const result = await readReceiptFile(input.files[0]);
+    const result = await readReceiptFile(input.files[0], project.id);
     addReceiptImport(project, result);
   } catch (error) {
     toast(error.message || "レシートを読み取れませんでした");
@@ -1865,6 +1871,7 @@ async function joinSharedProject(token) {
   state = Storage.mergeProjectGraph(state, graph);
   saveLocal();
   const projectId = graph.projects?.[0]?.id;
+  if (graph.share?.role === "editor" && graph.share?.token && projectId) shareTokensByProject.set(projectId, graph.share.token);
   if (!projectId) throw new Error("共有プロジェクトが見つかりません");
   location.hash = `#/p/${encodeURIComponent(projectId)}`;
 }

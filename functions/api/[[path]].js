@@ -15,6 +15,7 @@ import {
   getSharedProject,
   getTransactionGraph,
   listProjectMembers,
+  listProjectsForUser,
   listProjects,
   listTransactions,
   markProjectFinalized,
@@ -28,6 +29,30 @@ import {
   updateTransactionItem,
   updateTransactionPayment,
 } from "../lib/api-data.js";
+import {
+  CSRF_COOKIE,
+  clearCookieHeader,
+  createSession,
+  ensureUser,
+  getSessionUser,
+  requireUser,
+  revokeCurrentSession,
+  sessionCookieHeaders,
+  assertCsrf,
+} from "../lib/auth.js";
+import { assertOrigin } from "../lib/csrf.js";
+import { createGoogleStart, finishGoogleCallback } from "../lib/oauth.js";
+import {
+  grantProjectRole,
+  projectIdForImport,
+  projectIdForItem,
+  projectIdForMember,
+  projectIdForPayment,
+  projectIdForTransaction,
+  requireProjectRole,
+  requireProjectShareRole,
+} from "../lib/permissions.js";
+import { withSecurityHeaders } from "../lib/security-headers.js";
 import {
   cancelGeneratedForSource,
   syncSplitProjectToHouseholds,
@@ -52,103 +77,221 @@ const RECONCILE_ACTIONS = new Set(["link", "create", "reject", "unlink"]);
 export async function onRequest(context) {
   const request = context.request;
   try {
+    assertOrigin(request, context.env || {});
     const url = new URL(request.url);
     const path = requestPath(url.pathname);
-    if (path[0] === "ocr-receipt" && path.length === 1) {
-      return await invoke(request, ["POST"], () => handleReceiptOcr(request, context.env || {}));
-    }
     const db = context.env?.DB;
     if (!db) throw new ApiError(500, "missing_d1_binding");
-    return await dispatch(request, db, url, path);
+    if (path[0] === "ocr-receipt" && path.length === 1) {
+      return withSecurityHeaders(await dispatchReceiptOcr(request, db, context.env || {}, url));
+    }
+    const response = await dispatch(request, db, context.env || {}, url, path);
+    return withSecurityHeaders(response);
   } catch (error) {
-    return errorResponse(error);
+    return withSecurityHeaders(errorResponse(error));
   }
 }
 
-async function dispatch(request, db, url, path) {
-  if (path[0] === "projects") return dispatchProjects(request, db, url, path);
+async function dispatchReceiptOcr(request, db, env, url) {
+  return invoke(request, ["POST"], async () => {
+    const body = await readJson(request);
+    const projectId = body.project_id ?? url.searchParams.get("project_id");
+    if (typeof projectId !== "string" || projectId.trim() === "") throw new ApiError(400, "missing_field", { field: "project_id" });
+    const user = await getSessionUser(db, request);
+    if (user) {
+      assertCsrf(request, user);
+      try {
+        await requireProjectRole(db, user, projectId, "editor");
+        return handleReceiptOcr(request, env, body);
+      } catch (error) {
+        if (!(error instanceof ApiError) || error.code !== "not_found") throw error;
+      }
+    }
+    const shareToken = bearerToken(request) ?? body.share_token ?? url.searchParams.get("share_token");
+    if (shareToken) {
+      await requireProjectShareRole(db, projectId, shareToken, "editor");
+      return handleReceiptOcr(request, env, body);
+    }
+    if (!user) throw new ApiError(401, "authentication_required");
+    throw new ApiError(404, "not_found");
+  });
+}
+
+async function dispatch(request, db, env, url, path) {
+  if (path[0] === "auth") return dispatchAuth(request, db, env, url, path);
+  if (path[0] === "account" && path.length === 1) return dispatchAccount(request, db);
   if (path[0] === "share" && path.length === 2) {
     return invoke(request, ["GET"], async () => json(await getSharedProject(db, path[1])));
   }
+  const user = await requireUser(db, request);
+  assertCsrf(request, user);
+  if (path[0] === "projects") return dispatchProjects(request, db, url, path, user);
   if ((path[0] === "project-members" || path[0] === "members") && path.length >= 2) {
-    return dispatchMember(request, db, path);
+    return dispatchMember(request, db, path, user);
   }
   if (path[0] === "transactions" && path.length >= 2) {
-    return dispatchTransaction(request, db, path);
+    return dispatchTransaction(request, db, path, user);
   }
   if ((path[0] === "transaction-payments" || path[0] === "payments") && path.length === 2) {
-    return dispatchPayment(request, db, path[1]);
+    return dispatchPayment(request, db, path[1], user);
   }
   if ((path[0] === "transaction-items" || path[0] === "items") && path.length >= 2) {
-    return dispatchItem(request, db, path);
+    return dispatchItem(request, db, path, user);
   }
   if (path[0] === "imports" && path.length === 3 && path[2] === "reconcile") {
-    return invoke(request, ["POST"], () => handleReconcile(request, db, path[1]));
+    return invoke(request, ["POST"], async () => {
+      await requireProjectRole(db, user, await projectIdForImport(db, path[1]), "editor");
+      return handleReconcile(request, db, path[1]);
+    });
   }
   return json({ error: "not_found" }, 404);
 }
 
-async function dispatchProjects(request, db, url, path) {
+async function dispatchAuth(request, db, env, url, path) {
+  if (path.length === 2 && path[1] === "session") {
+    return invoke(request, ["GET"], async () => {
+      const user = await getSessionUser(db, request);
+      const headers = new Headers();
+      if (user) headers.append("set-cookie", `${CSRF_COOKIE}=${encodeURIComponent(user.csrf_token)}; Path=/; Secure; SameSite=Lax`);
+      return json({ authenticated: Boolean(user), user: user ? publicUser(user) : null, csrf_token: user?.csrf_token || null }, 200, headers);
+    });
+  }
+  if (path.length === 3 && path[1] === "google" && path[2] === "start") {
+    return invoke(request, ["POST"], async () => {
+      const start = await createGoogleStart(db, env, request);
+      return json({ url: start.url }, 200, { "set-cookie": start.cookie });
+    });
+  }
+  if (path.length === 3 && path[1] === "google" && path[2] === "callback") {
+    return invoke(request, ["GET"], async () => {
+      const callback = await finishGoogleCallback(db, env, request);
+      const user = await ensureUser(db, callback.profile);
+      const session = await createSession(db, user.id);
+      const headers = new Headers({
+        location: env.APP_ORIGIN || new URL("/", url).toString(),
+      });
+      headers.append("set-cookie", callback.clearCookie);
+      for (const cookie of sessionCookieHeaders(session)) headers.append("set-cookie", cookie);
+      return new Response(null, { status: 302, headers });
+    });
+  }
+  if (path.length === 2 && path[1] === "logout") {
+    return invoke(request, ["POST"], async () => {
+      const user = await requireUser(db, request);
+      assertCsrf(request, user);
+      await revokeCurrentSession(db, request);
+      const headers = new Headers();
+      headers.append("set-cookie", clearCookieHeader("wari_session"));
+      headers.append("set-cookie", clearCookieHeader(CSRF_COOKIE));
+      return json({ ok: true }, 200, headers);
+    });
+  }
+  return json({ error: "not_found" }, 404);
+}
+
+async function dispatchAccount(request, db) {
+  return invoke(request, ["DELETE"], async () => {
+    const user = await requireUser(db, request);
+    assertCsrf(request, user);
+    const timestamp = new Date().toISOString();
+    await db.batch([
+      db.prepare("UPDATE users SET deleted_at = ?, updated_at = ? WHERE id = ?").bind(timestamp, timestamp, user.id),
+      db.prepare("UPDATE sessions SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL").bind(timestamp, user.id),
+      db.prepare("UPDATE project_user_roles SET revoked_at = ?, updated_at = ? WHERE user_id = ? AND revoked_at IS NULL").bind(timestamp, timestamp, user.id),
+    ]);
+    const headers = new Headers();
+    headers.append("set-cookie", clearCookieHeader("wari_session"));
+    headers.append("set-cookie", clearCookieHeader(CSRF_COOKIE));
+    return json({ ok: true }, 200, headers);
+  });
+}
+
+async function dispatchProjects(request, db, url, path, user) {
   if (path.length === 1) {
-    if (request.method === "GET") return json(await listProjects(db));
-    if (request.method === "POST") return json(await createProject(db, await readJson(request)), 201);
+    if (request.method === "GET") return json(await listProjectsForUser(db, user));
+    if (request.method === "POST") {
+      const result = await createProject(db, await readJson(request));
+      await grantProjectRole(db, result.projects[0].id, user.id, "owner");
+      return json(result, 201);
+    }
     return methodNotAllowed(["GET", "POST"]);
   }
   const projectId = path[1];
   if (path.length === 2) {
     if (request.method === "GET") {
+      await requireProjectRole(db, user, projectId, "viewer");
       const graph = await getProjectGraph(db, projectId);
       if (graph.projects.length === 0) throw new ApiError(404, "not_found");
       return json(graph);
     }
     if (request.method === "PATCH") {
+      await requireProjectRole(db, user, projectId, "editor");
       const result = await updateProject(db, projectId, await readJson(request));
       if (result.project.project_type !== "split") await cancelGeneratedForSource(db, projectId);
       else await syncSplitProjectToHouseholds(db, projectId, { validate: false });
       return json(result);
     }
     if (request.method === "DELETE") {
+      await requireProjectRole(db, user, projectId, "owner");
       await cancelGeneratedForSource(db, projectId);
       return json(await deleteProject(db, projectId));
     }
     return methodNotAllowed(["GET", "PATCH", "DELETE"]);
   }
   if (path[2] === "share" && path.length === 3) {
-    return invoke(request, ["POST"], async () => json(await createProjectShare(db, projectId, await readOptionalJson(request))));
+    return invoke(request, ["POST"], async () => {
+      await requireProjectRole(db, user, projectId, "owner");
+      return json(await createProjectShare(db, projectId, await readOptionalJson(request), user));
+    });
   }
-  if (path[2] === "members") return dispatchProjectMembers(request, db, url, path);
-  if (path[2] === "transactions") return dispatchProjectTransactions(request, db, url, path);
-  if (path[2] === "imports") return dispatchProjectImports(request, db, url, path);
+  if (path[2] === "members") return dispatchProjectMembers(request, db, url, path, user);
+  if (path[2] === "transactions") return dispatchProjectTransactions(request, db, url, path, user);
+  if (path[2] === "imports") return dispatchProjectImports(request, db, url, path, user);
   if (path[2] === "summaries" && path.length === 3) {
-    return invoke(request, ["GET"], async () => json(await getProjectSummaries(db, projectId)));
+    return invoke(request, ["GET"], async () => {
+      await requireProjectRole(db, user, projectId, "viewer");
+      return json(await getProjectSummaries(db, projectId));
+    });
   }
   if (path[2] === "finalize" && path.length === 3) {
-    return invoke(request, ["POST"], () => finalizeProject(db, projectId));
+    return invoke(request, ["POST"], async () => {
+      await requireProjectRole(db, user, projectId, "editor");
+      return finalizeProject(db, projectId);
+    });
   }
   if (path[2] === "reopen" && path.length === 3) {
-    return invoke(request, ["POST"], () => reopenProject(db, projectId));
+    return invoke(request, ["POST"], async () => {
+      await requireProjectRole(db, user, projectId, "editor");
+      return reopenProject(db, projectId);
+    });
   }
   return json({ error: "not_found" }, 404);
 }
 
-async function dispatchProjectMembers(request, db, url, path) {
+async function dispatchProjectMembers(request, db, url, path, user) {
   const projectId = path[1];
   if (path.length === 3) {
     if (request.method === "GET") {
+      await requireProjectRole(db, user, projectId, "viewer");
       assertQueryFields(url.searchParams, new Set(["include_inactive"]));
       const includeInactive = booleanQuery(url.searchParams.get("include_inactive"), "include_inactive", false);
       return json(await listProjectMembers(db, projectId, includeInactive));
     }
-    if (request.method === "POST") return json(await createProjectMember(db, projectId, await readJson(request)), 201);
+    if (request.method === "POST") {
+      await requireProjectRole(db, user, projectId, "editor");
+      return json(await createProjectMember(db, projectId, await readJson(request)), 201);
+    }
     return methodNotAllowed(["GET", "POST"]);
   }
   if (path.length === 4) {
     if (request.method === "PATCH") {
+      await requireProjectRole(db, user, projectId, "editor");
       const result = await updateProjectMember(db, path[3], await readJson(request), projectId);
       await syncSplitProjectToHouseholds(db, projectId, { validate: false });
       return json(result);
     }
     if (request.method === "DELETE") {
+      await requireProjectRole(db, user, projectId, "editor");
       const result = await deleteProjectMember(db, path[3], projectId);
       await syncSplitProjectToHouseholds(db, projectId, { validate: false });
       return json(result);
@@ -158,15 +301,17 @@ async function dispatchProjectMembers(request, db, url, path) {
   return json({ error: "not_found" }, 404);
 }
 
-async function dispatchMember(request, db, path) {
+async function dispatchMember(request, db, path, user) {
   const memberId = path[1];
   if (path.length === 2) {
     if (request.method === "PATCH") {
+      await requireProjectRole(db, user, await projectIdForMember(db, memberId), "editor");
       const result = await updateProjectMember(db, memberId, await readJson(request));
       await syncSplitProjectToHouseholds(db, result.project_member.project_id, { validate: false });
       return json(result);
     }
     if (request.method === "DELETE") {
+      await requireProjectRole(db, user, await projectIdForMember(db, memberId), "editor");
       const member = await memberProject(db, memberId);
       const result = await deleteProjectMember(db, memberId);
       await syncSplitProjectToHouseholds(db, member.project_id, { validate: false });
@@ -176,6 +321,7 @@ async function dispatchMember(request, db, path) {
   }
   if (path.length === 3 && path[2] === "household-link") {
     return invoke(request, ["PATCH"], async () => {
+      await requireProjectRole(db, user, await projectIdForMember(db, memberId), "editor");
       const result = await updateMemberHouseholdLink(db, memberId, await readJson(request));
       await syncSplitProjectToHouseholds(db, result.project_member.project_id, { validate: false });
       return json(result);
@@ -184,11 +330,15 @@ async function dispatchMember(request, db, path) {
   return json({ error: "not_found" }, 404);
 }
 
-async function dispatchProjectTransactions(request, db, url, path) {
+async function dispatchProjectTransactions(request, db, url, path, user) {
   const projectId = path[1];
   if (path.length === 3) {
-    if (request.method === "GET") return json(await listTransactions(db, projectId, url.searchParams));
+    if (request.method === "GET") {
+      await requireProjectRole(db, user, projectId, "viewer");
+      return json(await listTransactions(db, projectId, url.searchParams));
+    }
     if (request.method === "POST") {
+      await requireProjectRole(db, user, projectId, "editor");
       const result = await createTransaction(db, projectId, await readJson(request));
       await syncSplitTransactionToHouseholds(db, result.transaction.id, { validate: false });
       return json(result, 201);
@@ -196,22 +346,28 @@ async function dispatchProjectTransactions(request, db, url, path) {
     return methodNotAllowed(["GET", "POST"]);
   }
   if (path.length === 4) {
+    await requireProjectRole(db, user, projectId, "viewer");
     await assertTransactionProject(db, path[3], projectId);
-    return dispatchTransaction(request, db, ["transactions", path[3]]);
+    return dispatchTransaction(request, db, ["transactions", path[3]], user);
   }
   return json({ error: "not_found" }, 404);
 }
 
-async function dispatchTransaction(request, db, path) {
+async function dispatchTransaction(request, db, path, user) {
   const transactionId = path[1];
   if (path.length === 2) {
-    if (request.method === "GET") return json(await getTransactionGraph(db, transactionId));
+    if (request.method === "GET") {
+      await requireProjectRole(db, user, await projectIdForTransaction(db, transactionId), "viewer");
+      return json(await getTransactionGraph(db, transactionId));
+    }
     if (request.method === "PATCH") {
+      await requireProjectRole(db, user, await projectIdForTransaction(db, transactionId), "editor");
       const result = await updateTransaction(db, transactionId, await readJson(request));
       await syncSplitTransactionToHouseholds(db, transactionId, { validate: false });
       return json(result);
     }
     if (request.method === "DELETE") {
+      await requireProjectRole(db, user, await projectIdForTransaction(db, transactionId), "editor");
       const result = await deleteTransaction(db, transactionId);
       await syncSplitTransactionToHouseholds(db, transactionId, { sourceProjectId: result.project_id, validate: false });
       return json({ ok: true });
@@ -220,16 +376,20 @@ async function dispatchTransaction(request, db, path) {
   }
   if (path[2] === "payments") {
     if (path.length === 3) {
-      return invoke(request, ["POST"], async () => json(await createTransactionPayment(db, transactionId, await readJson(request)), 201));
+      return invoke(request, ["POST"], async () => {
+        await requireProjectRole(db, user, await projectIdForTransaction(db, transactionId), "editor");
+        return json(await createTransactionPayment(db, transactionId, await readJson(request)), 201);
+      });
     }
     if (path.length === 4) {
       await assertPaymentTransaction(db, path[3], transactionId);
-      return dispatchPayment(request, db, path[3]);
+      return dispatchPayment(request, db, path[3], user);
     }
   }
   if (path[2] === "items") {
     if (path.length === 3) {
       return invoke(request, ["POST"], async () => {
+        await requireProjectRole(db, user, await projectIdForTransaction(db, transactionId), "editor");
         const result = await createTransactionItem(db, transactionId, await readJson(request));
         await syncSplitTransactionToHouseholds(db, transactionId, { validate: false });
         return json(result, 201);
@@ -237,53 +397,63 @@ async function dispatchTransaction(request, db, path) {
     }
     if (path.length === 4) {
       await assertItemTransaction(db, path[3], transactionId);
-      return dispatchItem(request, db, ["items", path[3]]);
+      return dispatchItem(request, db, ["items", path[3]], user);
     }
     if (path.length === 5 && path[4] === "allocations") {
       await assertItemTransaction(db, path[3], transactionId);
-      return replaceAllocations(request, db, path[3]);
+      return replaceAllocations(request, db, path[3], user);
     }
   }
   return json({ error: "not_found" }, 404);
 }
 
-async function dispatchPayment(request, db, paymentId) {
-  if (request.method === "PATCH") return json(await updateTransactionPayment(db, paymentId, await readJson(request)));
-  if (request.method === "DELETE") return json(await deleteTransactionPayment(db, paymentId));
+async function dispatchPayment(request, db, paymentId, user) {
+  if (request.method === "PATCH") {
+    await requireProjectRole(db, user, await projectIdForPayment(db, paymentId), "editor");
+    return json(await updateTransactionPayment(db, paymentId, await readJson(request)));
+  }
+  if (request.method === "DELETE") {
+    await requireProjectRole(db, user, await projectIdForPayment(db, paymentId), "editor");
+    return json(await deleteTransactionPayment(db, paymentId));
+  }
   return methodNotAllowed(["PATCH", "DELETE"]);
 }
 
-async function dispatchItem(request, db, path) {
+async function dispatchItem(request, db, path, user) {
   const itemId = path[1];
   if (path.length === 2) {
     if (request.method === "PATCH") {
+      await requireProjectRole(db, user, await projectIdForItem(db, itemId), "editor");
       const result = await updateTransactionItem(db, itemId, await readJson(request));
       await syncSplitTransactionToHouseholds(db, result.transaction_item.transaction_id, { validate: false });
       return json(result);
     }
     if (request.method === "DELETE") {
+      await requireProjectRole(db, user, await projectIdForItem(db, itemId), "editor");
       const result = await deleteTransactionItem(db, itemId);
       await syncSplitTransactionToHouseholds(db, result.transaction_id, { sourceProjectId: result.project_id, validate: false });
       return json({ ok: true });
     }
     return methodNotAllowed(["PATCH", "DELETE"]);
   }
-  if (path.length === 3 && path[2] === "allocations") return replaceAllocations(request, db, itemId);
+  if (path.length === 3 && path[2] === "allocations") return replaceAllocations(request, db, itemId, user);
   return json({ error: "not_found" }, 404);
 }
 
-async function replaceAllocations(request, db, itemId) {
+async function replaceAllocations(request, db, itemId, user) {
   return invoke(request, ["PUT"], async () => {
+    await requireProjectRole(db, user, await projectIdForItem(db, itemId), "editor");
     const result = await replaceItemAllocations(db, itemId, await readJson(request));
     await syncSplitTransactionToHouseholds(db, result.transaction_id, { validate: false });
     return json(result);
   });
 }
 
-async function dispatchProjectImports(request, db, url, path) {
+async function dispatchProjectImports(request, db, url, path, user) {
   const projectId = path[1];
   if (path.length === 3) {
     return invoke(request, ["GET"], async () => {
+      await requireProjectRole(db, user, projectId, "viewer");
       const options = importListOptions(url.searchParams);
       await requireProject(db, projectId);
       return json({ imports: await listImports(db, projectId, options) });
@@ -293,6 +463,7 @@ async function dispatchProjectImports(request, db, url, path) {
     return json({ error: "not_found" }, 404);
   }
   return invoke(request, ["POST"], async () => {
+    await requireProjectRole(db, user, projectId, "editor");
     await requireOpenProject(db, projectId);
     const body = await readJson(request);
     let result;
@@ -308,6 +479,10 @@ async function dispatchProjectImports(request, db, url, path) {
     await syncSplitProjectToHouseholds(db, projectId, { validate: false });
     return json(result, 201);
   });
+}
+
+function publicUser(user) {
+  return { id: user.id, email: user.email, name: user.name };
 }
 
 async function handleReconcile(request, db, importId) {
@@ -364,6 +539,12 @@ function requestPath(pathname) {
   } catch {
     throw new ApiError(400, "invalid_path");
   }
+}
+
+function bearerToken(request) {
+  const header = request.headers.get("authorization") || "";
+  const match = /^Bearer\s+(.+)$/iu.exec(header);
+  return match ? match[1].trim() : null;
 }
 
 async function memberProject(db, memberId) {

@@ -8,16 +8,22 @@ const repositoryRoot = path.resolve(__dirname, '..');
 const schemaSql = readFileSync(path.join(repositoryRoot, 'db', 'schema.sql'), 'utf8');
 const baselineSql = readFileSync(path.join(repositoryRoot, 'db', 'migrations', '0001_initial.sql'), 'utf8');
 const migrationSql = readFileSync(path.join(repositoryRoot, 'db', 'migrations', '0002_household_ledger.sql'), 'utf8');
+const authMigrationSql = readFileSync(path.join(repositoryRoot, 'db', 'migrations', '0003_auth_ownership_shares.sql'), 'utf8');
 const verificationSql = readFileSync(path.join(repositoryRoot, 'db', 'verify_household_ledger.sql'), 'utf8');
 
 const runtimeTables = [
   'import_records',
   'item_allocations',
+  'oauth_states',
   'project_members',
+  'project_shares',
+  'project_user_roles',
   'projects',
+  'sessions',
   'transaction_items',
   'transaction_payments',
   'transactions',
+  'users',
 ];
 
 const requestedIndexes = [
@@ -27,8 +33,12 @@ const requestedIndexes = [
   'idx_import_records_source_record',
   'idx_import_records_transaction',
   'idx_item_allocations_item',
+  'idx_oauth_states_expiry',
   'idx_project_members_project',
+  'idx_project_shares_project',
+  'idx_project_user_roles_user',
   'idx_projects_share_token',
+  'idx_sessions_user',
   'idx_transaction_items_transaction',
   'idx_transaction_payments_external_payment',
   'idx_transaction_payments_transaction',
@@ -244,8 +254,8 @@ test('fresh schema creates the seven runtime tables and requested indexes', (t) 
   assert.equal(allocationMemberKey.on_delete, 'RESTRICT');
 });
 
-test('numbered migrations create the seven runtime tables from an empty database', (t) => {
-  const database = openDatabase(`${baselineSql}\n${migrationSql}`);
+test('numbered migrations create the runtime tables from an empty database', (t) => {
+  const database = openDatabase(`${baselineSql}\n${migrationSql}\n${authMigrationSql}`);
   t.after(() => database.close());
 
   assert.deepEqual(tableNames(database), runtimeTables);
@@ -258,7 +268,7 @@ test('legacy migration preserves data and creates deterministic ledger rows', (t
   t.after(() => database.close());
   seedLegacyDatabase(database);
 
-  database.exec(`BEGIN IMMEDIATE;\n${migrationSql}\nCOMMIT;`);
+  database.exec(`BEGIN IMMEDIATE;\n${migrationSql}\n${authMigrationSql}\nCOMMIT;`);
 
   const freshDatabase = openDatabase(schemaSql);
   t.after(() => freshDatabase.close());
@@ -286,6 +296,19 @@ test('legacy migration preserves data and creates deterministic ledger rows', (t
     created_at: '2026-01-01T00:00:00.000Z',
     updated_at: '2026-01-01T00:00:00.000Z',
   });
+
+  const ownerUnknown = database
+    .prepare("SELECT id, deleted_at FROM users WHERE id = 'owner_unknown'")
+    .get();
+  assert.equal(ownerUnknown.id, 'owner_unknown');
+  assert.equal(typeof ownerUnknown.deleted_at, 'string');
+  assert.deepEqual(
+    database.prepare("SELECT project_id, user_id, role FROM project_user_roles ORDER BY project_id").all().map((row) => ({ ...row })),
+    [
+      { project_id: 'split-a', user_id: 'owner_unknown', role: 'owner' },
+      { project_id: 'split-b', user_id: 'owner_unknown', role: 'owner' },
+    ],
+  );
 
   const migratedMembers = database
     .prepare(`

@@ -1,5 +1,6 @@
 import { normalizeMerchant } from "./normalization.js";
 import { ApiError } from "./responses.js";
+import { sha256Hex } from "./crypto.js";
 
 export const PROJECT_GRAPH_KEYS = Object.freeze([
   "projects",
@@ -34,7 +35,29 @@ export async function listProjects(db) {
     FROM projects
     ORDER BY updated_at DESC, created_at DESC, id`),
   );
-  return { projects: results };
+  return { projects: sanitizeProjects(results) };
+}
+
+export async function listProjectsForUser(db, user) {
+  const results = await all(
+    db.prepare(`SELECT
+      projects.*,
+      roles.role AS access_role,
+      (SELECT COUNT(*) FROM project_members WHERE project_id = projects.id AND is_active = 1) AS member_count,
+      (SELECT COUNT(*) FROM transactions WHERE project_id = projects.id) AS transaction_count,
+      (SELECT COUNT(*) FROM import_records WHERE project_id = projects.id) AS import_count,
+      COALESCE((SELECT SUM(paid_amount) FROM transactions
+        WHERE project_id = projects.id
+          AND status IN ('confirmed', 'refunded', 'corrected')
+          AND entry_type IN ('purchase', 'split_expense', 'refund', 'adjustment')), 0) AS confirmed_total
+    FROM projects
+    JOIN project_user_roles roles
+      ON roles.project_id = projects.id
+     AND roles.user_id = ?
+     AND roles.revoked_at IS NULL
+    ORDER BY projects.updated_at DESC, projects.created_at DESC, projects.id`).bind(user.id),
+  );
+  return { projects: sanitizeProjects(results) };
 }
 
 export async function createProject(db, input) {
@@ -84,7 +107,7 @@ export async function createProject(db, input) {
 export async function getProjectGraph(db, projectId) {
   const id = pathId(projectId);
   const graph = emptyGraph();
-  graph.projects = await all(db.prepare("SELECT * FROM projects WHERE id = ?").bind(id));
+  graph.projects = sanitizeProjects(await all(db.prepare("SELECT * FROM projects WHERE id = ?").bind(id)));
   if (graph.projects.length === 0) return graph;
   graph.project_members = await all(db.prepare("SELECT * FROM project_members WHERE project_id = ? ORDER BY created_at, id").bind(id));
   graph.transactions = await all(db.prepare("SELECT * FROM transactions WHERE project_id = ? ORDER BY occurred_at, created_at, id").bind(id));
@@ -127,7 +150,7 @@ export async function updateProject(db, projectId, input) {
   if (has(input, "currency")) addAssignment(assignments, bindings, "currency", requiredCurrency(input, "currency"));
   addAssignment(assignments, bindings, "updated_at", now());
   await db.prepare(`UPDATE projects SET ${assignments.join(", ")} WHERE id = ?`).bind(...bindings, id).run();
-  return { project: await db.prepare("SELECT * FROM projects WHERE id = ?").bind(id).first() };
+  return { project: sanitizeProject(await db.prepare("SELECT * FROM projects WHERE id = ?").bind(id).first()) };
 }
 
 export async function deleteProject(db, projectId) {
@@ -143,7 +166,7 @@ export async function deleteProject(db, projectId) {
   return { ok: true };
 }
 
-export async function createProjectShare(db, projectId, input = {}) {
+export async function createProjectShare(db, projectId, input = {}, user = null) {
   const id = pathId(projectId);
   assertObject(input);
   assertAllowed(input, ["role", "expires_at", "rotate"]);
@@ -152,16 +175,72 @@ export async function createProjectShare(db, projectId, input = {}) {
   const expiresAtValue = has(input, "expires_at") ? nullableDate(input, "expires_at") : project.share_expires_at;
   const expiresAt = expiresAtValue === null ? null : new Date(expiresAtValue).toISOString();
   const rotate = has(input, "rotate") ? requiredBoolean(input, "rotate") : false;
-  const token = project.share_token && !rotate ? project.share_token : makeToken();
-  await db.prepare(`UPDATE projects
-    SET share_token = ?, share_role = ?, share_expires_at = ?, updated_at = ?
-    WHERE id = ?`).bind(token, role, expiresAt, now(), id).run();
+  const timestamp = now();
+  const statements = [];
+  if (rotate) {
+    statements.push(
+      db.prepare(`UPDATE project_shares
+        SET revoked_at = ?, updated_at = ?
+        WHERE project_id = ? AND revoked_at IS NULL`).bind(timestamp, timestamp, id),
+    );
+  }
+  let token = null;
+  if (!rotate) {
+    const activeShare = await db.prepare(`SELECT * FROM project_shares
+      WHERE project_id = ?
+        AND role = ?
+        AND revoked_at IS NULL
+        AND ((expires_at IS NULL AND ? IS NULL) OR expires_at = ?)
+      ORDER BY created_at DESC
+      LIMIT 1`).bind(id, role, expiresAt, expiresAt).first();
+    if (activeShare) token = null;
+  }
+  token = token || makeToken();
+  statements.push(
+    db.prepare(`INSERT INTO project_shares (
+      id, project_id, token_hash, role, expires_at, revoked_at, created_by_user_id, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?)`).bind(
+      makeId("shr"),
+      id,
+      await sha256Hex(token),
+      role,
+      expiresAt,
+      user?.id || null,
+      timestamp,
+      timestamp,
+    ),
+  );
+  statements.push(
+    db.prepare(`UPDATE projects
+      SET share_token = ?, share_role = ?, share_expires_at = ?, updated_at = ?
+      WHERE id = ?`).bind(rotate ? null : project.share_token, role, expiresAt, timestamp, id),
+  );
+  await db.batch(statements);
   return { project_id: id, token, role, expires_at: expiresAt };
 }
 
 export async function getSharedProject(db, tokenValue) {
   const token = boundedString(tokenValue, "token", 16, 256, false);
   const timestamp = now();
+  const share = await db.prepare(`SELECT shares.*, projects.share_token
+    FROM project_shares shares
+    JOIN projects ON projects.id = shares.project_id
+    WHERE shares.token_hash = ?
+      AND shares.revoked_at IS NULL
+      AND (shares.expires_at IS NULL OR shares.expires_at > ?)
+    LIMIT 1`).bind(await sha256Hex(token), timestamp).first();
+  if (share) {
+    const graph = await getProjectGraph(db, share.project_id);
+    return {
+      ...graph,
+      share: {
+        project_id: share.project_id,
+        token,
+        role: share.role,
+        expires_at: share.expires_at,
+      },
+    };
+  }
   const project = await db.prepare(`SELECT * FROM projects
     WHERE share_token = ? AND (share_expires_at IS NULL OR share_expires_at > ?)
     LIMIT 1`).bind(token, timestamp).first();
@@ -817,7 +896,7 @@ export async function markProjectFinalized(db, projectId, timestamp = now()) {
   const id = pathId(projectId);
   await requireProject(db, id);
   await db.prepare("UPDATE projects SET finalized_at = ?, updated_at = ? WHERE id = ?").bind(timestamp, timestamp, id).run();
-  return { project: await db.prepare("SELECT * FROM projects WHERE id = ?").bind(id).first() };
+  return { project: sanitizeProject(await db.prepare("SELECT * FROM projects WHERE id = ?").bind(id).first()) };
 }
 
 export async function markProjectReopened(db, projectId) {
@@ -830,7 +909,7 @@ export async function markProjectReopened(db, projectId) {
       SET status = 'cancelled', updated_at = ?
       WHERE origin_project_id = ? AND generated_automatically = 1 AND status <> 'cancelled'`).bind(timestamp, id),
   ]);
-  return { project: await db.prepare("SELECT * FROM projects WHERE id = ?").bind(id).first() };
+  return { project: sanitizeProject(await db.prepare("SELECT * FROM projects WHERE id = ?").bind(id).first()) };
 }
 
 export async function requireProject(db, projectId) {
@@ -846,6 +925,16 @@ export function makeId(prefix) {
 
 function emptyGraph() {
   return Object.fromEntries(PROJECT_GRAPH_KEYS.map((key) => [key, []]));
+}
+
+function sanitizeProject(project) {
+  if (!project) return project;
+  const { share_token, ...safeProject } = project;
+  return safeProject;
+}
+
+function sanitizeProjects(projects) {
+  return projects.map((project) => sanitizeProject(project));
 }
 
 async function requireWritableProject(db, projectId) {

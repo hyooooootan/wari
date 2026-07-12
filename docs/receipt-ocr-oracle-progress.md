@@ -20,6 +20,8 @@ POST /ocr
 POST /api/ocr-receipt
 ```
 
+Cloudflare Pages Functions 側の `/api/ocr-receipt` は `project_id` を受け取り、そのプロジェクトへの編集権限を持つログイン済みセッション、または編集権限の共有トークンを確認してから OCR に転送する。
+
 `services/receipt_ocr/tesseract_ollama.py` を追加し、次の処理を行う。
 
 ```text

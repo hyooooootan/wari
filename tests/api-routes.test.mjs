@@ -4,6 +4,7 @@ import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { onRequest } from "../functions/api/[[path]].js";
+import { sha256Hex } from "../functions/lib/crypto.js";
 
 const repositoryRoot = fileURLToPath(new URL("..", import.meta.url));
 const schema = readFileSync(`${repositoryRoot}/db/schema.sql`, "utf8");
@@ -43,6 +44,7 @@ class D1Database {
   constructor() {
     this.database = new DatabaseSync(":memory:");
     this.database.exec(schema);
+    this.session = null;
   }
 
   prepare(sql) {
@@ -67,8 +69,28 @@ class D1Database {
   }
 }
 
+async function testSession(db) {
+  if (db.session) return db.session;
+  const now = "2026-07-12T00:00:00.000Z";
+  const sessionId = "test-session";
+  const csrf = "test-csrf";
+  db.database.prepare(`INSERT INTO users (
+    id, google_sub, email, name, created_at, updated_at
+  ) VALUES (?, ?, ?, ?, ?, ?)`).run("test-user", "google-sub-test", "test@example.test", "Test User", now, now);
+  db.database.prepare(`INSERT INTO sessions (
+    id_hash, user_id, csrf_token, created_at, expires_at
+  ) VALUES (?, ?, ?, ?, ?)`).run(await sha256Hex(sessionId), "test-user", csrf, now, "2099-01-01T00:00:00.000Z");
+  db.session = { sessionId, csrf };
+  return db.session;
+}
+
 async function request(db, method, path, body, extraEnv = {}) {
   const init = { method, headers: {} };
+  if (db && extraEnv.auth !== false) {
+    const session = await testSession(db);
+    init.headers.cookie = `wari_session=${session.sessionId}; wari_csrf=${session.csrf}`;
+    if (["POST", "PUT", "PATCH", "DELETE"].includes(method)) init.headers["x-csrf-token"] = session.csrf;
+  }
   if (body !== undefined) {
     init.headers["content-type"] = "application/json";
     init.body = JSON.stringify(body);
@@ -85,6 +107,29 @@ async function createProject(db, project) {
   assert.equal(result.response.status, 201);
   return result.body;
 }
+
+test("auth routes create sessions, require CSRF, and hide unowned projects", async (t) => {
+  const db = new D1Database();
+  t.after(() => db.close());
+
+  const unauthenticated = await request(db, "GET", "/api/projects", undefined, { auth: false });
+  assert.equal(unauthenticated.response.status, 401);
+
+  const session = await request(db, "GET", "/api/auth/session");
+  assert.equal(session.response.status, 200);
+  assert.equal(session.body.authenticated, true);
+  assert.equal(session.body.csrf_token, "test-csrf");
+
+  const blockedCsrf = await request(db, "POST", "/api/projects", { id: "blocked", name: "Blocked" }, { auth: false });
+  assert.equal(blockedCsrf.response.status, 401);
+
+  db.database.prepare(`INSERT INTO projects (
+    id, name, project_type, currency, share_role, created_at, updated_at
+  ) VALUES ('owner-unknown-project', 'Hidden', 'split', 'JPY', 'editor', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')`).run();
+  const list = await request(db, "GET", "/api/projects");
+  assert.equal(list.response.status, 200);
+  assert.deepEqual(list.body.projects.map((project) => project.id), []);
+});
 
 test("project CRUD creates a household owner and enforces share expiry", async (t) => {
   const db = new D1Database();
@@ -116,17 +161,31 @@ test("project CRUD creates a household owner and enforces share expiry", async (
   const activeShare = await request(db, "POST", "/api/projects/home/share", { expires_at: "2099-01-01T00:00:00.000Z" });
   assert.equal(activeShare.response.status, 200);
   assert.equal(typeof activeShare.body.token, "string");
+  assert.equal(db.database.prepare("SELECT share_token FROM projects WHERE id = 'home'").get().share_token, null);
+  const storedShare = db.database.prepare("SELECT token_hash, role, expires_at FROM project_shares WHERE project_id = 'home' ORDER BY created_at DESC LIMIT 1").get();
+  assert.equal(storedShare.token_hash === activeShare.body.token, false);
+  assert.equal(storedShare.role, "editor");
 
   const shared = await request(db, "GET", `/api/share/${activeShare.body.token}`);
   assert.equal(shared.response.status, 200);
   assert.equal(shared.body.projects[0].id, "home");
+  assert.equal(Object.hasOwn(shared.body.projects[0], "share_token"), false);
   assert.equal(shared.body.share.role, "editor");
+
+  const projectGraph = await request(db, "GET", "/api/projects/home");
+  assert.equal(projectGraph.response.status, 200);
+  assert.equal(Object.hasOwn(projectGraph.body.projects[0], "share_token"), false);
 
   const expiredShare = await request(db, "POST", "/api/projects/home/share", { expires_at: "2020-01-01T00:00:00.000Z", rotate: true });
   assert.equal(expiredShare.response.status, 200);
+  const oldShareAfterRotate = await request(db, "GET", `/api/share/${activeShare.body.token}`);
+  assert.equal(oldShareAfterRotate.response.status, 404);
   const expiredRead = await request(db, "GET", `/api/share/${expiredShare.body.token}`);
   assert.equal(expiredRead.response.status, 404);
   assert.deepEqual(expiredRead.body, { error: "not_found" });
+  const shareRows = db.database.prepare("SELECT COUNT(*) AS total, SUM(CASE WHEN revoked_at IS NOT NULL THEN 1 ELSE 0 END) AS revoked FROM project_shares WHERE project_id = 'home'").get();
+  assert.equal(shareRows.total, 3);
+  assert.equal(shareRows.revoked, 2);
 
   const householdFinalize = await request(db, "POST", "/api/projects/home/finalize");
   assert.equal(householdFinalize.response.status, 409);
@@ -380,32 +439,63 @@ test("method, field, integer, scope, and OCR errors expose restrained responses"
   assert.equal(wrongProject.response.status, 404);
   assert.equal(Object.hasOwn(wrongProject.body, "message"), false);
 
-  const invalidMime = await request(null, "POST", "/api/ocr-receipt", { image_data_url: "data:text/plain;base64,QQ==" });
+  const unauthenticatedOcr = await request(db, "POST", "/api/ocr-receipt", { project_id: "one", image_data_url: "data:image/png;base64,AA==" }, { auth: false });
+  assert.equal(unauthenticatedOcr.response.status, 401);
+  assert.deepEqual(unauthenticatedOcr.body, { error: "authentication_required" });
+
+  const missingProject = await request(db, "POST", "/api/ocr-receipt", { image_data_url: "data:image/png;base64,AA==" });
+  assert.equal(missingProject.response.status, 400);
+  assert.deepEqual(missingProject.body, { error: "missing_field", field: "project_id" });
+
+  const invalidMime = await request(db, "POST", "/api/ocr-receipt", { project_id: "one", image_data_url: "data:text/plain;base64,QQ==" });
   assert.equal(invalidMime.response.status, 415);
   assert.deepEqual(invalidMime.body, { error: "unsupported_image_type" });
 
-  const invalidBase64 = await request(null, "POST", "/api/ocr-receipt", { image_data_url: "data:image/png;base64,***" });
+  const invalidBase64 = await request(db, "POST", "/api/ocr-receipt", { project_id: "one", image_data_url: "data:image/png;base64,***" });
   assert.equal(invalidBase64.response.status, 400);
   assert.deepEqual(invalidBase64.body, { error: "invalid_image" });
 
   const largeImage = Buffer.alloc(1025, 1).toString("base64");
-  const tooLarge = await request(null, "POST", "/api/ocr-receipt", { image_data_url: `data:image/png;base64,${largeImage}` }, { OCR_MAX_IMAGE_BYTES: "1024" });
+  const tooLarge = await request(db, "POST", "/api/ocr-receipt", { project_id: "one", image_data_url: `data:image/png;base64,${largeImage}` }, { OCR_MAX_IMAGE_BYTES: "1024" });
   assert.equal(tooLarge.response.status, 413);
   assert.deepEqual(tooLarge.body, { error: "image_too_large", max_bytes: 1024 });
 
-  const noKey = await request(null, "POST", "/api/ocr-receipt", { image_data_url: "data:image/png;base64,AA==" }, { OCR_BACKEND: "openai" });
+  const editorShare = await request(db, "POST", "/api/projects/one/share", { role: "editor" });
+  assert.equal(editorShare.response.status, 200);
+  const sharedEditorOcr = await request(db, "POST", "/api/ocr-receipt", {
+    project_id: "one",
+    share_token: editorShare.body.token,
+    image_data_url: "data:image/png;base64,AA==",
+  }, { auth: false, OCR_BACKEND: "openai" });
+  assert.equal(sharedEditorOcr.response.status, 503);
+  assert.deepEqual(sharedEditorOcr.body, { error: "missing_api_key" });
+
+  const viewerShare = await request(db, "POST", "/api/projects/one/share", { role: "viewer" });
+  assert.equal(viewerShare.response.status, 200);
+  const sharedViewerOcr = await request(db, "POST", "/api/ocr-receipt", {
+    project_id: "one",
+    share_token: viewerShare.body.token,
+    image_data_url: "data:image/png;base64,AA==",
+  }, { auth: false, OCR_BACKEND: "openai" });
+  assert.equal(sharedViewerOcr.response.status, 404);
+  assert.deepEqual(sharedViewerOcr.body, { error: "not_found" });
+
+  const noKey = await request(db, "POST", "/api/ocr-receipt", { project_id: "one", image_data_url: "data:image/png;base64,AA==" }, { OCR_BACKEND: "openai" });
   assert.equal(noKey.response.status, 503);
   assert.deepEqual(noKey.body, { error: "missing_api_key" });
 });
 
 test("OCR upstream failures are restrained and time out", async (t) => {
+  const db = new D1Database();
   const originalFetch = globalThis.fetch;
   t.after(() => {
     globalThis.fetch = originalFetch;
+    db.close();
   });
+  await createProject(db, { id: "ocr-ledger", name: "OCR", project_type: "household" });
 
   globalThis.fetch = async () => new Response(JSON.stringify({ error: "private_error", message: "secret value" }), { status: 401 });
-  const upstreamFailure = await request(null, "POST", "/api/ocr-receipt", { image_data_url: "data:image/png;base64,AA==" }, {
+  const upstreamFailure = await request(db, "POST", "/api/ocr-receipt", { project_id: "ocr-ledger", image_data_url: "data:image/png;base64,AA==" }, {
     OCR_BACKEND: "remote",
     RECEIPT_OCR_API_URL: "https://ocr.example.test",
   });
@@ -415,7 +505,7 @@ test("OCR upstream failures are restrained and time out", async (t) => {
   globalThis.fetch = async (_url, options) => new Promise((_resolve, reject) => {
     options.signal.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")), { once: true });
   });
-  const timedOut = await request(null, "POST", "/api/ocr-receipt", { image_data_url: "data:image/png;base64,AA==" }, {
+  const timedOut = await request(db, "POST", "/api/ocr-receipt", { project_id: "ocr-ledger", image_data_url: "data:image/png;base64,AA==" }, {
     OCR_BACKEND: "remote",
     RECEIPT_OCR_API_URL: "https://ocr.example.test",
     OCR_TIMEOUT_MS: "100",

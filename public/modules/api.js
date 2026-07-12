@@ -174,6 +174,14 @@ function createFetchClient(options = {}) {
   const values = typeof options === "function" ? { fetch: options } : { ...(options || {}) };
   const baseUrl = values.baseUrl ?? values.baseURL ?? "/api";
   const defaultHeaders = { Accept: "application/json", ...(values.headers || {}) };
+  let csrfToken = values.csrfToken || "";
+
+  function cookieValue(name) {
+    if (typeof document === "undefined") return "";
+    const prefix = `${name}=`;
+    const entry = document.cookie.split(";").map((part) => part.trim()).find((part) => part.startsWith(prefix));
+    return entry ? decodeURIComponent(entry.slice(prefix.length)) : "";
+  }
 
   async function request(path, requestOptions = {}) {
     const fetchImplementation = requestOptions.fetch || values.fetch || globalThis.fetch;
@@ -182,6 +190,10 @@ function createFetchClient(options = {}) {
     const url = `${joinUrl(baseUrl, path)}${queryString(requestOptions.query)}`;
     const headers = new Headers(defaultHeaders);
     for (const [key, value] of new Headers(requestOptions.headers || {})) headers.set(key, value);
+    if (["POST", "PUT", "PATCH", "DELETE"].includes(method) && !headers.has("x-csrf-token")) {
+      csrfToken = csrfToken || cookieValue("wari_csrf");
+      if (csrfToken) headers.set("x-csrf-token", csrfToken);
+    }
     let body = Object.prototype.hasOwnProperty.call(requestOptions, "json") ? requestOptions.json : requestOptions.body;
     if (plainJsonBody(body)) {
       body = JSON.stringify(body);
@@ -191,6 +203,7 @@ function createFetchClient(options = {}) {
     try {
       const { query, json, fetch: requestFetch, ...fetchOptions } = requestOptions;
       response = await fetchImplementation(url, {
+        credentials: "same-origin",
         ...fetchOptions,
         method,
         headers,
@@ -234,10 +247,11 @@ function createFetchClient(options = {}) {
         method,
       });
     }
+    if (data && typeof data === "object" && typeof data.csrf_token === "string") csrfToken = data.csrf_token;
     return data;
   }
 
-  return { request, fetchJson: request, apiRequest: request };
+  return { request, fetchJson: request, apiRequest: request, setCsrfToken: (value) => { csrfToken = String(value || ""); } };
 }
 
 function routedRow(parentOrRow, maybeRow, parentField) {
@@ -465,6 +479,10 @@ function createApiClient(options = {}) {
     json: payload,
   });
   const getSharedProject = (token) => request(`/share/${encoded(token, "token")}`);
+  const getSession = () => request("/auth/session");
+  const startGoogleLogin = () => request("/auth/google/start", { method: "POST" });
+  const logout = () => request("/auth/logout", { method: "POST" });
+  const deleteAccount = () => request("/account", { method: "DELETE" });
   const readReceipt = (imageDataUrl) => request("/ocr-receipt", {
     method: "POST",
     json: typeof imageDataUrl === "object" ? imageDataUrl : { image_data_url: imageDataUrl },
@@ -633,6 +651,10 @@ function createApiClient(options = {}) {
     createShare: createProjectShare,
     getSharedProject,
     getShare: getSharedProject,
+    getSession,
+    startGoogleLogin,
+    logout,
+    deleteAccount,
     readReceipt,
     mutateRow,
     applyRowMutation: mutateRow,
