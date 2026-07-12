@@ -21,6 +21,7 @@ class Database {
   constructor() { this.raw = new DatabaseSync(":memory:"); this.raw.exec(schema); }
   prepare(sql) { const statement=new Statement(this.raw, sql);statement.database.owner=this;return statement; }
   async batch(statements) {
+    if(this.beforeBatch){const beforeBatch=this.beforeBatch;this.beforeBatch=null;await beforeBatch();}
     this.raw.exec("BEGIN");
     try {
       const results=[];
@@ -69,6 +70,31 @@ test("OAuth callback revalidates the household selected at start", async (t) => 
   assert.notEqual(db.raw.prepare("SELECT used_at FROM gmail_oauth_states").get().used_at,null);
 });
 
+test("legacy household shares follow active, expired, and revoked read behavior", async (t) => {
+  const db=new Database();t.after(()=>db.close());seed(db);const env=environment(async()=>Response.json({}));const request=new Request("https://example.test/api/gmail/oauth/start");
+  db.raw.prepare("UPDATE projects SET share_token=?,share_expires_at=NULL WHERE id=?").run("legacy-active-token","personal-home");
+  await assert.rejects(()=>startGmailOAuth(db,env,request,{id:"user-1"},"personal-home"),/gmail_personal_household_required/);
+  db.raw.prepare("UPDATE projects SET share_expires_at=? WHERE id=?").run("2000-01-01T00:00:00.000Z","personal-home");
+  await startGmailOAuth(db,env,request,{id:"user-1"},"personal-home");
+  db.raw.prepare("UPDATE projects SET share_token=NULL,share_expires_at=NULL WHERE id=?").run("personal-home");
+  await startGmailOAuth(db,env,request,{id:"user-1"},"personal-home");
+  assert.equal(db.raw.prepare("SELECT count(*) AS n FROM gmail_oauth_states").get().n,2);
+});
+
+test("OAuth callback rejects sharing added after its final read and before connection storage", async (t) => {
+  const db=new Database();t.after(()=>db.close());seed(db);let profileRequested=false;const env=environment(async(url)=>{
+    if(String(url).includes("/token"))return Response.json({access_token:"access-secret",refresh_token:"refresh-secret"});
+    profileRequested=true;
+    db.raw.prepare("INSERT INTO project_shares (id,project_id,token_hash,role,created_by_user_id,created_at,updated_at) VALUES (?,?,?,?,?,?,?)").run("oauth-race-share","personal-home","oauth-race-hash","viewer","user-1","2026-07-12T00:00:00.000Z","2026-07-12T00:00:00.000Z");
+    return Response.json({emailAddress:"mail@example.test"});
+  });
+  const started=await startGmailOAuth(db,env,new Request("https://example.test/api/gmail/oauth/start"),{id:"user-1"},"personal-home");
+  const state=new URL(started.url).searchParams.get("state");const cookie=started.cookie.split(";",1)[0];
+  await assert.rejects(()=>finishGmailOAuth(db,env,new Request(`https://example.test/api/gmail/oauth/callback?state=${encodeURIComponent(state)}&code=code`,{headers:{cookie}}),{id:"user-1"}),/gmail_personal_household_required/);
+  assert.equal(profileRequested,true);
+  assert.equal(db.raw.prepare("SELECT count(*) AS n FROM gmail_connections").get().n,0);
+});
+
 test("message and candidate batch rollback permits a later sync retry", async (t) => {
   const db=new Database();t.after(()=>db.close());seed(db);const env=environment(async(url)=>{
     if(String(url).includes("oauth2.googleapis.com/token"))return Response.json({access_token:"access-secret"});
@@ -102,6 +128,35 @@ test("shared household rejects Gmail candidate import", async (t) => {
   db.raw.prepare("INSERT INTO gmail_import_candidates (id,connection_id,gmail_message_row_id,user_id,status,merchant_name,amount,occurred_at,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)").run("candidate-1","c1","m1","user-1","ready","Shop",1000,now,now,now);
   await assert.rejects(()=>importCandidate(db,{id:"user-1"},"candidate-1",{project_id:"shared-home"}),/gmail_import_target_forbidden/);
   assert.equal(db.raw.prepare("SELECT count(*) AS n FROM transactions WHERE project_id=?").get("shared-home").n,0);
+});
+
+test("candidate import rejects a role added between permission read and its write batch", async (t) => {
+  const db=new Database();t.after(()=>db.close());seed(db);const now="2026-07-12T00:00:00.000Z";
+  db.raw.prepare("INSERT INTO project_members (id,project_id,display_name,role,is_active,created_at,updated_at) VALUES (?,?,?,?,?,?,?)").run("personal-member","personal-home","Owner","owner",1,now,now);
+  db.raw.prepare("INSERT INTO gmail_connections (id,user_id,gmail_email,refresh_token_ciphertext,refresh_token_iv,key_generation,aad_version,status,created_at,updated_at) VALUES (?,?,?,?,?,?,1,'active',?,?)").run("race-connection","user-1","race@example.test","x","y",1,now,now);
+  db.raw.prepare("INSERT INTO gmail_sync_runs (id,connection_id,user_id,days,message_limit,status,started_at) VALUES (?,?,?,?,?,'completed',?)").run("race-run","race-connection","user-1",7,1,now);
+  db.raw.prepare("INSERT INTO gmail_messages (id,connection_id,gmail_message_id,sync_run_id,parse_status,created_at) VALUES (?,?,?,?,?,?)").run("race-message","race-connection","race-gmail-id","race-run","parsed",now);
+  db.raw.prepare("INSERT INTO gmail_import_candidates (id,connection_id,gmail_message_row_id,user_id,status,merchant_name,amount,occurred_at,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)").run("race-candidate","race-connection","race-message","user-1","ready","Shop",1000,now,now,now);
+  db.beforeBatch=async()=>{
+    db.raw.prepare("INSERT INTO users (id,google_sub,email,created_at,updated_at) VALUES (?,?,?,?,?)").run("user-2","sub-2","user2@example.test",now,now);
+    db.raw.prepare("INSERT INTO project_user_roles (project_id,user_id,role,created_at,updated_at) VALUES (?,?,?,?,?)").run("personal-home","user-2","viewer",now,now);
+  };
+  await assert.rejects(()=>importCandidate(db,{id:"user-1"},"race-candidate",{project_id:"personal-home"}),/gmail_import_target_forbidden/);
+  assert.equal(db.raw.prepare("SELECT count(*) AS n FROM import_records WHERE project_id=?").get("personal-home").n,0);
+  assert.equal(db.raw.prepare("SELECT count(*) AS n FROM transactions WHERE project_id=?").get("personal-home").n,0);
+  assert.equal(db.raw.prepare("SELECT status FROM gmail_import_candidates WHERE id=?").get("race-candidate").status,"ready");
+});
+
+test("sync remains available when a shared household and a personal household coexist", async (t) => {
+  const db=new Database();t.after(()=>db.close());seed(db);const now="2026-07-12T00:00:00.000Z";
+  db.raw.prepare("INSERT INTO projects (id,name,project_type,created_at,updated_at) VALUES (?,?,?,?,?)").run("shared-a","Shared","household",now,now);
+  db.raw.prepare("INSERT INTO project_user_roles (project_id,user_id,role,created_at,updated_at) VALUES (?,?,?,?,?)").run("shared-a","user-1","owner",now,now);
+  db.raw.prepare("INSERT INTO project_shares (id,project_id,token_hash,role,created_by_user_id,created_at,updated_at) VALUES (?,?,?,?,?,?,?)").run("shared-a-link","shared-a","shared-a-hash","viewer","user-1",now,now);
+  const env=environment(async(url)=>String(url).includes("/token")?Response.json({access_token:"access-secret"}):Response.json({messages:[]}));
+  const encrypted=await encryptRefreshToken(env,"mixed-connection","user-1","refresh-secret");
+  db.raw.prepare("INSERT INTO gmail_connections (id,user_id,gmail_email,refresh_token_ciphertext,refresh_token_iv,key_generation,aad_version,status,created_at,updated_at) VALUES (?,?,?,?,?,?,1,'active',?,?)").run("mixed-connection","user-1","mixed@example.test",encrypted.ciphertext,encrypted.iv,1,now,now);
+  const result=await syncGmail(db,env,{id:"user-1"},"mixed-connection",{days:7,limit:1});
+  assert.equal(result.run.status,"completed");
 });
 
 test("nested mixed and alternative MIME prefers plain text and decodes Base64URL", () => {

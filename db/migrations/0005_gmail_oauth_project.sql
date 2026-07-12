@@ -12,7 +12,7 @@ CREATE TABLE IF NOT EXISTS gmail_oauth_states (
 );
 
 INSERT INTO gmail_oauth_states (state_hash, user_id, project_id, created_at, expires_at, used_at)
-SELECT state_hash, user_id, NULL, created_at, expires_at, used_at
+SELECT state_hash, user_id, NULL, created_at, expires_at, COALESCE(used_at, created_at)
 FROM gmail_oauth_states_legacy;
 
 DROP TABLE gmail_oauth_states_legacy;

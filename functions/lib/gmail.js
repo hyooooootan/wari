@@ -3,7 +3,7 @@ import { cookieHeader, clearCookieHeader, parseCookies } from "./auth.js";
 import { randomToken, sha256Hex } from "./crypto.js";
 import { extractGmailText } from "./gmail-mime.js";
 import { parsePaymentNotification } from "./gmail-parsers.js";
-import { createNotificationImport, reconcileImport } from "./imports.js";
+import { normalizeDate, normalizeMerchantName, normalizePaymentMethod } from "./normalization.js";
 
 const STATE_COOKIE = "wari_gmail_oauth";
 const STATE_TTL_MS = 10 * 60 * 1000;
@@ -38,7 +38,7 @@ export async function finishGmailOAuth(db, env, request, user) {
   if (!cookieState || !verifier || cookieState !== suppliedState) throw new ApiError(400, "invalid_gmail_oauth_state");
   const stateHash = await sha256Hex(suppliedState);
   const state = await db.prepare("SELECT * FROM gmail_oauth_states WHERE state_hash = ?").bind(stateHash).first();
-  if (!state || state.user_id !== user.id || state.used_at || Date.parse(state.expires_at) <= Date.now()) throw new ApiError(400, "invalid_gmail_oauth_state");
+  if (!state || state.user_id !== user.id || !state.project_id || state.used_at || Date.parse(state.expires_at) <= Date.now()) throw new ApiError(400, "invalid_gmail_oauth_state");
   const usedAt = new Date().toISOString();
   const claimed = await db.prepare("UPDATE gmail_oauth_states SET used_at = ? WHERE state_hash = ? AND used_at IS NULL").bind(usedAt, stateHash).run();
   if (!claimed.meta?.changes) throw new ApiError(400, "invalid_gmail_oauth_state");
@@ -52,10 +52,17 @@ export async function finishGmailOAuth(db, env, request, user) {
   const existing = await db.prepare("SELECT id FROM gmail_connections WHERE user_id = ? AND gmail_email = ?").bind(user.id, profile.emailAddress).first();
   const connectionId = existing?.id || crypto.randomUUID();
   const encrypted = await encryptRefreshToken(env, connectionId, user.id, token.refresh_token);
-  await db.prepare(`INSERT INTO gmail_connections (id,user_id,gmail_email,refresh_token_ciphertext,refresh_token_iv,key_generation,aad_version,status,created_at,updated_at)
-    VALUES (?,?,?,?,?,?,1,'active',?,?) ON CONFLICT(user_id,gmail_email) DO UPDATE SET refresh_token_ciphertext=excluded.refresh_token_ciphertext,
-    refresh_token_iv=excluded.refresh_token_iv,key_generation=excluded.key_generation,aad_version=1,status='active',updated_at=excluded.updated_at`)
-    .bind(connectionId, user.id, profile.emailAddress, encrypted.ciphertext, encrypted.iv, encrypted.key_generation, usedAt, usedAt).run();
+  const personalSql = personalHouseholdExistsSql();
+  const personalBindings = personalHouseholdBindings(user.id, state.project_id, usedAt);
+  const results = await db.batch([
+    db.prepare(`UPDATE gmail_oauth_states SET used_at=used_at WHERE state_hash=? AND used_at=? AND project_id=? AND EXISTS(${personalSql})`).bind(stateHash, usedAt, state.project_id, ...personalBindings),
+    db.prepare(`INSERT INTO gmail_connections (id,user_id,gmail_email,refresh_token_ciphertext,refresh_token_iv,key_generation,aad_version,status,created_at,updated_at)
+      SELECT ?,?,?,?,?,?,1,'active',?,? WHERE EXISTS(${personalSql})
+      ON CONFLICT(user_id,gmail_email) DO UPDATE SET refresh_token_ciphertext=excluded.refresh_token_ciphertext,
+      refresh_token_iv=excluded.refresh_token_iv,key_generation=excluded.key_generation,aad_version=1,status='active',updated_at=excluded.updated_at`)
+      .bind(connectionId, user.id, profile.emailAddress, encrypted.ciphertext, encrypted.iv, encrypted.key_generation, usedAt, usedAt, ...personalBindings),
+  ]);
+  if (!changedRows(results[0]) || !changedRows(results[1])) throw new ApiError(403, "gmail_personal_household_required");
   return { connection_id: connectionId, clearCookie: clearCookieHeader(STATE_COOKIE) };
 }
 
@@ -131,18 +138,60 @@ export async function updateCandidate(db,user,id,input){const row=await ownedCan
   const next={...row,...input};if(input.status&&!new Set(["needs_review","ready","ignored"]).has(input.status))throw new ApiError(400,"invalid_field",{field:"status"});if(next.amount!==null&&(!Number.isSafeInteger(next.amount)))throw new ApiError(400,"invalid_field",{field:"amount"});
   await db.prepare(`UPDATE gmail_import_candidates SET merchant_name=?,amount=?,occurred_at=?,payment_method=?,external_transaction_id=?,status=?,updated_at=? WHERE id=? AND user_id=?`).bind(next.merchant_name,next.amount,next.occurred_at,next.payment_method,next.external_transaction_id,next.status,new Date().toISOString(),id,user.id).run();return{candidate:await ownedCandidate(db,user,id)};}
 export async function importCandidate(db,user,id,input){const candidate=await ownedCandidate(db,user,id);if(candidate.status==="ignored")throw new ApiError(409,"candidate_not_importable");const projectId=bounded(input?.project_id,"project_id",128);
-  const project=await db.prepare(`SELECT p.id FROM projects p JOIN project_user_roles r ON r.project_id=p.id AND r.user_id=? AND r.role='owner' AND r.revoked_at IS NULL WHERE p.id=? AND p.project_type='household' AND NOT EXISTS(SELECT 1 FROM project_user_roles other WHERE other.project_id=p.id AND other.user_id<>? AND other.revoked_at IS NULL) AND NOT EXISTS(SELECT 1 FROM project_shares s WHERE s.project_id=p.id AND s.revoked_at IS NULL AND (s.expires_at IS NULL OR s.expires_at>?))`).bind(user.id,projectId,user.id,new Date().toISOString()).first();if(!project)throw new ApiError(403,"gmail_import_target_forbidden");
+  await requirePersonalHousehold(db,user.id,projectId,"gmail_import_target_forbidden");
   if(!candidate.merchant_name||candidate.amount===null||!candidate.occurred_at)throw new ApiError(409,"candidate_incomplete");
   const message=await db.prepare("SELECT gmail_message_id FROM gmail_messages WHERE id=?").bind(candidate.gmail_message_row_id).first();
-  const result=await createNotificationImport(db,projectId,{source_record_id:`gmail:${candidate.connection_id}:${message.gmail_message_id}`,merchant_name:candidate.merchant_name,paid_amount:candidate.amount,gross_amount:candidate.amount,occurred_at:candidate.occurred_at,payment_method:candidate.payment_method,external_transaction_id:candidate.external_transaction_id,raw_text:null,raw_payload:null,provider:candidate.provider},{reconcile:false});
-  const created=await reconcileImport(db,projectId,result.import.id,"create",{new_transaction_id:`gmail-import:${result.import.id}`});await db.prepare("UPDATE gmail_import_candidates SET status='imported',imported_project_id=?,import_record_id=?,updated_at=? WHERE id=? AND user_id=?").bind(projectId,result.import.id,new Date().toISOString(),id,user.id).run();return{candidate:await ownedCandidate(db,user,id),import:created.import,transaction:created.transaction};}
+  if(!message)throw new ApiError(409,"candidate_incomplete");
+  const sourceRecordId=`gmail:${candidate.connection_id}:${message.gmail_message_id}`;
+  const existingImport=await db.prepare("SELECT * FROM import_records WHERE project_id=? AND source_type='gmail_notification' AND source_record_id=?").bind(projectId,sourceRecordId).first();
+  const importId=existingImport?.id||crypto.randomUUID();
+  const transactionId=existingImport?.transaction_id||`gmail-import:${importId}`;
+  const timestamp=new Date().toISOString();
+  const occurredAt=normalizeDate(candidate.occurred_at);
+  if(!occurredAt)throw new ApiError(409,"candidate_incomplete");
+  const normalizedMerchant=normalizeMerchantName(candidate.merchant_name);
+  const paymentMethod=schemaPaymentMethod(candidate.payment_method);
+  const status=candidate.amount<0?"refunded":"provisional";
+  const entryType=candidate.amount<0?"refund":"purchase";
+  const members=(await db.prepare("SELECT id FROM project_members WHERE project_id=? AND is_active=1 ORDER BY created_at,id").bind(projectId).all()).results||[];
+  const personalSql=personalHouseholdExistsSql();
+  const personalBindings=personalHouseholdBindings(user.id,projectId,timestamp);
+  const candidateGuard=`EXISTS(SELECT 1 FROM gmail_import_candidates c WHERE c.id=? AND c.user_id=? AND c.updated_at=? AND c.status!='ignored') AND EXISTS(${personalSql})`;
+  const guardBindings=[id,user.id,timestamp,...personalBindings];
+  const statements=[
+    db.prepare(`UPDATE gmail_import_candidates SET updated_at=? WHERE id=? AND user_id=? AND updated_at=? AND status!='ignored' AND EXISTS(${personalSql})`).bind(timestamp,id,user.id,candidate.updated_at,...personalBindings),
+  ];
+  if(!existingImport){statements.push(db.prepare(`INSERT INTO import_records (id,project_id,transaction_id,source_type,source_record_id,source_status,merchant_raw,merchant_normalized,gross_amount_raw,paid_amount_raw,occurred_at_raw,settled_at_raw,payment_method_raw,external_transaction_id,image_url,raw_text,raw_payload,parse_confidence,parser_version,match_score,match_reason_json,created_at,updated_at)
+    SELECT ?,?,NULL,'gmail_notification',?,'parsed',?,?,?,?,?,NULL,?,?,NULL,NULL,NULL,NULL,NULL,NULL,NULL,?,? WHERE ${candidateGuard}`).bind(importId,projectId,sourceRecordId,candidate.merchant_name,normalizedMerchant,candidate.amount,candidate.amount,occurredAt,normalizePaymentMethod(candidate.payment_method),candidate.external_transaction_id,timestamp,timestamp,...guardBindings));}
+  if(!existingImport?.transaction_id){
+    statements.push(db.prepare(`INSERT INTO transactions (id,project_id,merchant_name,merchant_normalized,gross_amount,paid_amount,discount_amount,point_amount,category,status,occurred_at,settled_at,note,entry_type,origin_project_id,origin_transaction_id,origin_member_id,generated_automatically,created_at,updated_at)
+      SELECT ?,?,?,?,?,?,0,0,NULL,?,?,NULL,NULL,?,NULL,NULL,NULL,1,?,? WHERE ${candidateGuard} AND EXISTS(SELECT 1 FROM import_records WHERE id=? AND transaction_id IS NULL)`).bind(transactionId,projectId,candidate.merchant_name,normalizedMerchant,candidate.amount,candidate.amount,status,occurredAt,entryType,timestamp,timestamp,...guardBindings,importId));
+    const summaryId=`gmail-summary:${importId}`;
+    statements.push(db.prepare(`INSERT INTO transaction_items (id,transaction_id,name,amount,quantity,item_type,category,sort_order,is_hidden,created_at,updated_at)
+      SELECT ?,?,'Total',?,1,'summary',NULL,0,0,?,? WHERE ${candidateGuard} AND EXISTS(SELECT 1 FROM transactions WHERE id=?)`).bind(summaryId,transactionId,candidate.amount,timestamp,timestamp,...guardBindings,transactionId));
+    for(const allocation of allocateAmount(candidate.amount,members)){statements.push(db.prepare(`INSERT INTO item_allocations (id,transaction_item_id,project_member_id,allocated_amount,created_at,updated_at)
+      SELECT ?,?,?,?,?,? WHERE ${candidateGuard} AND EXISTS(SELECT 1 FROM transaction_items WHERE id=?)`).bind(`gmail-allocation:${importId}:${allocation.member.id}`,summaryId,allocation.member.id,allocation.amount,timestamp,timestamp,...guardBindings,summaryId));}
+    if(candidate.payment_method||candidate.external_transaction_id||candidate.provider){statements.push(db.prepare(`INSERT INTO transaction_payments (id,transaction_id,payer_member_id,amount,payment_method,provider,account_label,external_payment_id,payment_status,occurred_at,created_at,updated_at)
+      SELECT ?,?,NULL,?,?,?,NULL,?,?,?,?,? WHERE ${candidateGuard} AND EXISTS(SELECT 1 FROM transactions WHERE id=?)`).bind(`gmail-payment:${importId}`,transactionId,candidate.amount,paymentMethod,candidate.provider,candidate.external_transaction_id,status,occurredAt,timestamp,timestamp,...guardBindings,transactionId));}
+    statements.push(db.prepare(`UPDATE import_records SET transaction_id=?,source_status='linked',updated_at=? WHERE id=? AND transaction_id IS NULL AND ${candidateGuard}`).bind(transactionId,timestamp,importId,...guardBindings));
+  }
+  statements.push(db.prepare(`UPDATE gmail_import_candidates SET status='imported',imported_project_id=?,import_record_id=?,updated_at=? WHERE id=? AND user_id=? AND updated_at=? AND ${candidateGuard} AND EXISTS(SELECT 1 FROM import_records WHERE id=? AND transaction_id=?)`).bind(projectId,importId,timestamp,id,user.id,timestamp,...guardBindings,importId,transactionId));
+  const results=await db.batch(statements);
+  if(!changedRows(results[0])||!changedRows(results.at(-1)))throw new ApiError(403,"gmail_import_target_forbidden");
+  return{candidate:await ownedCandidate(db,user,id),import:await db.prepare("SELECT * FROM import_records WHERE id=?").bind(importId).first(),transaction:await db.prepare("SELECT * FROM transactions WHERE id=?").bind(transactionId).first()};}
 
 export async function encryptRefreshToken(env,connectionId,userId,token){const generation=keyGeneration(env);const key=await tokenKey(env,generation);const iv=crypto.getRandomValues(new Uint8Array(12));const aad=encoder.encode(`gmail-token:v1:${connectionId}:${userId}:${generation}`);const encrypted=await crypto.subtle.encrypt({name:"AES-GCM",iv,additionalData:aad},key,encoder.encode(token));return{ciphertext:base64(new Uint8Array(encrypted)),iv:base64(iv),key_generation:generation,aad_version:1};}
 export async function decryptRefreshToken(env,connection){if(connection.aad_version!==1)throw new ApiError(500,"unsupported_gmail_token_aad");const key=await tokenKey(env,connection.key_generation);try{const decrypted=await crypto.subtle.decrypt({name:"AES-GCM",iv:fromBase64(connection.refresh_token_iv),additionalData:encoder.encode(`gmail-token:v1:${connection.id}:${connection.user_id}:${connection.key_generation}`)},key,fromBase64(connection.refresh_token_ciphertext));return new TextDecoder().decode(decrypted);}catch{throw new ApiError(500,"gmail_token_decryption_failed");}}
 async function ownedConnection(db,user,id){const row=await db.prepare("SELECT * FROM gmail_connections WHERE id=? AND user_id=? AND status!='disconnected'").bind(id,user.id).first();if(!row)throw new ApiError(404,"not_found");return row;}
 async function ownedCandidate(db,user,id){const row=await db.prepare("SELECT * FROM gmail_import_candidates WHERE id=? AND user_id=?").bind(id,user.id).first();if(!row)throw new ApiError(404,"not_found");return row;}
-async function requirePersonalHousehold(db,userId,projectId){projectId=bounded(projectId,"project_id",128);const now=new Date().toISOString();const row=await db.prepare(`SELECT p.id FROM projects p JOIN project_user_roles owner ON owner.project_id=p.id AND owner.user_id=? AND owner.role='owner' AND owner.revoked_at IS NULL WHERE p.id=? AND p.project_type='household' AND NOT EXISTS(SELECT 1 FROM project_user_roles other WHERE other.project_id=p.id AND other.user_id<>? AND other.revoked_at IS NULL) AND NOT EXISTS(SELECT 1 FROM project_shares s WHERE s.project_id=p.id AND s.revoked_at IS NULL AND (s.expires_at IS NULL OR s.expires_at>?))`).bind(userId,projectId,userId,now).first();if(!row)throw new ApiError(403,"gmail_personal_household_required");return row;}
-async function requireAnyPersonalHousehold(db,userId){const now=new Date().toISOString();const row=await db.prepare(`SELECT EXISTS(SELECT 1 FROM projects p JOIN project_user_roles owner ON owner.project_id=p.id AND owner.user_id=? AND owner.role='owner' AND owner.revoked_at IS NULL WHERE p.project_type='household' AND NOT EXISTS(SELECT 1 FROM project_user_roles other WHERE other.project_id=p.id AND other.user_id<>? AND other.revoked_at IS NULL) AND NOT EXISTS(SELECT 1 FROM project_shares s WHERE s.project_id=p.id AND s.revoked_at IS NULL AND (s.expires_at IS NULL OR s.expires_at>?))) AS allowed`).bind(userId,userId,now).first();if(!row?.allowed)throw new ApiError(403,"gmail_personal_household_required");}
+async function requirePersonalHousehold(db,userId,projectId,errorCode="gmail_personal_household_required"){projectId=bounded(projectId,"project_id",128);const timestamp=new Date().toISOString();const row=await db.prepare(`SELECT p.id FROM projects p JOIN project_user_roles owner ON owner.project_id=p.id AND owner.user_id=? AND owner.role='owner' AND owner.revoked_at IS NULL WHERE ${personalHouseholdPredicate()}`).bind(...personalHouseholdBindings(userId,projectId,timestamp)).first();if(!row)throw new ApiError(403,errorCode);return row;}
+async function requireAnyPersonalHousehold(db,userId){const timestamp=new Date().toISOString();const row=await db.prepare(`SELECT EXISTS(SELECT 1 FROM projects p JOIN project_user_roles owner ON owner.project_id=p.id AND owner.user_id=? AND owner.role='owner' AND owner.revoked_at IS NULL WHERE ${personalHouseholdPredicate(false)}) AS allowed`).bind(...personalHouseholdBindings(userId,null,timestamp)).first();if(!row?.allowed)throw new ApiError(403,"gmail_personal_household_required");}
+function personalHouseholdPredicate(withProjectId=true){return `${withProjectId?"p.id=? AND ":""}p.project_type='household' AND NOT EXISTS(SELECT 1 FROM project_user_roles other WHERE other.project_id=p.id AND other.user_id<>? AND other.revoked_at IS NULL) AND NOT EXISTS(SELECT 1 FROM project_shares s WHERE s.project_id=p.id AND s.revoked_at IS NULL AND (s.expires_at IS NULL OR s.expires_at>?)) AND (p.share_token IS NULL OR (p.share_expires_at IS NOT NULL AND p.share_expires_at<=?))`;}
+function personalHouseholdExistsSql(){return `SELECT 1 FROM projects p JOIN project_user_roles owner ON owner.project_id=p.id AND owner.user_id=? AND owner.role='owner' AND owner.revoked_at IS NULL WHERE ${personalHouseholdPredicate()}`;}
+function personalHouseholdBindings(userId,projectId,timestamp){return projectId===null?[userId,userId,timestamp,timestamp]:[userId,projectId,userId,timestamp,timestamp];}
+function changedRows(result){return Number(result?.meta?.changes??result?.changes??result?.meta?.rows_written??0);}
+function allocateAmount(amount,members){if(!members.length)return[];const base=Math.trunc(amount/members.length);const remainder=amount-base*members.length;return members.map((member,index)=>({member,amount:base+(index<Math.abs(remainder)?Math.sign(remainder):0)}));}
+function schemaPaymentMethod(value){const raw=String(value||"").normalize("NFKC").toLowerCase();if(raw.includes("suica"))return"suica";if(raw.includes("pasmo"))return"pasmo";const normalized=normalizePaymentMethod(value);if(["cash","credit_card","paypay","suica","pasmo","bank","point","other"].includes(normalized))return normalized;if(["bank_transfer","direct_debit"].includes(normalized))return"bank";if(normalized==="points")return"point";return"other";}
 async function duplicateWarning(db,userId,amount,occurredAt){const start=new Date(Date.parse(occurredAt)-7*86400000).toISOString(),end=new Date(Date.parse(occurredAt)+7*86400000).toISOString();const row=await db.prepare(`SELECT 1 FROM gmail_import_candidates WHERE user_id=? AND amount=? AND occurred_at BETWEEN ? AND ? LIMIT 1`).bind(userId,amount,start,end).first();return row?1:0;}
 function keyGeneration(env){const value=Number(env.GMAIL_TOKEN_KEY_CURRENT_GENERATION);if(!Number.isInteger(value)||value<1)throw new ApiError(500,"invalid_gmail_token_key_generation");return value;}
 async function tokenKey(env,generation){const raw=env[`GMAIL_TOKEN_KEY_V${generation}`];if(!raw)throw new ApiError(500,"missing_gmail_token_key");const bytes=fromBase64(raw);if(bytes.length!==32)throw new ApiError(500,"invalid_gmail_token_key");return crypto.subtle.importKey("raw",bytes,"AES-GCM",false,["encrypt","decrypt"]);}

@@ -55,12 +55,17 @@ class D1Database {
     this.database.exec("BEGIN IMMEDIATE");
     try {
       const results = [];
-      for (const statement of statements) results.push(await statement.run());
+      for (let index=0;index<statements.length;index++) {
+        if(this.failBatchAt===index)throw new Error("injected_batch_failure");
+        results.push(await statements[index].run());
+      }
       this.database.exec("COMMIT");
       return results;
     } catch (error) {
       this.database.exec("ROLLBACK");
       throw error;
+    } finally {
+      this.failBatchAt=undefined;
     }
   }
 
@@ -190,6 +195,16 @@ test("project CRUD creates a household owner and enforces share expiry", async (
   const householdFinalize = await request(db, "POST", "/api/projects/home/finalize");
   assert.equal(householdFinalize.response.status, 409);
   assert.deepEqual(householdFinalize.body, { error: "project_not_split" });
+});
+
+test("household creation rolls back project, member, and owner role when owner insertion fails", async (t) => {
+  const db=new D1Database();t.after(()=>db.close());
+  db.failBatchAt=2;
+  const result=await request(db,"POST","/api/projects",{id:"failed-home",name:"Failed",project_type:"household"});
+  assert.equal(result.response.status,500);
+  assert.equal(db.database.prepare("SELECT count(*) AS n FROM projects WHERE id=?").get("failed-home").n,0);
+  assert.equal(db.database.prepare("SELECT count(*) AS n FROM project_members WHERE project_id=?").get("failed-home").n,0);
+  assert.equal(db.database.prepare("SELECT count(*) AS n FROM project_user_roles WHERE project_id=?").get("failed-home").n,0);
 });
 
 test("Gmail OAuth start validates the selected household and requires a JSON project identifier", async (t) => {

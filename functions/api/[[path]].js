@@ -43,7 +43,6 @@ import {
 import { assertOrigin } from "../lib/csrf.js";
 import { createGoogleStart, finishGoogleCallback } from "../lib/oauth.js";
 import {
-  grantProjectRole,
   projectIdForImport,
   projectIdForItem,
   projectIdForMember,
@@ -271,8 +270,7 @@ async function dispatchProjects(request, db, url, path, user) {
   if (path.length === 1) {
     if (request.method === "GET") return json(await listProjectsForUser(db, user));
     if (request.method === "POST") {
-      const result = await createProject(db, await readJson(request));
-      await grantProjectRole(db, result.projects[0].id, user.id, "owner");
+      const result = await createProject(db, await readJson(request), user);
       return json(result, 201);
     }
     return methodNotAllowed(["GET", "POST"]);

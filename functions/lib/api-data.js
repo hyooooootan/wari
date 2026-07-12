@@ -60,7 +60,7 @@ export async function listProjectsForUser(db, user) {
   return { projects: sanitizeProjects(results) };
 }
 
-export async function createProject(db, input) {
+export async function createProject(db, input, ownerUser = null) {
   assertObject(input);
   assertAllowed(input, ["id", "name", "project_type", "currency"]);
   const timestamp = now();
@@ -98,6 +98,14 @@ export async function createProject(db, input) {
       db.prepare(`INSERT INTO project_members (
         id, project_id, display_name, role, is_active, linked_household_project_id, linked_at, created_at, updated_at
       ) VALUES (?, ?, ?, 'owner', 1, NULL, NULL, ?, ?)`).bind(makeId("mem"), project.id, "自分", timestamp, timestamp),
+    );
+  }
+  if (ownerUser) {
+    const ownerUserId = boundedString(ownerUser.id, "user_id", 1, 128, true);
+    statements.push(
+      db.prepare(`INSERT INTO project_user_roles (
+        project_id, user_id, role, created_at, updated_at, revoked_at
+      ) VALUES (?, ?, 'owner', ?, ?, NULL)`).bind(project.id, ownerUserId, timestamp, timestamp),
     );
   }
   await db.batch(statements);

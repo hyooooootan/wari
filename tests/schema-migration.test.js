@@ -276,6 +276,18 @@ test('numbered migrations create the runtime tables from an empty database', (t)
   assert.deepEqual(database.prepare('PRAGMA foreign_key_check').all(), []);
 });
 
+test('0005 invalidates OAuth states created before project selection was recorded', (t) => {
+  const database=openDatabase(`${baselineSql}\n${migrationSql}\n${authMigrationSql}\n${gmailMigrationSql}`);
+  t.after(()=>database.close());
+  database.prepare("INSERT INTO users (id,google_sub,email,created_at,updated_at) VALUES (?,?,?,?,?)").run("state-user","state-sub","state@example.test","2026-01-01T00:00:00.000Z","2026-01-01T00:00:00.000Z");
+  database.prepare("INSERT INTO gmail_oauth_states (state_hash,user_id,created_at,expires_at,used_at) VALUES (?,?,?,?,NULL)").run("legacy-state","state-user","2026-01-01T00:00:00.000Z","2099-01-01T00:00:00.000Z");
+  database.exec(gmailOauthProjectMigrationSql);
+  const state=database.prepare("SELECT project_id,used_at FROM gmail_oauth_states WHERE state_hash=?").get("legacy-state");
+  assert.equal(state.project_id,null);
+  assert.equal(state.used_at,"2026-01-01T00:00:00.000Z");
+  assert.deepEqual(database.prepare('PRAGMA foreign_key_check').all(),[]);
+});
+
 test('legacy migration preserves data and creates deterministic ledger rows', (t) => {
   const database = openDatabase(legacySchemaSql);
   t.after(() => database.close());
