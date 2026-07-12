@@ -66,6 +66,7 @@ if (!Storage || !Split) throw new Error("WariStorage and WariSplit are required"
 
 let state = Storage.loadState();
 let isCloud = false;
+let cloudSession = { status: "checking", user: null };
 let savingCount = 0;
 let activeProjectId = null;
 let lastToastTimer = 0;
@@ -440,7 +441,14 @@ function typeLabel(project) {
 }
 
 function shell(content) {
-  return `<div class="app-shell"><header class="topbar"><button class="brand" type="button" data-home aria-label="ホームへ"><span class="logo" aria-hidden="true">W</span><span>Wari</span></button><span id="save-status" class="save-status">${esc(statusText())}</span></header>${content}</div>`;
+  const account = cloudSession.status === "authenticated"
+    ? `<span class="save-status">${esc(cloudSession.user?.name || cloudSession.user?.email || "ログイン中")}</span><button class="text-button" type="button" data-google-logout>ログアウト</button>`
+    : cloudSession.status === "unauthenticated"
+      ? `<button class="small-button" type="button" data-google-login>Googleでログイン</button>`
+      : cloudSession.status === "error"
+        ? `<span class="save-status">クラウド接続を確認できません</span>`
+        : `<span class="save-status">認証を確認中</span>`;
+  return `<div class="app-shell"><header class="topbar"><button class="brand" type="button" data-home aria-label="ホームへ"><span class="logo" aria-hidden="true">W</span><span>Wari</span></button><span><span id="save-status" class="save-status">${esc(statusText())}</span> ${account}</span></header>${content}</div>`;
 }
 
 function statusTag(status) {
@@ -1869,14 +1877,46 @@ function mergeProjectSummaries(rows) {
 }
 
 async function bootCloud() {
-  if (typeof Api.listProjects !== "function") return;
+  if (typeof Api.getSession !== "function" || typeof Api.listProjects !== "function") {
+    cloudSession = { status: "error", user: null };
+    return;
+  }
   try {
+    const session = await Api.getSession();
+    if (!session?.authenticated) {
+      isCloud = false;
+      cloudSession = { status: "unauthenticated", user: null };
+      return;
+    }
+    cloudSession = { status: "authenticated", user: session.user || null };
     const result = await Api.listProjects();
     isCloud = true;
     mergeProjectSummaries(Array.isArray(result) ? result : result.projects || []);
-  } catch {
+  } catch (error) {
     isCloud = false;
+    cloudSession = error?.status === 401
+      ? { status: "unauthenticated", user: null }
+      : { status: "error", user: null };
   }
+}
+
+async function startGoogleLogin() {
+  const result = await Api.startGoogleLogin();
+  if (!result?.url) throw new Error("認可先を取得できませんでした");
+  location.assign(result.url);
+}
+
+async function logoutGoogle() {
+  await Api.logout();
+  isCloud = false;
+  cloudSession = { status: "unauthenticated", user: null };
+  remoteSyncQueue = Promise.resolve();
+  gmailUi.connections = [];
+  gmailUi.candidates = [];
+  ui.householdSummaries = {};
+  shareTokensByProject.clear();
+  state = Storage.loadState();
+  render();
 }
 
 async function joinSharedProject(token) {
@@ -1987,6 +2027,15 @@ document.addEventListener("click", async (event) => {
     ? state.transactions.find((row) => row.id === ui.selectedTransactionId && row.project_id === project.id)
     : null);
   try {
+    if (button.dataset.googleLogin !== undefined) {
+      await startGoogleLogin();
+      return;
+    }
+    if (button.dataset.googleLogout !== undefined) {
+      await logoutGoogle();
+      toast("ログアウトしました");
+      return;
+    }
     if (button.dataset.gmailConnect !== undefined) {
       const result = await Api.startGmailConnection();
       location.assign(result.url);
@@ -2015,7 +2064,7 @@ document.addEventListener("click", async (event) => {
       return;
     }
   } catch (error) {
-    toast(error.message || "Gmail取込を実行できませんでした");
+    toast(error.message || "操作を実行できませんでした");
     return;
   }
   if (button.dataset.calendarView) {
@@ -2263,6 +2312,7 @@ window.addEventListener("hashchange", () => void route());
 if (!location.hash) location.hash = "#/";
 render();
 await bootCloud();
+render();
 await route();
 
 if ("serviceWorker" in navigator) {
