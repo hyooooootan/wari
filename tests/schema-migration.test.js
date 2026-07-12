@@ -9,9 +9,15 @@ const schemaSql = readFileSync(path.join(repositoryRoot, 'db', 'schema.sql'), 'u
 const baselineSql = readFileSync(path.join(repositoryRoot, 'db', 'migrations', '0001_initial.sql'), 'utf8');
 const migrationSql = readFileSync(path.join(repositoryRoot, 'db', 'migrations', '0002_household_ledger.sql'), 'utf8');
 const authMigrationSql = readFileSync(path.join(repositoryRoot, 'db', 'migrations', '0003_auth_ownership_shares.sql'), 'utf8');
+const gmailMigrationSql = readFileSync(path.join(repositoryRoot, 'db', 'migrations', '0004_gmail_payment_import.sql'), 'utf8');
 const verificationSql = readFileSync(path.join(repositoryRoot, 'db', 'verify_household_ledger.sql'), 'utf8');
 
 const runtimeTables = [
+  'gmail_connections',
+  'gmail_import_candidates',
+  'gmail_messages',
+  'gmail_oauth_states',
+  'gmail_sync_runs',
   'import_records',
   'item_allocations',
   'oauth_states',
@@ -28,6 +34,12 @@ const runtimeTables = [
 
 const requestedIndexes = [
   'idx_generated_household_transaction',
+  'idx_gmail_candidates_amount_date',
+  'idx_gmail_candidates_user_status',
+  'idx_gmail_connections_user',
+  'idx_gmail_messages_run',
+  'idx_gmail_oauth_states_expiry',
+  'idx_gmail_sync_runs_connection',
   'idx_import_records_project_amount_date',
   'idx_import_records_project_status',
   'idx_import_records_source_record',
@@ -255,7 +267,7 @@ test('fresh schema creates the seven runtime tables and requested indexes', (t) 
 });
 
 test('numbered migrations create the runtime tables from an empty database', (t) => {
-  const database = openDatabase(`${baselineSql}\n${migrationSql}\n${authMigrationSql}`);
+  const database = openDatabase(`${baselineSql}\n${migrationSql}\n${authMigrationSql}\n${gmailMigrationSql}`);
   t.after(() => database.close());
 
   assert.deepEqual(tableNames(database), runtimeTables);
@@ -268,7 +280,7 @@ test('legacy migration preserves data and creates deterministic ledger rows', (t
   t.after(() => database.close());
   seedLegacyDatabase(database);
 
-  database.exec(`BEGIN IMMEDIATE;\n${migrationSql}\n${authMigrationSql}\nCOMMIT;`);
+  database.exec(`BEGIN IMMEDIATE;\n${migrationSql}\n${authMigrationSql}\n${gmailMigrationSql}\nCOMMIT;`);
 
   const freshDatabase = openDatabase(schemaSql);
   t.after(() => freshDatabase.close());

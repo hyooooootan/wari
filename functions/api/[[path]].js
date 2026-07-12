@@ -67,6 +67,17 @@ import {
   reconcileImport,
 } from "../lib/imports.js";
 import { handleReceiptOcr } from "../lib/ocr.js";
+import {
+  disconnectGmail,
+  finishGmailOAuth,
+  importCandidate,
+  listCandidates,
+  listConnections,
+  listSyncRuns,
+  startGmailOAuth,
+  syncGmail,
+  updateCandidate,
+} from "../lib/gmail.js";
 import { ApiError, errorResponse, json, methodNotAllowed, readJson, readOptionalJson } from "../lib/responses.js";
 
 const IMPORT_STATUSES = new Set(["received", "parsed", "linked", "review", "rejected", "error"]);
@@ -125,6 +136,7 @@ async function dispatch(request, db, env, url, path) {
   }
   const user = await requireUser(db, request);
   assertCsrf(request, user);
+  if (path[0] === "gmail") return dispatchGmail(request, db, env, url, path, user);
   if (path[0] === "projects") return dispatchProjects(request, db, url, path, user);
   if ((path[0] === "project-members" || path[0] === "members") && path.length >= 2) {
     return dispatchMember(request, db, path, user);
@@ -195,6 +207,7 @@ async function dispatchAccount(request, db) {
     assertCsrf(request, user);
     const timestamp = new Date().toISOString();
     await db.batch([
+      db.prepare("UPDATE gmail_connections SET refresh_token_ciphertext = '', refresh_token_iv = '', status = 'disconnected', updated_at = ? WHERE user_id = ?").bind(timestamp, user.id),
       db.prepare("UPDATE users SET deleted_at = ?, updated_at = ? WHERE id = ?").bind(timestamp, timestamp, user.id),
       db.prepare("UPDATE sessions SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL").bind(timestamp, user.id),
       db.prepare("UPDATE project_user_roles SET revoked_at = ?, updated_at = ? WHERE user_id = ? AND revoked_at IS NULL").bind(timestamp, timestamp, user.id),
@@ -204,6 +217,47 @@ async function dispatchAccount(request, db) {
     headers.append("set-cookie", clearCookieHeader(CSRF_COOKIE));
     return json({ ok: true }, 200, headers);
   });
+}
+
+async function dispatchGmail(request, db, env, url, path, user) {
+  if (path.length === 3 && path[1] === "oauth" && path[2] === "start") {
+    return invoke(request, ["POST"], async () => {
+      await readOptionalJson(request);
+      const result = await startGmailOAuth(db, env, request, user);
+      return json({ url: result.url }, 200, { "set-cookie": result.cookie });
+    });
+  }
+  if (path.length === 3 && path[1] === "oauth" && path[2] === "callback") {
+    return invoke(request, ["GET"], async () => {
+      const result = await finishGmailOAuth(db, env, request, user);
+      const headers = new Headers({ location: env.APP_ORIGIN || new URL("/", url).toString() });
+      headers.append("set-cookie", result.clearCookie);
+      return new Response(null, { status: 302, headers });
+    });
+  }
+  if (path.length === 2 && path[1] === "connections") return invoke(request, ["GET"], async () => json(await listConnections(db, user)));
+  if (path.length === 3 && path[1] === "connections") {
+    return invoke(request, ["DELETE"], async () => json(await disconnectGmail(db, env, user, path[2])));
+  }
+  if (path.length === 4 && path[1] === "connections" && path[3] === "sync") {
+    return invoke(request, ["POST"], async () => json(await syncGmail(db, env, user, path[2], await readJson(request))));
+  }
+  if (path.length === 4 && path[1] === "connections" && path[3] === "sync-runs") {
+    return invoke(request, ["GET"], async () => json(await listSyncRuns(db, user, path[2])));
+  }
+  if (path.length === 2 && path[1] === "candidates") {
+    return invoke(request, ["GET"], async () => {
+      assertQueryFields(url.searchParams, new Set(["status"]));
+      return json(await listCandidates(db, user, url.searchParams.get("status")));
+    });
+  }
+  if (path.length === 3 && path[1] === "candidates") {
+    return invoke(request, ["PATCH"], async () => json(await updateCandidate(db, user, path[2], await readJson(request))));
+  }
+  if (path.length === 4 && path[1] === "candidates" && path[3] === "import") {
+    return invoke(request, ["POST"], async () => json(await importCandidate(db, user, path[2], await readJson(request))), 201);
+  }
+  return json({ error: "not_found" }, 404);
 }
 
 async function dispatchProjects(request, db, url, path, user) {

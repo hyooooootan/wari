@@ -22,3 +22,11 @@ Routes:
 - `DELETE /api/account` marks the user deleted, revokes sessions, and revokes direct project roles.
 
 Local tests use `OAUTH_MOCK_USER_JSON` for provider callback tests when needed. Do not set this in production.
+
+## Gmail payment notification connection
+
+The Gmail connection is separate from login OAuth. It uses authorization code flow, S256 PKCE, a single-use state expiring after ten minutes, and `https://www.googleapis.com/auth/gmail.readonly`. Authorization requests use `access_type=offline` and `prompt=consent`.
+
+Create a separate OAuth client in Google Cloud and register `https://<application-host>/api/gmail/oauth/callback` as an authorized redirect URI. Configure Cloudflare Secrets `GMAIL_CLIENT_ID`, `GMAIL_CLIENT_SECRET`, `GMAIL_TOKEN_KEY_V1` (a Base64-encoded 32-byte key), and `GMAIL_TOKEN_KEY_CURRENT_GENERATION=1`. Set `GMAIL_REDIRECT_URI` where an explicit callback URI is required. Do not commit these values.
+
+The implemented operation is user-initiated synchronization for 7, 30, or 90 days. Scheduled synchronization, notifications, tracking later email edits or deletion, and Google production verification are not implemented.

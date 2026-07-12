@@ -27,3 +27,11 @@ Manual setup check:
 2. Store the Cloudflare secrets listed in `docs/auth.md`.
 3. Apply D1 migrations locally before remote use.
 4. Do not run remote D1 migrations from local development without an explicit release step.
+
+## Gmail token and message handling
+
+Gmail refresh tokens are encrypted with AES-256-GCM. D1 stores a 12-byte IV, key generation, and AAD version. AAD v1 binds the connection ID, user ID, and key generation. Decryption keys are read from `GMAIL_TOKEN_KEY_V<generation>` and the current generation from `GMAIL_TOKEN_KEY_CURRENT_GENERATION`. Keep prior generation secrets until stored ciphertext has been re-encrypted.
+
+Gmail body text, HTML, attachments, authorization codes, access tokens, refresh tokens, cookies, OAuth state, PKCE verifiers, and encryption keys are not persisted in D1, returned in responses, or written to application logs. Access tokens exist in memory during synchronization. Message bodies and attachments are not sent to external generative AI or OCR services. Candidate rows contain structured fields such as merchant, amount, time, payment method, provider, and external transaction identifier.
+
+Import targets are restricted to `project_type='household'` projects where the connection owner has an active direct `owner` role. Split projects, shared households, share links, candidates owned by another user, and projects owned by another user are rejected. Synchronization creates review candidates and never creates expenses automatically.

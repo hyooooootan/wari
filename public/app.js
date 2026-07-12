@@ -70,6 +70,7 @@ let savingCount = 0;
 let activeProjectId = null;
 let lastToastTimer = 0;
 let remoteSyncQueue = Promise.resolve();
+const gmailUi = { connections: [], candidates: [] };
 const shareTokensByProject = new Map();
 const ui = {
   createMode: null,
@@ -728,8 +729,8 @@ function renderImportReview(project, projectIds = new Set([project.id])) {
   const records = state.import_records
     .filter((row) => projectIds.has(row.project_id) && ["received", "parsed", "review"].includes(row.source_status))
     .sort((left, right) => String(right.created_at).localeCompare(String(left.created_at)));
-  if (!records.length) return `<div class="empty-state compact-empty">確認待ちはありません</div>`;
-  return records.map((record) => {
+  if (!records.length) return `${renderGmailImport(project)}<div class="empty-state compact-empty">確認待ちはありません</div>`;
+  return renderGmailImport(project) + records.map((record) => {
     const transactions = transactionsFor(record.project_id).filter((row) => !["cancelled", "refunded"].includes(row.status));
     return `<div class="review-row"><div class="review-row-head"><span class="source-type">${esc(SOURCE_TYPES[record.source_type] || record.source_type)}</span><span>${esc(formatDate(record.occurred_at_raw || record.created_at))}</span></div><div class="review-row-value"><strong>${esc(record.merchant_raw || "店名未設定")}</strong><strong>${esc(yen(record.paid_amount_raw ?? record.gross_amount_raw))}</strong></div><div class="review-actions"><button class="small-button household-small" type="button" data-create-from-import="${esc(record.id)}">取引にする</button><select data-import-link-select="${esc(record.id)}" aria-label="既存の取引"><option value="">既存の取引</option>${transactions.map((transaction) => `<option value="${esc(transaction.id)}">${esc(dateValue(transaction.occurred_at))} ${esc(transaction.merchant_name)} ${esc(yen(transaction.paid_amount))}</option>`).join("")}</select><button class="small-button" type="button" data-link-import="${esc(record.id)}">紐付け</button><button class="icon-button quiet" type="button" data-reject-import="${esc(record.id)}" aria-label="却下">×</button></div></div>`;
   }).join("");
@@ -1049,6 +1050,20 @@ async function createSplitProject(form) {
   resetSplitDraft("createSplit");
   await commitState(next, "割り勘を作成しました", { render: false });
   location.hash = `#/p/${encodeURIComponent(projectId)}`;
+}
+
+function renderGmailImport(project) {
+  const connections = gmailUi.connections.map((row) => `<div class="review-row"><div class="review-row-value"><strong>${esc(row.gmail_email)}</strong><span>${esc(row.status)}</span></div><div class="review-actions"><select data-gmail-days="${esc(row.id)}"><option value="7">7日</option><option value="30" selected>30日</option><option value="90">90日</option></select><button class="small-button household-small" type="button" data-gmail-sync="${esc(row.id)}">同期</button><button class="small-button" type="button" data-gmail-disconnect="${esc(row.id)}">解除</button></div></div>`).join("");
+  const candidates = gmailUi.candidates.filter((row) => !["ignored", "imported"].includes(row.status)).map((row) => `<form class="review-row" data-gmail-candidate-form="${esc(row.id)}"><div class="review-row-head"><span>${esc(row.provider || "gmail")}</span><span>${row.duplicate_warning ? "同額・前後7日の候補あり" : ""}</span></div><div class="field-grid"><input class="input" name="merchant_name" value="${esc(row.merchant_name || "")}" aria-label="店名"><input class="input" name="amount" type="number" value="${row.amount ?? ""}" aria-label="金額"><input class="input" name="occurred_at" type="datetime-local" value="${esc(row.occurred_at ? row.occurred_at.slice(0, 16) : "")}" aria-label="日時"></div><div class="review-actions"><button class="small-button" type="submit">編集を保存</button><button class="small-button" type="button" data-gmail-ignore="${esc(row.id)}">無視</button><button class="small-button household-small" type="button" data-gmail-import="${esc(row.id)}" data-project-id="${esc(project.id)}">家計簿へ登録</button></div></form>`).join("");
+  return `<section class="import-section"><div class="inline-heading"><h3>Gmail支払い通知</h3><button class="button secondary-button" type="button" data-gmail-connect>Gmailを接続</button></div>${connections || `<div class="empty-state compact-empty">Gmail接続はありません</div>`}${candidates}</section>`;
+}
+
+async function refreshGmailImport() {
+  if (!isCloud) return;
+  const [connections, candidates] = await Promise.all([Api.listGmailConnections(), Api.listGmailCandidates()]);
+  gmailUi.connections = connections.connections || [];
+  gmailUi.candidates = candidates.candidates || [];
+  render();
 }
 
 async function createHouseholdProject(form) {
@@ -1939,7 +1954,11 @@ document.addEventListener("submit", async (event) => {
     ? state.transactions.find((row) => row.id === ui.selectedTransactionId && row.project_id === project.id)
     : null);
   try {
-    if (form.id === "calendar-entry-form") addCalendarTransaction(form);
+    if (form.dataset.gmailCandidateForm) {
+      const values = Object.fromEntries(new FormData(form));
+      await Api.updateGmailCandidate(form.dataset.gmailCandidateForm, { merchant_name: values.merchant_name, amount: values.amount === "" ? null : Number(values.amount), occurred_at: values.occurred_at ? new Date(values.occurred_at).toISOString() : null, status: "ready" });
+      await refreshGmailImport();
+    } else if (form.id === "calendar-entry-form") addCalendarTransaction(form);
     else if (form.id === "create-split-form") await createSplitProject(form);
     else if (form.id === "create-household-form") await createHouseholdProject(form);
     else if (form.id === "add-member-form" && project) addMember(project, form);
@@ -1967,6 +1986,38 @@ document.addEventListener("click", async (event) => {
   const transaction = calendarSelectedTransaction || (project && ui.selectedTransactionId
     ? state.transactions.find((row) => row.id === ui.selectedTransactionId && row.project_id === project.id)
     : null);
+  try {
+    if (button.dataset.gmailConnect !== undefined) {
+      const result = await Api.startGmailConnection();
+      location.assign(result.url);
+      return;
+    }
+    if (button.dataset.gmailSync) {
+      const days = Number(document.querySelector(`[data-gmail-days="${CSS.escape(button.dataset.gmailSync)}"]`)?.value || 30);
+      await Api.syncGmail(button.dataset.gmailSync, days, 100);
+      await refreshGmailImport();
+      return;
+    }
+    if (button.dataset.gmailDisconnect) {
+      await Api.disconnectGmail(button.dataset.gmailDisconnect);
+      await refreshGmailImport();
+      return;
+    }
+    if (button.dataset.gmailIgnore) {
+      await Api.updateGmailCandidate(button.dataset.gmailIgnore, { status: "ignored" });
+      await refreshGmailImport();
+      return;
+    }
+    if (button.dataset.gmailImport) {
+      await Api.importGmailCandidate(button.dataset.gmailImport, button.dataset.projectId);
+      await refreshGmailImport();
+      await loadCloudState();
+      return;
+    }
+  } catch (error) {
+    toast(error.message || "Gmail取込を実行できませんでした");
+    return;
+  }
   if (button.dataset.calendarView) {
     ui.calendarView = button.dataset.calendarView;
     ui.calendarEntryOpen = false;
@@ -2067,6 +2118,13 @@ document.addEventListener("click", async (event) => {
     if (project?.project_type === "split") ui.splitTab = button.dataset.projectTab;
     else ui.householdTab = button.dataset.projectTab;
     render();
+    if (project?.project_type !== "split" && button.dataset.projectTab === "imports") {
+      try {
+        await refreshGmailImport();
+      } catch (error) {
+        toast(error.message || "Gmail取込を読み込めませんでした");
+      }
+    }
     if (project?.project_type !== "split" && button.dataset.projectTab === "summary") {
       try {
         await refreshCloudSummary(project.id);

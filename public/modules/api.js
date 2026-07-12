@@ -459,6 +459,13 @@ function createApiClient(options = {}) {
       : { ...details, action: actionOrPayload };
     return request(`/imports/${encoded(importId, "importId")}/reconcile`, { method: "POST", json: payload });
   };
+  const startGmailConnection = () => request("/gmail/oauth/start", { method: "POST", json: {} });
+  const listGmailConnections = () => request("/gmail/connections");
+  const disconnectGmail = (connectionId) => request(`/gmail/connections/${encoded(connectionId)}`, { method: "DELETE" });
+  const syncGmail = (connectionId, days = 30, limit = 100) => request(`/gmail/connections/${encoded(connectionId)}/sync`, { method: "POST", json: { days, limit } });
+  const listGmailCandidates = (status) => request("/gmail/candidates", { query: status ? { status } : undefined });
+  const updateGmailCandidate = (candidateId, values) => request(`/gmail/candidates/${encoded(candidateId)}`, { method: "PATCH", json: values });
+  const importGmailCandidate = (candidateId, projectId) => request(`/gmail/candidates/${encoded(candidateId)}/import`, { method: "POST", json: { project_id: projectId } });
   const updateImportRecord = (importId, row = {}) => {
     if (row.source_status === "linked" && row.transaction_id) {
       return reconcileImport(importId, { action: "link", transaction_id: row.transaction_id });
@@ -642,6 +649,13 @@ function createApiClient(options = {}) {
     importCsv,
     createCsvImports: importCsv,
     reconcileImport,
+    startGmailConnection,
+    listGmailConnections,
+    disconnectGmail,
+    syncGmail,
+    listGmailCandidates,
+    updateGmailCandidate,
+    importGmailCandidate,
     getProjectSummaries,
     getProjectSummary: getProjectSummaries,
     getSummaries: getProjectSummaries,
