@@ -261,10 +261,21 @@ CREATE TRIGGER IF NOT EXISTS trg_household_sync_guard_insert
 BEFORE INSERT ON household_sync_guards
 WHEN NOT EXISTS (
   SELECT 1
+  FROM projects
+  JOIN users ON users.id = projects.owner_user_id
+  WHERE projects.id = NEW.project_id
+    AND projects.project_type = 'household'
+    AND projects.owner_user_id = NEW.user_id
+    AND users.deleted_at IS NULL
+    AND users.deletion_started_at IS NULL
+  UNION ALL
+  SELECT 1
   FROM project_user_roles
   JOIN users ON users.id = project_user_roles.user_id
+  JOIN projects ON projects.id = project_user_roles.project_id
   WHERE project_user_roles.project_id = NEW.project_id
     AND project_user_roles.user_id = NEW.user_id
+    AND projects.project_type = 'split'
     AND project_user_roles.role IN ('owner', 'editor')
     AND project_user_roles.revoked_at IS NULL
     AND users.deleted_at IS NULL

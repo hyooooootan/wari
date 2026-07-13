@@ -86,12 +86,13 @@ class D1Database {
 }
 
 function insertProject(database, id, name, projectType, finalizedAt = null) {
+  const ownerUserId = projectType === "household" ? `owner-${id.replace("house-", "")}` : null;
   database.prepare(
     `INSERT INTO projects (
-       id, name, project_type, currency, share_token, share_role, share_expires_at,
+       id, name, project_type, owner_user_id, currency, share_token, share_role, share_expires_at,
        finalized_at, created_at, updated_at
-     ) VALUES (?, ?, ?, 'JPY', NULL, 'editor', NULL, ?, ?, ?)`,
-  ).run(id, name, projectType, finalizedAt, now, now);
+     ) VALUES (?, ?, ?, ?, 'JPY', NULL, 'editor', NULL, ?, ?, ?)`,
+  ).run(id, name, projectType, ownerUserId, finalizedAt, now, now);
 }
 
 function insertMember(database, id, projectId, displayName, role, householdProjectId = null) {
@@ -106,6 +107,11 @@ function insertMember(database, id, projectId, displayName, role, householdProje
 function createFixture() {
   const database = new DatabaseSync(":memory:");
   database.exec(schemaSql);
+  for (const suffix of ["a", "b", "c", "d"]) {
+    database.prepare(
+      "INSERT INTO users (id, google_sub, email, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+    ).run(`owner-${suffix}`, `owner-${suffix}-sub`, `owner-${suffix}@example.test`, now, now);
+  }
   insertProject(database, "split", "Trip", "split");
   for (const suffix of ["a", "b", "c", "d"]) {
     insertProject(database, `house-${suffix}`, `House ${suffix.toUpperCase()}`, "household");
@@ -169,16 +175,8 @@ function createFixture() {
 }
 
 function grantFixtureAccess(database) {
-  database.prepare(
-    "INSERT INTO users (id, google_sub, email, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-  ).run("sync-user", "sync-sub", "sync@example.test", now, now);
-  for (const projectId of ["split", "house-a", "house-b", "house-c", "house-d"]) {
-    database.prepare(
-      `INSERT INTO project_user_roles (project_id, user_id, role, created_at, updated_at)
-       VALUES (?, 'sync-user', 'owner', ?, ?)`,
-    ).run(projectId, now, now);
-  }
-  return { id: "sync-user" };
+  database.prepare("UPDATE project_members SET linked_household_project_id = NULL, linked_at = NULL WHERE id IN ('A', 'C', 'D')").run();
+  return { id: "owner-b" };
 }
 
 function generatedGraph(database) {
@@ -485,7 +483,7 @@ test("target permission guards stop creation, updates, and cancellation after pr
         }
         const before = generatedGraph(database);
         db.beforeBatch = () => database.prepare(
-          "UPDATE project_user_roles SET revoked_at = ? WHERE project_id = 'house-b' AND user_id = ?",
+          "UPDATE users SET deletion_started_at = ? WHERE id = ?",
         ).run(now, user.id);
         await assert.rejects(
           () => syncSplitTransactionToHouseholds(db, "tx-source", { now, user, validate: false }),

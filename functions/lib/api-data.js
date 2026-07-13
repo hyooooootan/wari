@@ -12,7 +12,7 @@ export const PROJECT_GRAPH_KEYS = Object.freeze([
   "import_records",
 ]);
 
-const PROJECT_TYPES = new Set(["split", "household", "shared_household"]);
+const PROJECT_TYPES = new Set(["split", "household"]);
 const PROJECT_ROLES = new Set(["owner", "editor", "member", "viewer"]);
 const SHARE_ROLES = new Set(["editor", "viewer"]);
 const TRANSACTION_STATUSES = new Set(["provisional", "confirmed", "cancelled", "refunded", "corrected"]);
@@ -33,6 +33,7 @@ export async function listProjects(db) {
           AND status IN ('confirmed', 'refunded', 'corrected')
           AND entry_type IN ('purchase', 'split_expense', 'refund', 'adjustment')), 0) AS confirmed_total
     FROM projects
+    WHERE projects.project_type IN ('split', 'household')
     ORDER BY updated_at DESC, created_at DESC, id`),
   );
   return { projects: sanitizeProjects(results) };
@@ -42,7 +43,7 @@ export async function listProjectsForUser(db, user) {
   const results = await all(
     db.prepare(`SELECT
       projects.*,
-      roles.role AS access_role,
+      CASE WHEN projects.project_type = 'household' THEN 'owner' ELSE roles.role END AS access_role,
       (SELECT COUNT(*) FROM project_members WHERE project_id = projects.id AND is_active = 1) AS member_count,
       (SELECT COUNT(*) FROM transactions WHERE project_id = projects.id) AS transaction_count,
       (SELECT COUNT(*) FROM import_records WHERE project_id = projects.id) AS import_count,
@@ -51,11 +52,16 @@ export async function listProjectsForUser(db, user) {
           AND status IN ('confirmed', 'refunded', 'corrected')
           AND entry_type IN ('purchase', 'split_expense', 'refund', 'adjustment')), 0) AS confirmed_total
     FROM projects
-    JOIN project_user_roles roles
+    LEFT JOIN project_user_roles roles
       ON roles.project_id = projects.id
-     AND roles.user_id = ?
-     AND roles.revoked_at IS NULL
-    ORDER BY projects.updated_at DESC, projects.created_at DESC, projects.id`).bind(user.id),
+      AND roles.user_id = ?
+      AND roles.revoked_at IS NULL
+    WHERE projects.project_type IN ('split', 'household')
+      AND (
+        (projects.project_type = 'household' AND projects.owner_user_id = ?)
+        OR (projects.project_type = 'split' AND roles.user_id IS NOT NULL)
+      )
+    ORDER BY projects.updated_at DESC, projects.created_at DESC, projects.id`).bind(user.id, user.id),
   );
   return { projects: sanitizeProjects(results) };
 }
@@ -68,6 +74,7 @@ export async function createProject(db, input, ownerUser = null) {
     id: optionalId(input, "id") || makeId("prj"),
     name: requiredString(input, "name", 1, 200),
     project_type: optionalEnum(input, "project_type", PROJECT_TYPES, "split"),
+    owner_user_id: null,
     currency: optionalCurrency(input, "currency", "JPY"),
     share_token: null,
     share_role: "editor",
@@ -86,15 +93,24 @@ export async function createProject(db, input, ownerUser = null) {
       display_name: requiredString(input.initial_member, "display_name", 1, 200),
     };
   }
+  if (project.project_type === "household") {
+    if (!ownerUser?.id) throw new ApiError(401, "authentication_required");
+    project.owner_user_id = boundedString(ownerUser.id, "owner_user_id", 1, 128, true);
+    const existing = await db.prepare(`SELECT id FROM projects
+      WHERE project_type = 'household' AND owner_user_id = ?
+      ORDER BY created_at, id LIMIT 1`).bind(project.owner_user_id).first();
+    if (existing) return getProjectGraph(db, existing.id);
+  }
   await assertIdAvailable(db, "projects", project.id);
   if (initialMember) await assertIdAvailable(db, "project_members", initialMember.id);
   const statements = [
     db.prepare(`INSERT INTO projects (
-      id, name, project_type, currency, share_token, share_role, share_expires_at, finalized_at, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(
+      id, name, project_type, owner_user_id, currency, share_token, share_role, share_expires_at, finalized_at, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(
       project.id,
       project.name,
       project.project_type,
+      project.owner_user_id,
       project.currency,
       project.share_token,
       project.share_role,
@@ -112,7 +128,7 @@ export async function createProject(db, input, ownerUser = null) {
         .bind(initialMember?.id || makeId("mem"), project.id, initialMember?.display_name || "自分", timestamp, timestamp),
     );
   }
-  if (ownerUser) {
+  if (ownerUser && project.project_type === "split") {
     const ownerUserId = boundedString(ownerUser.id, "user_id", 1, 128, true);
     statements.push(
       db.prepare(`INSERT INTO project_user_roles (
@@ -120,7 +136,17 @@ export async function createProject(db, input, ownerUser = null) {
       ) VALUES (?, ?, 'owner', ?, ?, NULL)`).bind(project.id, ownerUserId, timestamp, timestamp),
     );
   }
-  await db.batch(statements);
+  try {
+    await db.batch(statements);
+  } catch (error) {
+    if (project.project_type === "household") {
+      const existing = await db.prepare(`SELECT id FROM projects
+        WHERE project_type = 'household' AND owner_user_id = ?
+        ORDER BY created_at, id LIMIT 1`).bind(project.owner_user_id).first();
+      if (existing) return getProjectGraph(db, existing.id);
+    }
+    throw error;
+  }
   return getProjectGraph(db, project.id);
 }
 
@@ -163,10 +189,10 @@ export async function updateProject(db, projectId, input) {
   assertAllowed(input, ["name", "project_type", "currency"]);
   assertNonEmpty(input);
   await requireProject(db, id);
+  if (has(input, "project_type")) throw new ApiError(400, "project_type_immutable");
   const assignments = [];
   const bindings = [];
   if (has(input, "name")) addAssignment(assignments, bindings, "name", requiredString(input, "name", 1, 200));
-  if (has(input, "project_type")) addAssignment(assignments, bindings, "project_type", requiredEnum(input, "project_type", PROJECT_TYPES));
   if (has(input, "currency")) addAssignment(assignments, bindings, "currency", requiredCurrency(input, "currency"));
   addAssignment(assignments, bindings, "updated_at", now());
   await db.prepare(`UPDATE projects SET ${assignments.join(", ")} WHERE id = ?`).bind(...bindings, id).run();
@@ -191,6 +217,7 @@ export async function createProjectShare(db, projectId, input = {}, user = null)
   assertObject(input);
   assertAllowed(input, ["role", "expires_at", "rotate"]);
   const project = await requireProject(db, id);
+  if (project.project_type === "household") throw new ApiError(403, "household_sharing_forbidden");
   const role = optionalEnum(input, "role", SHARE_ROLES, project.share_role || "editor");
   const expiresAtValue = has(input, "expires_at") ? nullableDate(input, "expires_at") : project.share_expires_at;
   const expiresAt = expiresAtValue === null ? null : new Date(expiresAtValue).toISOString();
@@ -246,6 +273,7 @@ export async function getSharedProject(db, tokenValue) {
     FROM project_shares shares
     JOIN projects ON projects.id = shares.project_id
     WHERE shares.token_hash = ?
+      AND projects.project_type = 'split'
       AND shares.revoked_at IS NULL
       AND (shares.expires_at IS NULL OR shares.expires_at > ?)
     LIMIT 1`).bind(await sha256Hex(token), timestamp).first();
@@ -262,7 +290,8 @@ export async function getSharedProject(db, tokenValue) {
     };
   }
   const project = await db.prepare(`SELECT * FROM projects
-    WHERE share_token = ? AND (share_expires_at IS NULL OR share_expires_at > ?)
+    WHERE project_type = 'split'
+      AND share_token = ? AND (share_expires_at IS NULL OR share_expires_at > ?)
     LIMIT 1`).bind(token, timestamp).first();
   if (!project) throw new ApiError(404, "not_found");
   const graph = await getProjectGraph(db, project.id);
@@ -950,6 +979,10 @@ function emptyGraph() {
 function sanitizeProject(project) {
   if (!project) return project;
   const { share_token, ...safeProject } = project;
+  if (safeProject.project_type === "household") {
+    delete safeProject.share_role;
+    delete safeProject.share_expires_at;
+  }
   return safeProject;
 }
 

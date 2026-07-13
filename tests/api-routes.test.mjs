@@ -180,10 +180,12 @@ test("project CRUD creates a household owner and enforces share expiry", async (
 
   const created = await createProject(db, { id: "home", name: "家計", project_type: "household", currency: "jpy" });
   assert.equal(created.projects[0].id, "home");
+  assert.equal(created.projects[0].owner_user_id, "test-user");
   assert.equal(created.projects[0].currency, "JPY");
   assert.equal(created.project_members.length, 1);
   assert.equal(created.project_members[0].display_name, "自分");
   assert.equal(created.project_members[0].role, "owner");
+  assert.equal(db.database.prepare("SELECT COUNT(*) AS n FROM project_user_roles WHERE project_id = 'home'").get().n, 0);
 
   const list = await request(db, "GET", "/api/projects");
   assert.equal(list.response.status, 200);
@@ -197,47 +199,27 @@ test("project CRUD creates a household owner and enforces share expiry", async (
   assert.equal(invalidPatch.response.status, 400);
   assert.deepEqual(invalidPatch.body, { error: "unknown_field", field: "created_at" });
 
-  const defaultShare = await request(db, "POST", "/api/projects/home/share");
-  assert.equal(defaultShare.response.status, 200);
-  assert.equal(defaultShare.body.role, "editor");
+  const householdShare = await request(db, "POST", "/api/projects/home/share");
+  assert.equal(householdShare.response.status, 403);
+  assert.deepEqual(householdShare.body, { error: "household_sharing_forbidden" });
+  assert.equal(db.database.prepare("SELECT COUNT(*) AS n FROM project_shares WHERE project_id = 'home'").get().n, 0);
 
-  const activeShare = await request(db, "POST", "/api/projects/home/share", { expires_at: "2099-01-01T00:00:00.000Z" });
-  assert.equal(activeShare.response.status, 200);
-  assert.equal(typeof activeShare.body.token, "string");
-  assert.equal(db.database.prepare("SELECT share_token FROM projects WHERE id = 'home'").get().share_token, null);
-  const storedShare = db.database.prepare("SELECT token_hash, role, expires_at FROM project_shares WHERE project_id = 'home' ORDER BY created_at DESC LIMIT 1").get();
-  assert.equal(storedShare.token_hash === activeShare.body.token, false);
-  assert.equal(storedShare.role, "editor");
-
-  const shared = await request(db, "GET", `/api/share/${activeShare.body.token}`);
-  assert.equal(shared.response.status, 200);
-  assert.equal(shared.body.projects[0].id, "home");
-  assert.equal(Object.hasOwn(shared.body.projects[0], "share_token"), false);
-  assert.equal(shared.body.share.role, "editor");
+  const shared = await request(db, "GET", "/api/share/household-token");
+  assert.equal(shared.response.status, 400);
+  assert.deepEqual(shared.body, { error: "invalid_field", field: "token" });
 
   const projectGraph = await request(db, "GET", "/api/projects/home");
   assert.equal(projectGraph.response.status, 200);
   assert.equal(Object.hasOwn(projectGraph.body.projects[0], "share_token"), false);
-
-  const expiredShare = await request(db, "POST", "/api/projects/home/share", { expires_at: "2020-01-01T00:00:00.000Z", rotate: true });
-  assert.equal(expiredShare.response.status, 200);
-  const oldShareAfterRotate = await request(db, "GET", `/api/share/${activeShare.body.token}`);
-  assert.equal(oldShareAfterRotate.response.status, 404);
-  const expiredRead = await request(db, "GET", `/api/share/${expiredShare.body.token}`);
-  assert.equal(expiredRead.response.status, 404);
-  assert.deepEqual(expiredRead.body, { error: "not_found" });
-  const shareRows = db.database.prepare("SELECT COUNT(*) AS total, SUM(CASE WHEN revoked_at IS NOT NULL THEN 1 ELSE 0 END) AS revoked FROM project_shares WHERE project_id = 'home'").get();
-  assert.equal(shareRows.total, 3);
-  assert.equal(shareRows.revoked, 2);
 
   const householdFinalize = await request(db, "POST", "/api/projects/home/finalize");
   assert.equal(householdFinalize.response.status, 409);
   assert.deepEqual(householdFinalize.body, { error: "project_not_split" });
 });
 
-test("household creation rolls back project, member, and owner role when owner insertion fails", async (t) => {
+test("household creation rolls back project and member when the batch fails", async (t) => {
   const db=new D1Database();t.after(()=>db.close());
-  db.failBatchAt=2;
+  db.failBatchAt=1;
   const result=await request(db,"POST","/api/projects",{id:"failed-home",name:"Failed",project_type:"household",initial_member:{id:"failed-owner",display_name:"Owner"}});
   assert.equal(result.response.status,500);
   assert.equal(db.database.prepare("SELECT count(*) AS n FROM projects WHERE id=?").get("failed-home").n,0);
@@ -290,9 +272,9 @@ test("household links require target edit access and revoked access blocks later
   await request(db, "POST", "/api/projects/split-access/members", { id: "linked-member", display_name: "Member" });
   const now = "2026-07-12T00:00:00.000Z";
   db.database.prepare("INSERT INTO users (id,google_sub,email,created_at,updated_at) VALUES (?,?,?,?,?)").run("other-user", "other-sub", "other@example.test", now, now);
-  db.database.prepare("INSERT INTO projects (id,name,project_type,created_at,updated_at) VALUES (?,?,?,?,?)").run("forbidden-home", "Forbidden", "household", now, now);
+  db.database.prepare("INSERT INTO users (id,google_sub,email,created_at,updated_at) VALUES (?,?,?,?,?)").run("revoked-user", "revoked-sub", "revoked@example.test", now, now);
+  db.database.prepare("INSERT INTO projects (id,name,project_type,owner_user_id,created_at,updated_at) VALUES (?,?,?,?,?,?)").run("forbidden-home", "Forbidden", "household", "other-user", now, now);
   db.database.prepare("INSERT INTO project_members (id,project_id,display_name,role,is_active,created_at,updated_at) VALUES (?,?,?,?,1,?,?)").run("forbidden-owner", "forbidden-home", "Owner", "owner", now, now);
-  db.database.prepare("INSERT INTO project_user_roles (project_id,user_id,role,created_at,updated_at) VALUES (?,?,?,?,?)").run("forbidden-home", "other-user", "owner", now, now);
 
   const forbidden = await request(db, "PATCH", "/api/project-members/linked-member/household-link", { action: "link", household_project_id: "forbidden-home" });
   assert.equal(forbidden.response.status, 404);
@@ -306,7 +288,7 @@ test("household links require target edit access and revoked access blocks later
   const generated = db.database.prepare("SELECT id,paid_amount,status FROM transactions WHERE project_id='allowed-home' AND origin_transaction_id='access-txn'").get();
   assert.equal(generated.paid_amount, 100);
 
-  db.database.prepare("UPDATE project_user_roles SET revoked_at=? WHERE project_id='allowed-home' AND user_id='test-user'").run(now);
+  db.database.prepare("UPDATE projects SET owner_user_id='revoked-user' WHERE id='allowed-home'").run();
   const updated = await request(db, "PUT", "/api/items/access-item/allocations", { allocations: [{ id: "access-allocation", project_member_id: "linked-member", allocated_amount: 40 }] });
   assert.equal(updated.response.status, 200);
   assert.equal(updated.body.synchronization.status, "pending");
@@ -355,7 +337,7 @@ test("failed derived synchronization retry validates requester, origin, and an e
 
   const otherSession = await createTestSession(db, "other-retry-user");
   const roleTimestamp = "2026-07-12T00:00:00.000Z";
-  for (const projectId of ["retry-home", "retry-split"]) {
+  for (const projectId of ["retry-split"]) {
     db.database.prepare(
       "INSERT INTO project_user_roles (project_id,user_id,role,created_at,updated_at) VALUES (?,?,?,?,?)",
     ).run(projectId, "other-retry-user", "editor", roleTimestamp, roleTimestamp);
@@ -423,8 +405,8 @@ test("failed derived synchronization retry validates requester, origin, and an e
   assert.equal(failedAgain.body.synchronization.job_id, pending.id);
   assert.equal(db.database.prepare("SELECT COUNT(*) AS count FROM household_sync_jobs WHERE source_project_id = 'retry-split' AND source_transaction_id = 'retry-transaction'").get().count, 1);
   db.database.prepare(
-    "UPDATE project_user_roles SET revoked_at = ? WHERE project_id = 'retry-home' AND user_id = 'test-user'",
-  ).run("2026-07-13T00:00:00.000Z");
+    "UPDATE projects SET owner_user_id = 'other-retry-user' WHERE id = 'retry-home'",
+  ).run();
   const blocked = await request(db, "POST", `/api/household-sync-jobs/${encodeURIComponent(pending.id)}/retry`, {});
   assert.equal(blocked.response.status, 200);
   assert.equal(blocked.body.status, "blocked");

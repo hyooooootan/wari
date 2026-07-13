@@ -124,16 +124,39 @@ async function canWriteHousehold(db, user, projectId) {
   const row = await first(
     db,
     `SELECT 1 AS allowed
-     FROM project_user_roles
-     JOIN users ON users.id = project_user_roles.user_id
-     WHERE project_user_roles.project_id = ?
-       AND project_user_roles.user_id = ?
-       AND project_user_roles.role IN ('owner', 'editor')
-       AND project_user_roles.revoked_at IS NULL
+     FROM projects
+     JOIN users ON users.id = projects.owner_user_id
+     WHERE projects.id = ?
+       AND projects.project_type = 'household'
+       AND projects.owner_user_id = ?
        AND users.deleted_at IS NULL
        AND users.deletion_started_at IS NULL
      LIMIT 1`,
     [projectId, user.id],
+  );
+  return Boolean(row);
+}
+
+async function canWriteProject(db, user, projectId) {
+  if (!user) return true;
+  const row = await first(
+    db,
+    `SELECT 1 AS allowed
+     FROM projects
+     JOIN users ON users.id = ?
+     LEFT JOIN project_user_roles roles
+       ON roles.project_id = projects.id
+      AND roles.user_id = users.id
+      AND roles.revoked_at IS NULL
+     WHERE projects.id = ?
+       AND users.deleted_at IS NULL
+       AND users.deletion_started_at IS NULL
+       AND (
+         (projects.project_type = 'household' AND projects.owner_user_id = users.id)
+         OR (projects.project_type = 'split' AND roles.role IN ('owner', 'editor'))
+       )
+     LIMIT 1`,
+    [user.id, projectId],
   );
   return Boolean(row);
 }
@@ -1006,7 +1029,7 @@ export async function retryHouseholdSyncJob(db, jobId, user, options = {}) {
     const rejected = await updateRetryFailure(db, job, "rejected", "source_project_not_found", now);
     return { status: "rejected", sync_pending: false, job_id: rejected.id };
   }
-  if (!await canWriteHousehold(db, user, job.source_project_id)) {
+  if (!await canWriteProject(db, user, job.source_project_id)) {
     const blocked = await updateRetryFailure(db, job, "blocked", "source_access_lost", now);
     return { status: "blocked", sync_pending: false, job_id: blocked.id };
   }

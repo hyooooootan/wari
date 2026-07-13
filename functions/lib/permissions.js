@@ -25,9 +25,11 @@ export async function requireProjectShareRole(db, projectId, token, requiredRole
   const project = boundedString(projectId, "project_id", 1, 128, true);
   const bearer = boundedString(token, "share_token", 16, 256, false);
   const timestamp = now();
-  const share = await db.prepare(`SELECT project_id, role, expires_at
+  const share = await db.prepare(`SELECT project_shares.project_id, project_shares.role, project_shares.expires_at
     FROM project_shares
-    WHERE project_id = ?
+    JOIN projects ON projects.id = project_shares.project_id
+    WHERE project_shares.project_id = ?
+      AND projects.project_type = 'split'
       AND token_hash = ?
       AND revoked_at IS NULL
       AND (expires_at IS NULL OR expires_at > ?)
@@ -39,6 +41,7 @@ export async function requireProjectShareRole(db, projectId, token, requiredRole
   const legacy = await db.prepare(`SELECT id AS project_id, share_role AS role, share_expires_at AS expires_at
     FROM projects
     WHERE id = ?
+      AND project_type = 'split'
       AND share_token = ?
       AND (share_expires_at IS NULL OR share_expires_at > ?)
     LIMIT 1`).bind(project, bearer, timestamp).first();
@@ -48,11 +51,23 @@ export async function requireProjectShareRole(db, projectId, token, requiredRole
 
 export async function projectRole(db, user, projectId) {
   if (!user) return null;
-  const row = await db.prepare(`SELECT role FROM project_user_roles
-    WHERE project_id = ?
-      AND user_id = ?
-      AND revoked_at IS NULL`).bind(projectId, user.id).first();
-  return row ? { project_id: projectId, user_id: user.id, role: row.role } : null;
+  const row = await db.prepare(`SELECT
+      projects.id AS project_id,
+      CASE WHEN projects.project_type = 'household' THEN 'owner' ELSE roles.role END AS role
+    FROM projects
+    JOIN users ON users.id = ?
+    LEFT JOIN project_user_roles roles
+      ON roles.project_id = projects.id
+     AND roles.user_id = users.id
+     AND roles.revoked_at IS NULL
+    WHERE projects.id = ?
+      AND users.deleted_at IS NULL
+      AND users.deletion_started_at IS NULL
+      AND (
+        (projects.project_type = 'household' AND projects.owner_user_id = users.id)
+        OR (projects.project_type = 'split' AND roles.user_id IS NOT NULL)
+      )`).bind(user.id, projectId).first();
+  return row ? { project_id: row.project_id, user_id: user.id, role: row.role } : null;
 }
 
 export async function projectIdForMember(db, memberId) {

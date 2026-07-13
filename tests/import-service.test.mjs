@@ -65,10 +65,11 @@ function openDatabase() {
   const database = new DatabaseSync(":memory:");
   database.exec(schemaSql);
   const now = "2026-07-01T00:00:00.000Z";
+  database.prepare("INSERT INTO users (id, google_sub, email, created_at, updated_at) VALUES (?, ?, ?, ?, ?)").run("import-owner", "import-owner-sub", "import-owner@example.test", now, now);
   database.prepare(`
     INSERT INTO projects (
-      id, name, project_type, currency, share_role, created_at, updated_at
-    ) VALUES (?, ?, 'household', 'JPY', 'editor', ?, ?)
+      id, name, project_type, owner_user_id, currency, share_role, created_at, updated_at
+    ) VALUES (?, ?, 'household', 'import-owner', 'JPY', 'editor', ?, ?)
   `).run("project-a", "Household", now, now);
   database.prepare(`
     INSERT INTO project_members (
