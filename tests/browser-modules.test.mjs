@@ -189,6 +189,13 @@ test("家計企画と手入力取引に本人、要約品目、支払い、配�
     state.project_members.map((row) => [row.display_name, row.role]),
     [["自分", "owner"]],
   );
+  const duplicate = WariHousehold.createHouseholdProject(
+    state,
+    { id: "other-home", name: "別の家計簿", owner_member_id: "other-self" },
+    { now: T1, storage: WariStorage },
+  );
+  assert.equal(duplicate.projects.length, 1);
+  assert.equal(duplicate.projects[0].id, "home");
   state = WariHousehold.createManualHouseholdTransaction(
     state,
     "home",
@@ -404,164 +411,55 @@ test("APIのJSONエラーに状態番号と識別子を保持する", async () =
   );
 });
 
-test("Gmail接続前に画面の個人家計簿と同じ識別子でクラウド家計簿を作成する", async () => {
+test("Gmail接続開始は家計簿識別子を送らず認可先へ遷移する", async () => {
   const calls = [];
-  let listCount = 0;
   const client = WariApi.createApiClient({
     fetch: async (url, options) => {
       calls.push({ url, method: options.method, body: options.body ? JSON.parse(options.body) : null });
-      if (url === "/api/projects" && options.method === "GET") {
-        listCount += 1;
-        return Response.json({ projects: listCount === 1 ? [] : [{ id: "home", project_type: "household", access_role: "owner" }] });
-      }
-      if (url === "/api/projects") return Response.json({ projects: [{ id: "home" }] }, { status: 201 });
       return Response.json({ url: "https://accounts.google.com/gmail-oauth" });
     },
   });
-  const result = await client.startGmailConnectionForProject({ id: "home", name: "生活費", project_type: "household", currency: "JPY" });
+  const result = await client.startGmailConnection();
   assert.equal(result.url, "https://accounts.google.com/gmail-oauth");
-  assert.deepEqual(calls.map((call) => [call.method, call.url]), [
-    ["GET", "/api/projects"],
-    ["POST", "/api/projects"],
-    ["GET", "/api/projects"],
-    ["POST", "/api/gmail/oauth/start"],
-  ]);
-  assert.deepEqual(calls[1].body, { id: "home", name: "生活費", project_type: "household", currency: "JPY" });
-  assert.deepEqual(calls[3].body, { project_id: "home" });
+  assert.deepEqual(calls, [{ url: "/api/gmail/oauth/start", method: "POST", body: {} }]);
 });
 
-test("作成済みの個人家計簿では重複作成せずGmail接続を開始する", async () => {
-  const calls = [];
-  const client = WariApi.createApiClient({
-    fetch: async (url, options) => {
-      calls.push([options.method, url]);
-      if (url === "/api/projects") return Response.json({ projects: [{ id: "home", project_type: "household", access_role: "owner" }] });
-      return Response.json({ url: "https://accounts.google.com/gmail-oauth" });
-    },
-  });
-  await client.startGmailConnectionForProject({ id: "home", name: "生活費", project_type: "household" });
-  assert.deepEqual(calls, [["GET", "/api/projects"], ["POST", "/api/gmail/oauth/start"]]);
-});
-
-test("個人家計簿の作成競合後に再読込してGmail接続を続行する", async () => {
-  let listCount = 0;
-  const calls = [];
-  const client = WariApi.createApiClient({
-    fetch: async (url, options) => {
-      calls.push([options.method, url]);
-      if (url === "/api/projects" && options.method === "GET") {
-        listCount += 1;
-        return Response.json({ projects: listCount === 1 ? [] : [{ id: "home", project_type: "household", access_role: "owner" }] });
-      }
-      if (url === "/api/projects") return Response.json({ error: "id_conflict" }, { status: 409 });
-      return Response.json({ url: "https://accounts.google.com/gmail-oauth" });
-    },
-  });
-  await client.startGmailConnectionForProject({ id: "home", name: "生活費", project_type: "household" });
-  assert.deepEqual(calls, [
-    ["GET", "/api/projects"],
-    ["POST", "/api/projects"],
-    ["GET", "/api/projects"],
-    ["POST", "/api/gmail/oauth/start"],
-  ]);
-});
-
-test("個人家計簿の作成競合後に所有者でなければGmail接続を拒否する", async () => {
-  let listCount = 0;
-  const calls = [];
-  const client = WariApi.createApiClient({
-    fetch: async (url, options) => {
-      calls.push([options.method, url]);
-      if (url === "/api/projects" && options.method === "GET") {
-        listCount += 1;
-        return Response.json({ projects: listCount === 1 ? [] : [{ id: "home", project_type: "household", access_role: "editor" }] });
-      }
-      return Response.json({ error: "id_conflict" }, { status: 409 });
-    },
-  });
-  await assert.rejects(
-    () => client.startGmailConnectionForProject({ id: "home", name: "生活費", project_type: "household" }),
-    (error) => error.code === "gmail_shared_household_not_allowed",
-  );
-  assert.deepEqual(calls, [
-    ["GET", "/api/projects"],
-    ["POST", "/api/projects"],
-    ["GET", "/api/projects"],
-  ]);
-});
-
-test("Gmail接続準備の認証失効、共有家計簿、作成失敗を日本語で示す", async () => {
+test("Gmail接続開始の認証失効と本人家計簿エラーを日本語で示す", async () => {
   const expired = WariApi.createApiClient({
     fetch: async () => Response.json({ error: "authentication_required" }, { status: 401 }),
   });
   await assert.rejects(
-    () => expired.startGmailConnectionForProject({ id: "home", project_type: "household" }),
+    () => expired.startGmailConnection(),
     (error) => error.code === "gmail_authentication_required" && /ログインし直してください/.test(error.message),
   );
 
-  const shared = WariApi.createApiClient({
-    fetch: async () => Response.json({ projects: [{ id: "home", project_type: "household", access_role: "editor" }] }),
+  const missingHousehold = WariApi.createApiClient({
+    fetch: async () => Response.json({ error: "gmail_personal_household_required" }, { status: 409 }),
   });
   await assert.rejects(
-    () => shared.startGmailConnectionForProject({ id: "home", project_type: "household" }),
-    (error) => error.code === "gmail_shared_household_not_allowed" && /共有家計簿/.test(error.message),
-  );
-
-  const ownerUnknown = WariApi.createApiClient({
-    fetch: async () => Response.json({ projects: [{ id: "home", project_type: "household" }] }),
-  });
-  await assert.rejects(
-    () => ownerUnknown.startGmailConnectionForProject({ id: "home", project_type: "household" }),
-    (error) => error.code === "gmail_shared_household_not_allowed" && /共有家計簿/.test(error.message),
-  );
-
-  let requestCount = 0;
-  const failed = WariApi.createApiClient({
-    fetch: async () => {
-      requestCount += 1;
-      return requestCount === 1
-        ? Response.json({ projects: [] })
-        : Response.json({ error: "server_error" }, { status: 500 });
-    },
-  });
-  await assert.rejects(
-    () => failed.startGmailConnectionForProject({ id: "home", project_type: "household" }),
-    (error) => /作成できませんでした/.test(error.message),
-  );
-
-  let conflictCount = 0;
-  const nonIdConflict = WariApi.createApiClient({
-    fetch: async () => {
-      conflictCount += 1;
-      return conflictCount === 1
-        ? Response.json({ projects: [] })
-        : Response.json({ error: "project_state_conflict" }, { status: 409 });
-    },
-  });
-  await assert.rejects(
-    () => nonIdConflict.startGmailConnectionForProject({ id: "home", project_type: "household" }),
-    (error) => error.code === "project_state_conflict" && /作成できませんでした/.test(error.message),
-  );
-
-  const sharedAtStart = WariApi.createApiClient({
-    fetch: async (url) => url === "/api/projects"
-      ? Response.json({ projects: [{ id: "home", project_type: "household", access_role: "owner" }] })
-      : Response.json({ error: "gmail_personal_household_required" }, { status: 403 }),
-  });
-  await assert.rejects(
-    () => sharedAtStart.startGmailConnectionForProject({ id: "home", project_type: "household" }),
-    (error) => error.code === "gmail_personal_household_required" && /共有中の家計簿/.test(error.message),
+    () => missingHousehold.startGmailConnection(),
+    (error) => error.code === "gmail_personal_household_required" && /本人の家計簿/.test(error.message),
   );
 
   const oauthStartFailure = WariApi.createApiClient({
-    fetch: async (url) => url === "/api/projects"
-      ? Response.json({ projects: [{ id: "home", project_type: "household", access_role: "owner" }] })
-      : Response.json({ error: "server_error" }, { status: 500 }),
+    fetch: async () => Response.json({ error: "server_error" }, { status: 500 }),
   });
   await assert.rejects(
-    () => oauthStartFailure.startGmailConnectionForProject({ id: "home", project_type: "household" }),
+    () => oauthStartFailure.startGmailConnection(),
     (error) => error.code === "server_error" && /Gmail接続を開始できませんでした/.test(error.message),
   );
+});
+
+test("Gmail候補の登録は家計簿識別子を送らない", async () => {
+  let request;
+  const client = WariApi.createApiClient({
+    fetch: async (url, options) => {
+      request = { url, method: options.method, body: options.body ? JSON.parse(options.body) : null };
+      return Response.json({ candidate: { id: "candidate-1" } });
+    },
+  });
+  await client.importGmailCandidate("candidate-1");
+  assert.deepEqual(request, { url: "/api/gmail/candidates/candidate-1/import", method: "POST", body: {} });
 });
 
 test("household row mutation sends the client owner in the project creation request", async () => {

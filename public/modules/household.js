@@ -131,6 +131,7 @@ function activeHouseholdMember(state, projectId, requestedMemberId) {
 function createHouseholdProject(state, input = {}, options = {}) {
   const values = typeof input === "string" ? { name: input } : { ...(input || {}) };
   const next = copyState(state, options);
+  if (next.projects.some((project) => project.project_type === "household")) return next;
   const timestamp = isoTimestamp(options, values.created_at);
   const projectId = makeId("prj", values.id ?? values.project_id ?? options.projectId, options);
   const ownerId = makeId("mem", values.owner_member_id ?? values.member_id ?? options.memberId, options);
@@ -143,9 +144,6 @@ function createHouseholdProject(state, input = {}, options = {}) {
     name,
     project_type: "household",
     currency: String(values.currency || "JPY"),
-    share_token: values.share_token ?? null,
-    share_role: values.share_role || "editor",
-    share_expires_at: values.share_expires_at ?? null,
     finalized_at: null,
     created_at: timestamp,
     updated_at: timestamp,
