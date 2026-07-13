@@ -3,6 +3,7 @@ Thumbs.db
 .env
 .env.*
 !.env.example
+.dev.vars
 node_modules/
 .venv*/
 __pycache__/
