@@ -63,6 +63,11 @@ class D1Database {
   }
 
   batch(statements) {
+    if (this.beforeBatch) {
+      const callback = this.beforeBatch;
+      this.beforeBatch = undefined;
+      callback();
+    }
     this.database.exec("BEGIN IMMEDIATE");
     try {
       const results = statements.map((statement, index) => {
@@ -161,6 +166,35 @@ function createFixture() {
     ).run(`allocation-${itemId}-${memberId}`, itemId, memberId, amount, now, now);
   }
   return { database, db: new D1Database(database) };
+}
+
+function grantFixtureAccess(database) {
+  database.prepare(
+    "INSERT INTO users (id, google_sub, email, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+  ).run("sync-user", "sync-sub", "sync@example.test", now, now);
+  for (const projectId of ["split", "house-a", "house-b", "house-c", "house-d"]) {
+    database.prepare(
+      `INSERT INTO project_user_roles (project_id, user_id, role, created_at, updated_at)
+       VALUES (?, 'sync-user', 'owner', ?, ?)`,
+    ).run(projectId, now, now);
+  }
+  return { id: "sync-user" };
+}
+
+function generatedGraph(database) {
+  return {
+    transactions: queryAll(database, "SELECT * FROM transactions WHERE generated_automatically = 1 ORDER BY id"),
+    payments: queryAll(database, `SELECT payments.* FROM transaction_payments payments
+      JOIN transactions ON transactions.id = payments.transaction_id
+      WHERE transactions.generated_automatically = 1 ORDER BY payments.id`),
+    items: queryAll(database, `SELECT items.* FROM transaction_items items
+      JOIN transactions ON transactions.id = items.transaction_id
+      WHERE transactions.generated_automatically = 1 ORDER BY items.id`),
+    allocations: queryAll(database, `SELECT allocations.* FROM item_allocations allocations
+      JOIN transaction_items items ON items.id = allocations.transaction_item_id
+      JOIN transactions ON transactions.id = items.transaction_id
+      WHERE transactions.generated_automatically = 1 ORDER BY allocations.id`),
+  };
 }
 
 function queryAll(database, sql, ...values) {
@@ -433,5 +467,34 @@ test("household synchronization rolls back every target statement when a batch s
     assert.deepEqual(after, before);
   } finally {
     database.close();
+  }
+});
+
+test("target permission guards stop creation, updates, and cancellation after preflight access is revoked", async (t) => {
+  for (const action of ["create", "update", "cancel"]) {
+    await t.test(action, async () => {
+      const { database, db } = createFixture();
+      try {
+        const user = grantFixtureAccess(database);
+        if (action !== "create") await syncSplitTransactionToHouseholds(db, "tx-source", { now, user });
+        if (action === "update") {
+          database.prepare("UPDATE item_allocations SET allocated_amount = allocated_amount + 5 WHERE transaction_item_id = 'item-food'").run();
+        }
+        if (action === "cancel") {
+          database.prepare("UPDATE transactions SET status = 'cancelled' WHERE id = 'tx-source'").run();
+        }
+        const before = generatedGraph(database);
+        db.beforeBatch = () => database.prepare(
+          "UPDATE project_user_roles SET revoked_at = ? WHERE project_id = 'house-b' AND user_id = ?",
+        ).run(now, user.id);
+        await assert.rejects(
+          () => syncSplitTransactionToHouseholds(db, "tx-source", { now, user, validate: false }),
+          /household_sync_access_denied/,
+        );
+        assert.deepEqual(generatedGraph(database), before);
+      } finally {
+        database.close();
+      }
+    });
   }
 });

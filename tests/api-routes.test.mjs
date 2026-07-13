@@ -55,10 +55,12 @@ class D1Database {
   }
 
   async batch(statements) {
+    const isHouseholdBatch=statements.some((statement)=>statement.sql.includes("household_sync_guards"));
     this.database.exec("BEGIN IMMEDIATE");
     try {
       const results = [];
       for (let index=0;index<statements.length;index++) {
+        if(this.failHouseholdBatchAt===index&&isHouseholdBatch)throw new Error("injected_household_sync_failure");
         if(this.failBatchAt===index)throw new Error("injected_batch_failure");
         results.push(await statements[index].run());
       }
@@ -69,6 +71,7 @@ class D1Database {
       throw error;
     } finally {
       this.failBatchAt=undefined;
+      if(isHouseholdBatch)this.failHouseholdBatchAt=undefined;
     }
   }
 
@@ -274,12 +277,80 @@ test("household links require target edit access and revoked access blocks later
   db.database.prepare("UPDATE project_user_roles SET revoked_at=? WHERE project_id='allowed-home' AND user_id='test-user'").run(now);
   const updated = await request(db, "PUT", "/api/items/access-item/allocations", { allocations: [{ id: "access-allocation", project_member_id: "linked-member", allocated_amount: 40 }] });
   assert.equal(updated.response.status, 200);
+  assert.equal(updated.body.synchronization.status, "pending");
   const afterUpdate = db.database.prepare("SELECT paid_amount,status FROM transactions WHERE id=?").get(generated.id);
   assert.deepEqual({ ...afterUpdate }, { paid_amount: 100, status: "provisional" });
   const removed = await request(db, "DELETE", "/api/transactions/access-txn");
   assert.equal(removed.response.status, 200);
+  assert.equal(removed.body.synchronization.status, "not_found");
   const afterDelete = db.database.prepare("SELECT paid_amount,status FROM transactions WHERE id=?").get(generated.id);
   assert.deepEqual({ ...afterDelete }, { paid_amount: 100, status: "provisional" });
+});
+
+test("failed derived synchronization is persisted, retried, and blocked after target access loss", async (t) => {
+  const db = new D1Database();
+  t.after(() => db.close());
+  await createProject(db, { id: "retry-home", name: "Retry home", project_type: "household" });
+  await createProject(db, { id: "retry-split", name: "Retry split", project_type: "split" });
+  await request(db, "POST", "/api/projects/retry-split/members", { id: "retry-member", display_name: "Member" });
+  await request(db, "PATCH", "/api/project-members/retry-member/household-link", { action: "link", household_project_id: "retry-home" });
+  await request(db, "POST", "/api/projects/retry-split/transactions", {
+    id: "retry-transaction", merchant_name: "Store", paid_amount: 100, occurred_at: "2026-07-12",
+  });
+  await request(db, "POST", "/api/transactions/retry-transaction/items", { id: "retry-item", name: "Item", amount: 100 });
+  await request(db, "PUT", "/api/items/retry-item/allocations", {
+    allocations: [{ id: "retry-allocation", project_member_id: "retry-member", allocated_amount: 100 }],
+  });
+  const generatedId = db.database.prepare(
+    "SELECT id FROM transactions WHERE project_id = 'retry-home' AND origin_transaction_id = 'retry-transaction'",
+  ).get().id;
+
+  db.failHouseholdBatchAt = 2;
+  const failed = await request(db, "PUT", "/api/items/retry-item/allocations", {
+    allocations: [{ id: "retry-allocation", project_member_id: "retry-member", allocated_amount: 40 }],
+  });
+  assert.equal(failed.response.status, 200);
+  assert.equal(failed.body.synchronization.status, "pending");
+  assert.equal(failed.body.synchronization.sync_pending, true);
+  assert.equal(db.database.prepare("SELECT allocated_amount FROM item_allocations WHERE id = 'retry-allocation'").get().allocated_amount, 40);
+  assert.equal(db.database.prepare("SELECT paid_amount FROM transactions WHERE id = ?").get(generatedId).paid_amount, 100);
+  const pending = db.database.prepare("SELECT * FROM household_sync_jobs WHERE id = ?").get(failed.body.synchronization.job_id);
+  assert.equal(pending.status, "pending");
+  assert.equal(pending.source_project_id, "retry-split");
+  assert.equal(pending.source_transaction_id, "retry-transaction");
+  assert.equal(pending.requested_by_user_id, "test-user");
+  assert.equal(pending.attempt_count, 1);
+
+  const retried = await request(db, "POST", `/api/household-sync-jobs/${encodeURIComponent(pending.id)}/retry`);
+  assert.equal(retried.response.status, 200);
+  assert.equal(retried.body.status, "completed");
+  assert.equal(db.database.prepare("SELECT paid_amount FROM transactions WHERE id = ?").get(generatedId).paid_amount, 40);
+  assert.equal(db.database.prepare("SELECT status FROM household_sync_jobs WHERE id = ?").get(pending.id).status, "completed");
+
+  db.failHouseholdBatchAt = 2;
+  const failedAgain = await request(db, "PUT", "/api/items/retry-item/allocations", {
+    allocations: [{ id: "retry-allocation", project_member_id: "retry-member", allocated_amount: 25 }],
+  });
+  assert.equal(failedAgain.body.synchronization.job_id, pending.id);
+  assert.equal(db.database.prepare("SELECT COUNT(*) AS count FROM household_sync_jobs WHERE source_project_id = 'retry-split' AND source_transaction_id = 'retry-transaction'").get().count, 1);
+  db.database.prepare(
+    "UPDATE project_user_roles SET revoked_at = ? WHERE project_id = 'retry-home' AND user_id = 'test-user'",
+  ).run("2026-07-13T00:00:00.000Z");
+  const blocked = await request(db, "POST", `/api/household-sync-jobs/${encodeURIComponent(pending.id)}/retry`);
+  assert.equal(blocked.response.status, 200);
+  assert.equal(blocked.body.status, "blocked");
+  assert.equal(db.database.prepare("SELECT paid_amount FROM transactions WHERE id = ?").get(generatedId).paid_amount, 40);
+  assert.equal(db.database.prepare("SELECT status FROM household_sync_jobs WHERE id = ?").get(pending.id).status, "blocked");
+  db.database.prepare(
+    "UPDATE project_user_roles SET revoked_at = NULL WHERE project_id = 'retry-home' AND user_id = 'test-user'",
+  ).run();
+  db.database.prepare(
+    "UPDATE project_user_roles SET revoked_at = ? WHERE project_id = 'retry-split' AND user_id = 'test-user'",
+  ).run("2026-07-13T00:00:01.000Z");
+  const sourceBlocked = await request(db, "POST", `/api/household-sync-jobs/${encodeURIComponent(pending.id)}/retry`);
+  assert.equal(sourceBlocked.response.status, 200);
+  assert.equal(sourceBlocked.body.status, "blocked");
+  assert.equal(db.database.prepare("SELECT paid_amount FROM transactions WHERE id = ?").get(generatedId).paid_amount, 40);
 });
 
 test("Google login state is claimed once before mock profile handling", async (t) => {

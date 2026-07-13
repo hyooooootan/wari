@@ -12,6 +12,7 @@ const authMigrationSql = readFileSync(path.join(repositoryRoot, 'db', 'migration
 const gmailMigrationSql = readFileSync(path.join(repositoryRoot, 'db', 'migrations', '0004_gmail_payment_import.sql'), 'utf8');
 const gmailOauthProjectMigrationSql = readFileSync(path.join(repositoryRoot, 'db', 'migrations', '0005_gmail_oauth_project.sql'), 'utf8');
 const accountDeletionMigrationSql = readFileSync(path.join(repositoryRoot, 'db', 'migrations', '0006_account_deletion.sql'), 'utf8');
+const householdSyncMigrationSql = readFileSync(path.join(repositoryRoot, 'db', 'migrations', '0007_household_sync_jobs.sql'), 'utf8');
 const verificationSql = readFileSync(path.join(repositoryRoot, 'db', 'verify_household_ledger.sql'), 'utf8');
 
 const runtimeTables = [
@@ -20,6 +21,8 @@ const runtimeTables = [
   'gmail_messages',
   'gmail_oauth_states',
   'gmail_sync_runs',
+  'household_sync_guards',
+  'household_sync_jobs',
   'import_records',
   'item_allocations',
   'oauth_states',
@@ -42,6 +45,8 @@ const requestedIndexes = [
   'idx_gmail_messages_run',
   'idx_gmail_oauth_states_expiry',
   'idx_gmail_sync_runs_connection',
+  'idx_household_sync_jobs_source',
+  'idx_household_sync_jobs_status',
   'idx_import_records_project_amount_date',
   'idx_import_records_project_status',
   'idx_import_records_source_record',
@@ -241,6 +246,7 @@ test('fresh schema creates the seven runtime tables and requested indexes', (t) 
 
   assert.deepEqual(tableNames(database), runtimeTables);
   assert.deepEqual(indexNames(database), requestedIndexes);
+  assert.equal(database.prepare("SELECT COUNT(*) AS count FROM sqlite_schema WHERE type = 'trigger' AND name = 'trg_household_sync_guard_insert'").get().count, 1);
 
   const projectColumns = database.prepare('PRAGMA table_info(projects)').all().map((row) => row.name);
   const memberColumns = database.prepare('PRAGMA table_info(project_members)').all().map((row) => row.name);
@@ -269,7 +275,7 @@ test('fresh schema creates the seven runtime tables and requested indexes', (t) 
 });
 
 test('numbered migrations create the runtime tables from an empty database', (t) => {
-  const database = openDatabase(`${baselineSql}\n${migrationSql}\n${authMigrationSql}\n${gmailMigrationSql}\n${gmailOauthProjectMigrationSql}\n${accountDeletionMigrationSql}`);
+  const database = openDatabase(`${baselineSql}\n${migrationSql}\n${authMigrationSql}\n${gmailMigrationSql}\n${gmailOauthProjectMigrationSql}\n${accountDeletionMigrationSql}\n${householdSyncMigrationSql}`);
   t.after(() => database.close());
 
   assert.deepEqual(tableNames(database), runtimeTables);
@@ -294,7 +300,7 @@ test('legacy migration preserves data and creates deterministic ledger rows', (t
   t.after(() => database.close());
   seedLegacyDatabase(database);
 
-  database.exec(`BEGIN IMMEDIATE;\n${migrationSql}\n${authMigrationSql}\n${gmailMigrationSql}\n${gmailOauthProjectMigrationSql}\n${accountDeletionMigrationSql}\nCOMMIT;`);
+  database.exec(`BEGIN IMMEDIATE;\n${migrationSql}\n${authMigrationSql}\n${gmailMigrationSql}\n${gmailOauthProjectMigrationSql}\n${accountDeletionMigrationSql}\n${householdSyncMigrationSql}\nCOMMIT;`);
 
   const freshDatabase = openDatabase(schemaSql);
   t.after(() => freshDatabase.close());

@@ -18,11 +18,23 @@ async function first(db, sql, values = []) {
   return (await statement.first()) ?? null;
 }
 
-async function executeStatements(db, statements) {
+async function executeStatements(db, statements, options = {}) {
   if (!statements.length) return [];
-  if (typeof db.batch === "function") return db.batch(statements);
+  const targetProjectIds = [...(options.targetProjectIds || [])].sort();
+  const guardedStatements = options.user && targetProjectIds.length
+    ? [
+      ...targetProjectIds.map((projectId) => db.prepare(
+        "INSERT INTO household_sync_guards (project_id, user_id, checked_at) VALUES (?, ?, ?)",
+      ).bind(projectId, options.user.id, nowValue(options))),
+      ...statements,
+      ...targetProjectIds.map((projectId) => db.prepare(
+        "DELETE FROM household_sync_guards WHERE project_id = ? AND user_id = ?",
+      ).bind(projectId, options.user.id)),
+    ]
+    : statements;
+  if (typeof db.batch === "function") return db.batch(guardedStatements);
   const results = [];
-  for (const statement of statements) results.push(await statement.run());
+  for (const statement of guardedStatements) results.push(await statement.run());
   return results;
 }
 
@@ -31,7 +43,7 @@ async function queueOrExecute(db, statements, options = {}) {
     options.statementCollector.push(...statements);
     return false;
   }
-  await executeStatements(db, statements);
+  await executeStatements(db, statements, options);
   return true;
 }
 
@@ -348,6 +360,8 @@ async function resolveUpsertContext(db, input, sourceMemberInput, optionsInput) 
       now: input.now,
       user: optionsInput?.user,
       statementCollector: optionsInput?.statementCollector,
+      targetProjectIds: optionsInput?.targetProjectIds || new Set(),
+      strictTargetAccess: optionsInput?.strictTargetAccess === true,
     };
   }
 
@@ -381,6 +395,8 @@ async function resolveUpsertContext(db, input, sourceMemberInput, optionsInput) 
     now: options.now,
     user: options.user,
     statementCollector: options.statementCollector,
+    targetProjectIds: options.targetProjectIds || new Set(),
+    strictTargetAccess: options.strictTargetAccess === true,
   };
 }
 
@@ -406,6 +422,7 @@ export async function upsertGeneratedHouseholdTransaction(db, input, sourceMembe
     return { status: "skipped", reason: "household_not_found", transaction_id: sourceTransaction.id, cancelled };
   }
   if (!await canWriteHousehold(db, optionsInput.user, householdProject.id)) {
+    if (optionsInput.strictTargetAccess) throw householdAccessError(householdProject.id);
     return { status: "skipped", reason: "household_access_lost", transaction_id: sourceTransaction.id };
   }
   if (!householdMember || Number(householdMember.is_active) !== 1 || householdMember.project_id !== householdProject.id) {
@@ -464,6 +481,7 @@ export async function upsertGeneratedHouseholdTransaction(db, input, sourceMembe
       allocation.source_item_id,
     ),
   }));
+  if (context.targetProjectIds) context.targetProjectIds.add(householdProject.id);
   const statements = [
     db.prepare(
       `INSERT INTO transactions (
@@ -602,10 +620,14 @@ export async function cancelGeneratedHouseholdTransaction(db, generatedTransacti
     return { status: "skipped", reason: "not_generated", transaction_id: generatedTransaction.id };
   }
   if (!await canWriteHousehold(db, options.user, generatedTransaction.project_id)) {
+    if (options.strictTargetAccess) throw householdAccessError(generatedTransaction.project_id);
     return { status: "skipped", reason: "household_access_lost", transaction_id: generatedTransaction.id };
   }
 
+  const targetProjectIds = options.targetProjectIds || new Set();
+  const operationOptions = { ...options, targetProjectIds };
   const now = nowValue(options);
+  targetProjectIds.add(generatedTransaction.project_id);
   const statements = [
     db.prepare(
       `UPDATE transactions
@@ -639,7 +661,7 @@ export async function cancelGeneratedHouseholdTransaction(db, generatedTransacti
        )`,
     ).bind(now, generatedTransaction.id),
   ];
-  await queueOrExecute(db, statements, options);
+  await queueOrExecute(db, statements, operationOptions);
   return { status: "cancelled", transaction_id: generatedTransaction.id };
 }
 
@@ -656,14 +678,18 @@ export async function cancelGeneratedForSource(db, sourceProjectId, sourceTransa
   }
   const generatedRows = await all(db, sql, values);
   const statementCollector = options.statementCollector || [];
-  const operationOptions = { ...options, statementCollector };
+  const targetProjectIds = options.targetProjectIds || new Set();
+  const operationOptions = { ...options, statementCollector, targetProjectIds };
   const transactionIds = [];
   for (const generatedRow of generatedRows) {
-    if (!await canWriteHousehold(db, options.user, generatedRow.project_id)) continue;
+    if (!await canWriteHousehold(db, options.user, generatedRow.project_id)) {
+      if (options.strictTargetAccess) throw householdAccessError(generatedRow.project_id);
+      continue;
+    }
     const result = await cancelGeneratedHouseholdTransaction(db, generatedRow, operationOptions);
     if (result.status === "cancelled") transactionIds.push(generatedRow.id);
   }
-  if (!options.statementCollector) await executeStatements(db, statementCollector);
+  if (!options.statementCollector) await executeStatements(db, statementCollector, operationOptions);
   return { status: "cancelled", count: transactionIds.length, transaction_ids: transactionIds };
 }
 
@@ -675,6 +701,13 @@ function invalidTransactionError(validation, transactionId) {
   const error = new Error(`invalid_split_transaction:${transactionId}`);
   error.code = "invalid_split_project";
   error.validation = validation;
+  return error;
+}
+
+function householdAccessError(projectId) {
+  const error = new Error("household_sync_access_denied");
+  error.code = "household_sync_access_denied";
+  error.project_id = projectId;
   return error;
 }
 
@@ -706,15 +739,19 @@ export async function syncSplitTransactionToHouseholds(db, transactionInput, opt
 
   const existingRows = await findGeneratedRows(db, sourceTransaction.project_id, sourceTransaction.id);
   const statementCollector = options.statementCollector || [];
-  const operationOptions = { ...options, statementCollector };
+  const targetProjectIds = options.targetProjectIds || new Set();
+  const operationOptions = { ...options, statementCollector, targetProjectIds };
   if (TERMINAL_SOURCE_STATUSES.has(sourceTransaction.status)) {
     const cancelled = [];
     for (const row of existingRows) {
-      if (!await canWriteHousehold(db, options.user, row.project_id)) continue;
+      if (!await canWriteHousehold(db, options.user, row.project_id)) {
+        if (options.strictTargetAccess) throw householdAccessError(row.project_id);
+        continue;
+      }
       const result = await cancelGeneratedHouseholdTransaction(db, row, operationOptions);
       if (result.status === "cancelled") cancelled.push(row.id);
     }
-    if (!options.statementCollector) await executeStatements(db, statementCollector);
+    if (!options.statementCollector) await executeStatements(db, statementCollector, operationOptions);
     return { status: "cancelled", reason: "source_cancelled", source_transaction_id: sourceTransaction.id, upserted: [], cancelled };
   }
 
@@ -738,7 +775,10 @@ export async function syncSplitTransactionToHouseholds(db, transactionInput, opt
     if (Number(burdens[sourceMember.id] || 0) === 0) continue;
     const householdProject = await loadProject(db, sourceMember.linked_household_project_id);
     if (householdProject?.project_type !== "household") continue;
-    if (!await canWriteHousehold(db, options.user, householdProject.id)) continue;
+    if (!await canWriteHousehold(db, options.user, householdProject.id)) {
+      if (options.strictTargetAccess) throw householdAccessError(householdProject.id);
+      continue;
+    }
     const householdMember = await loadHouseholdMember(db, householdProject.id);
     if (!householdMember) continue;
     const allocations = await loadMemberAllocations(db, sourceTransaction.id, sourceMember.id);
@@ -749,7 +789,10 @@ export async function syncSplitTransactionToHouseholds(db, transactionInput, opt
   const cancelled = [];
   for (const existingRow of existingRows) {
     if (desired.has(desiredKey(existingRow.project_id, existingRow.origin_member_id))) continue;
-    if (!await canWriteHousehold(db, options.user, existingRow.project_id)) continue;
+    if (!await canWriteHousehold(db, options.user, existingRow.project_id)) {
+      if (options.strictTargetAccess) throw householdAccessError(existingRow.project_id);
+      continue;
+    }
     const result = await cancelGeneratedHouseholdTransaction(db, existingRow, operationOptions);
     if (result.status === "cancelled") cancelled.push(existingRow.id);
   }
@@ -759,7 +802,7 @@ export async function syncSplitTransactionToHouseholds(db, transactionInput, opt
     const result = await upsertGeneratedHouseholdTransaction(db, context, undefined, operationOptions);
     if (result.status === "upserted") upserted.push(result);
   }
-  if (!options.statementCollector) await executeStatements(db, statementCollector);
+  if (!options.statementCollector) await executeStatements(db, statementCollector, operationOptions);
   return {
     status: "synced",
     source_transaction_id: sourceTransaction.id,
@@ -796,11 +839,15 @@ export async function syncSplitProjectToHouseholds(db, projectInput, options = {
     [project.id],
   );
   const statementCollector = options.statementCollector || [];
-  const operationOptions = { ...options, statementCollector };
+  const targetProjectIds = options.targetProjectIds || new Set();
+  const operationOptions = { ...options, statementCollector, targetProjectIds };
   const cancelled = [];
   for (const generatedRow of generatedRows) {
     if (generatedRow.origin_transaction_id && generatedRow.origin_member_id && sourceTransactionIds.has(generatedRow.origin_transaction_id)) continue;
-    if (!await canWriteHousehold(db, options.user, generatedRow.project_id)) continue;
+    if (!await canWriteHousehold(db, options.user, generatedRow.project_id)) {
+      if (options.strictTargetAccess) throw householdAccessError(generatedRow.project_id);
+      continue;
+    }
     const result = await cancelGeneratedHouseholdTransaction(db, generatedRow, operationOptions);
     if (result.status === "cancelled") cancelled.push(generatedRow.id);
   }
@@ -814,11 +861,181 @@ export async function syncSplitProjectToHouseholds(db, projectInput, options = {
   for (const sourceTransaction of sourceTransactions) {
     transactionResults.push(await syncSplitTransactionToHouseholds(db, sourceTransaction, { ...operationOptions, validate: false }));
   }
-  if (!options.statementCollector) await executeStatements(db, statementCollector);
+  if (!options.statementCollector) await executeStatements(db, statementCollector, operationOptions);
   return {
     status: "synced",
     project_id: project.id,
     transactions: transactionResults,
     cancelled,
   };
+}
+
+function syncJobTransactionId(value) {
+  return value === undefined || value === null ? "" : String(value);
+}
+
+function syncJobId(sourceProjectId, sourceTransactionId, syncScope) {
+  return ["household", "sync", syncScope, sourceProjectId, syncJobTransactionId(sourceTransactionId)]
+    .map(idPart)
+    .join(":");
+}
+
+async function loadSyncJob(db, jobId) {
+  return first(db, "SELECT * FROM household_sync_jobs WHERE id = ?", [jobId]);
+}
+
+async function completeSyncJob(db, input, now) {
+  await db.prepare(
+    `UPDATE household_sync_jobs
+     SET status = 'completed',
+         last_error_code = NULL,
+         updated_at = ?,
+         last_attempted_at = ?,
+         completed_at = ?
+     WHERE source_project_id = ?
+       AND source_transaction_id = ?
+       AND sync_scope = ?
+       AND status <> 'completed'`,
+  ).bind(
+    now,
+    now,
+    now,
+    input.sourceProjectId,
+    syncJobTransactionId(input.sourceTransactionId),
+    input.syncScope,
+  ).run();
+}
+
+async function recordSyncFailure(db, input, error, now) {
+  const transactionId = syncJobTransactionId(input.sourceTransactionId);
+  const id = syncJobId(input.sourceProjectId, transactionId, input.syncScope);
+  const errorCode = error?.code === "household_sync_access_denied"
+    ? "household_sync_access_denied"
+    : "household_sync_failed";
+  await db.prepare(
+    `INSERT INTO household_sync_jobs (
+       id, source_project_id, source_transaction_id, requested_by_user_id,
+       sync_scope, reason, attempt_count, status, last_error_code,
+       created_at, updated_at, last_attempted_at, completed_at
+     ) VALUES (?, ?, ?, ?, ?, ?, 1, 'pending', ?, ?, ?, ?, NULL)
+     ON CONFLICT(source_project_id, source_transaction_id, sync_scope) DO UPDATE SET
+       requested_by_user_id = excluded.requested_by_user_id,
+       reason = excluded.reason,
+       attempt_count = household_sync_jobs.attempt_count + 1,
+       status = 'pending',
+       last_error_code = excluded.last_error_code,
+       updated_at = excluded.updated_at,
+       last_attempted_at = excluded.last_attempted_at,
+       completed_at = NULL`,
+  ).bind(
+    id,
+    input.sourceProjectId,
+    transactionId,
+    input.user.id,
+    input.syncScope,
+    input.reason,
+    errorCode,
+    now,
+    now,
+    now,
+  ).run();
+  return loadSyncJob(db, id);
+}
+
+async function performJobSynchronization(db, input, options = {}) {
+  const syncOptions = {
+    validate: false,
+    user: input.user,
+    strictTargetAccess: options.strictTargetAccess === true,
+    targetProjectIds: options.guardSourceAccess ? new Set([input.sourceProjectId]) : undefined,
+  };
+  if (input.syncScope === "transaction") {
+    return syncSplitTransactionToHouseholds(db, input.sourceTransactionId, {
+      ...syncOptions,
+      sourceProjectId: input.sourceProjectId,
+    });
+  }
+  if (input.syncScope === "cancel_project") {
+    return cancelGeneratedForSource(db, input.sourceProjectId, undefined, syncOptions);
+  }
+  return syncSplitProjectToHouseholds(db, input.sourceProjectId, syncOptions);
+}
+
+export async function synchronizeHouseholdMutation(db, input) {
+  const now = nowValue(input);
+  try {
+    const result = await performJobSynchronization(db, input, { strictTargetAccess: true, guardSourceAccess: true });
+    await completeSyncJob(db, input, now);
+    return result;
+  } catch (error) {
+    const job = await recordSyncFailure(db, input, error, now);
+    return {
+      status: "pending",
+      sync_pending: true,
+      job_id: job.id,
+      attempt_count: job.attempt_count,
+      reason: job.reason,
+    };
+  }
+}
+
+async function updateRetryFailure(db, job, status, errorCode, now) {
+  await db.prepare(
+    `UPDATE household_sync_jobs
+     SET attempt_count = attempt_count + 1,
+         status = ?,
+         last_error_code = ?,
+         updated_at = ?,
+         last_attempted_at = ?,
+         completed_at = NULL
+     WHERE id = ?`,
+  ).bind(status, errorCode, now, now, job.id).run();
+  return loadSyncJob(db, job.id);
+}
+
+export async function retryHouseholdSyncJob(db, jobId, user, options = {}) {
+  const job = await loadSyncJob(db, jobId);
+  if (!job) return { status: "not_found", job_id: jobId };
+  const now = nowValue(options);
+  const sourceProject = await loadProject(db, job.source_project_id);
+  if (!sourceProject) {
+    if (user.id !== job.requested_by_user_id) return { status: "not_found", job_id: jobId };
+    const rejected = await updateRetryFailure(db, job, "rejected", "source_project_not_found", now);
+    return { status: "rejected", sync_pending: false, job_id: rejected.id };
+  }
+  if (!await canWriteHousehold(db, user, job.source_project_id)) {
+    if (user.id !== job.requested_by_user_id) return { status: "not_found", job_id: jobId };
+    const blocked = await updateRetryFailure(db, job, "blocked", "source_access_lost", now);
+    return { status: "blocked", sync_pending: false, job_id: blocked.id };
+  }
+  try {
+    const synchronization = await performJobSynchronization(db, {
+      sourceProjectId: job.source_project_id,
+      sourceTransactionId: job.source_transaction_id || undefined,
+      syncScope: job.sync_scope,
+      user,
+    }, { strictTargetAccess: true, guardSourceAccess: true });
+    await db.prepare(
+      `UPDATE household_sync_jobs
+       SET attempt_count = attempt_count + 1,
+           status = 'completed',
+           last_error_code = NULL,
+           updated_at = ?,
+           last_attempted_at = ?,
+           completed_at = ?
+       WHERE id = ?`,
+    ).bind(now, now, now, job.id).run();
+    return { status: "completed", sync_pending: false, job: await loadSyncJob(db, job.id), synchronization };
+  } catch (error) {
+    const accessLost = error?.code === "household_sync_access_denied"
+      || String(error?.message || "").includes("household_sync_access_denied");
+    const failed = await updateRetryFailure(
+      db,
+      job,
+      accessLost ? "blocked" : "pending",
+      accessLost ? "target_access_lost" : "household_sync_failed",
+      now,
+    );
+    return { status: failed.status, sync_pending: failed.status === "pending", job: failed };
+  }
 }
