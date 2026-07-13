@@ -214,7 +214,7 @@ test("OAuth revocation failure stores an encrypted retry and retry completion er
   const pending=db.raw.prepare("SELECT * FROM gmail_revocation_retries").get();
   assert.equal(pending.status,"pending");assert.equal(Buffer.from(pending.token_iv,"base64").length,12);assert.notEqual(pending.token_ciphertext,"refresh-secret");assert.equal(pending.owner_user_id,"user-1");
   assert.doesNotMatch(JSON.stringify(pending),/refresh-secret/);
-  allowRevocation=true;const retried=await retryGmailRevocations(db,env,{limit:10});assert.deepEqual(retried,{completed:1,failed:0});
+  allowRevocation=true;const retried=await retryGmailRevocations(db,env,{limit:10});assert.deepEqual(retried,{completed:1,failed:0,remaining:0});
   const completed=db.raw.prepare("SELECT status,token_ciphertext,token_iv,completed_at FROM gmail_revocation_retries WHERE id=?").get(pending.id);assert.equal(completed.status,"completed");assert.equal(completed.token_ciphertext,"");assert.equal(completed.token_iv,"");assert.notEqual(completed.completed_at,null);
 });
 
@@ -231,7 +231,7 @@ test("disconnecting connections reject synchronization and successful retry eras
   await assert.rejects(()=>disconnectGmail(db,env,{id:"user-1"},"disconnect-retry"),/gmail_revocation_failed/);
   await assert.rejects(()=>syncGmail(db,env,{id:"user-1"},"disconnect-retry",{days:7,limit:1}),(error)=>error.status===409&&error.message==="gmail_connection_unavailable");
   assert.equal(db.raw.prepare("SELECT count(*) AS n FROM gmail_sync_runs").get().n,0);
-  available=true;const result=await retryGmailRevocations(db,env,{limit:10});assert.deepEqual(result,{completed:1,failed:0});
+  available=true;const result=await retryGmailRevocations(db,env,{limit:10});assert.deepEqual(result,{completed:1,failed:0,remaining:0});
   const row=db.raw.prepare("SELECT status,refresh_token_ciphertext,refresh_token_iv FROM gmail_connections WHERE id=?").get("disconnect-retry");assert.deepEqual({...row},{status:"disconnected",refresh_token_ciphertext:"",refresh_token_iv:""});
 });
 

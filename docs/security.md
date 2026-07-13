@@ -20,6 +20,7 @@ API protections:
 - Unsafe cross-origin requests are rejected when the `Origin` header does not match `APP_ORIGIN`.
 - JSON endpoints reject unsupported content types when a content type is present.
 - Responses include `no-store` JSON caching and security headers.
+- `POST /api/admin/gmail-revocations/retry` is a server-to-server administrative route outside browser session and CSRF handling. It accepts an empty JSON object with `application/json` and authenticates `Authorization: Bearer <secret>` against the dedicated `GMAIL_REVOCATION_RETRY_SECRET` Cloudflare Secret. An unset secret makes the route unavailable. The secret must not be placed in a URL, D1, logs, or responses.
 
 Manual setup check:
 

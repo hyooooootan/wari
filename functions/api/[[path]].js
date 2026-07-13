@@ -75,25 +75,31 @@ import {
   listCandidates,
   listConnections,
   listSyncRuns,
+  retryGmailRevocations,
   startGmailOAuth,
   syncGmail,
   updateCandidate,
 } from "../lib/gmail.js";
+import { sha256Hex, timingSafeEqual } from "../lib/crypto.js";
 import { ApiError, errorResponse, json, methodNotAllowed, readJson, readOptionalJson } from "../lib/responses.js";
 
 const IMPORT_STATUSES = new Set(["received", "parsed", "linked", "review", "rejected", "error"]);
 const IMPORT_SOURCES = new Set(["receipt", "gmail_notification", "card_csv", "paypay_csv", "bank_csv", "manual"]);
 const CSV_PROFILES = new Set(["generic", "card", "paypay", "bank"]);
 const RECONCILE_ACTIONS = new Set(["link", "create", "reject", "unlink"]);
+const GMAIL_REVOCATION_RETRY_LIMIT = 25;
 
 export async function onRequest(context) {
   const request = context.request;
   try {
-    assertOrigin(request, context.env || {});
     const url = new URL(request.url);
     const path = requestPath(url.pathname);
     const db = context.env?.DB;
     if (!db) throw new ApiError(500, "missing_d1_binding");
+    if (path.length === 3 && path[0] === "admin" && path[1] === "gmail-revocations" && path[2] === "retry") {
+      return withSecurityHeaders(await dispatchGmailRevocationRetry(request, db, context.env || {}, url));
+    }
+    assertOrigin(request, context.env || {});
     if (path[0] === "ocr-receipt" && path.length === 1) {
       return withSecurityHeaders(await dispatchReceiptOcr(request, db, context.env || {}, url));
     }
@@ -102,6 +108,30 @@ export async function onRequest(context) {
   } catch (error) {
     return withSecurityHeaders(errorResponse(error));
   }
+}
+
+async function dispatchGmailRevocationRetry(request, db, env, url) {
+  const secret = env.GMAIL_REVOCATION_RETRY_SECRET;
+  if (typeof secret !== "string" || secret.length === 0) throw new ApiError(404, "not_found");
+  if (request.method !== "POST") return methodNotAllowed(["POST"]);
+  if ([...url.searchParams.keys()].length !== 0) throw new ApiError(400, "invalid_request");
+  const authorization = request.headers.get("authorization") || "";
+  const match = /^Bearer ([A-Za-z0-9._~+\/-]+=*)$/u.exec(authorization);
+  const supplied = match?.[1] || "";
+  const [suppliedHash, secretHash] = await Promise.all([sha256Hex(supplied), sha256Hex(secret)]);
+  if (!match || !timingSafeEqual(suppliedHash, secretHash)) throw new ApiError(401, "invalid_admin_authorization");
+  const contentType = request.headers.get("content-type") || "";
+  if (contentType.split(";", 1)[0].trim().toLowerCase() !== "application/json") {
+    throw new ApiError(415, "unsupported_content_type");
+  }
+  if (Object.keys(await readJson(request)).length !== 0) throw new ApiError(400, "invalid_request");
+  const result = await retryGmailRevocations(db, env, { limit: GMAIL_REVOCATION_RETRY_LIMIT });
+  return json({
+    succeeded: result.completed,
+    failed: result.failed,
+    remaining: result.remaining,
+    errors: result.failed > 0 ? ["gmail_revocation_failed"] : [],
+  });
 }
 
 async function dispatchReceiptOcr(request, db, env, url) {

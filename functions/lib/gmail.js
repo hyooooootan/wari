@@ -135,9 +135,9 @@ export async function retryGmailRevocations(db, env, input = {}) {
       failed += 1;
     }
   }
-  const remaining = Math.max(0, limit - (retries.results || []).length);
-  if (remaining > 0) {
-    const connections = await db.prepare("SELECT * FROM gmail_connections WHERE status='disconnecting' AND refresh_token_ciphertext!='' ORDER BY updated_at,id LIMIT ?").bind(remaining).all();
+  const available = Math.max(0, limit - (retries.results || []).length);
+  if (available > 0) {
+    const connections = await db.prepare("SELECT * FROM gmail_connections WHERE status='disconnecting' AND refresh_token_ciphertext!='' ORDER BY updated_at,id LIMIT ?").bind(available).all();
     for (const connection of connections.results || []) {
       const attemptedAt = new Date().toISOString();
       try {
@@ -151,7 +151,9 @@ export async function retryGmailRevocations(db, env, input = {}) {
       }
     }
   }
-  return { completed, failed };
+  const pendingRetries = await db.prepare("SELECT COUNT(*) AS count FROM gmail_revocation_retries WHERE status='pending'").first();
+  const pendingConnections = await db.prepare("SELECT COUNT(*) AS count FROM gmail_connections WHERE status='disconnecting' AND refresh_token_ciphertext!=''").first();
+  return { completed, failed, remaining: Number(pendingRetries?.count || 0) + Number(pendingConnections?.count || 0) };
 }
 
 export async function syncGmail(db, env, user, connectionId, input = {}) {

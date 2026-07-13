@@ -135,6 +135,22 @@ async function createProject(db, project) {
   return result.body;
 }
 
+async function encryptRevocationRetry(keyValue, id, ownerUserId, token) {
+  const keyBytes = Uint8Array.from(atob(keyValue), (character) => character.charCodeAt(0));
+  const key = await crypto.subtle.importKey("raw", keyBytes, "AES-GCM", false, ["encrypt"]);
+  const iv = new Uint8Array(12).fill(3);
+  const encoder = new TextEncoder();
+  const ciphertext = await crypto.subtle.encrypt({
+    name: "AES-GCM",
+    iv,
+    additionalData: encoder.encode(`gmail-revocation:v1:${id}:${ownerUserId}:1`),
+  }, key, encoder.encode(token));
+  return {
+    ciphertext: btoa(String.fromCharCode(...new Uint8Array(ciphertext))),
+    iv: btoa(String.fromCharCode(...iv)),
+  };
+}
+
 test("auth routes create sessions, require CSRF, and hide unowned projects", async (t) => {
   const db = new D1Database();
   t.after(() => db.close());
@@ -437,6 +453,109 @@ test("Google login state is claimed once before mock profile handling", async (t
   const results = await Promise.allSettled([callback(), callback()]);
   assert.equal(results.filter((result) => result.status === "fulfilled").length, 1);
   assert.equal(results.filter((result) => result.status === "rejected" && result.reason?.code === "invalid_oauth_state").length, 1);
+});
+
+test("Gmail revocation retry administration rejects unavailable and invalid requests", async (t) => {
+  const db = new D1Database();
+  t.after(() => db.close());
+  const path = "/api/admin/gmail-revocations/retry";
+  const token = "test-admin-token";
+  const unauthenticatedEnv = { auth: false };
+
+  const unavailable = await request(db, "POST", path, {}, unauthenticatedEnv, { omitOrigin: true });
+  assert.equal(unavailable.response.status, 404);
+  assert.deepEqual(unavailable.body, { error: "not_found" });
+
+  const wrong = await request(db, "POST", path, {}, { auth: false, GMAIL_REVOCATION_RETRY_SECRET: token }, {
+    omitOrigin: true,
+    headers: { authorization: "Bearer wrong-token" },
+  });
+  assert.equal(wrong.response.status, 401);
+  assert.deepEqual(wrong.body, { error: "invalid_admin_authorization" });
+
+  const wrongScheme = await request(db, "POST", path, {}, { auth: false, GMAIL_REVOCATION_RETRY_SECRET: token }, {
+    omitOrigin: true,
+    headers: { authorization: `Basic ${token}` },
+  });
+  assert.equal(wrongScheme.response.status, 401);
+  assert.deepEqual(wrongScheme.body, { error: "invalid_admin_authorization" });
+
+  const wrongType = await request(db, "POST", path, {}, { auth: false, GMAIL_REVOCATION_RETRY_SECRET: token }, {
+    omitOrigin: true,
+    headers: { authorization: `Bearer ${token}`, "content-type": "text/plain" },
+  });
+  assert.equal(wrongType.response.status, 415);
+  assert.deepEqual(wrongType.body, { error: "unsupported_content_type" });
+
+  const nonEmpty = await request(db, "POST", path, { limit: 1 }, { auth: false, GMAIL_REVOCATION_RETRY_SECRET: token }, {
+    omitOrigin: true,
+    headers: { authorization: `Bearer ${token}` },
+  });
+  assert.equal(nonEmpty.response.status, 400);
+  assert.deepEqual(nonEmpty.body, { error: "invalid_request" });
+
+  const wrongMethod = await request(db, "GET", path, undefined, { auth: false, GMAIL_REVOCATION_RETRY_SECRET: token }, { omitOrigin: true });
+  assert.equal(wrongMethod.response.status, 405);
+  assert.equal(wrongMethod.response.headers.get("allow"), "POST");
+});
+
+test("Gmail revocation retry administration processes queued and disconnecting grants", async (t) => {
+  const db = new D1Database();
+  t.after(() => db.close());
+  await testSession(db);
+  const key = btoa(String.fromCharCode(...new Uint8Array(32).fill(7)));
+  const retryId = "admin-retry-row";
+  const queued = await encryptRevocationRetry(key, retryId, "removed-user", "queued-refresh-token");
+  const connection = await encryptRefreshToken({ GMAIL_TOKEN_KEY_CURRENT_GENERATION: "1", GMAIL_TOKEN_KEY_V1: key }, "admin-disconnecting", "test-user", "connection-refresh-token");
+  const now = "2026-07-12T00:00:00.000Z";
+  db.database.prepare(`INSERT INTO gmail_revocation_retries (id,owner_user_id,source,token_ciphertext,token_iv,key_generation,aad_version,status,attempt_count,last_error_code,created_at,updated_at,last_attempted_at,completed_at)
+    VALUES (?,?,'oauth_storage_rejected',?,?,1,1,'pending',1,'gmail_revocation_failed',?,?,?,NULL)`).run(retryId, "removed-user", queued.ciphertext, queued.iv, now, now, now);
+  db.database.prepare(`INSERT INTO gmail_connections (id,user_id,gmail_email,refresh_token_ciphertext,refresh_token_iv,key_generation,aad_version,status,created_at,updated_at)
+    VALUES (?,?,?,?,?,1,1,'disconnecting',?,?)`).run("admin-disconnecting", "test-user", "admin@example.test", connection.ciphertext, connection.iv, now, now);
+  const env = {
+    auth: false,
+    GMAIL_REVOCATION_RETRY_SECRET: "test-admin-token",
+    GMAIL_TOKEN_KEY_CURRENT_GENERATION: "1",
+    GMAIL_TOKEN_KEY_V1: key,
+    GMAIL_FETCH: async () => new Response(null, { status: 200 }),
+  };
+  const result = await request(db, "POST", "/api/admin/gmail-revocations/retry", {}, env, {
+    omitOrigin: true,
+    headers: { authorization: "Bearer test-admin-token" },
+  });
+  assert.equal(result.response.status, 200);
+  assert.deepEqual(result.body, { succeeded: 2, failed: 0, remaining: 0, errors: [] });
+  const completedRetry = db.database.prepare("SELECT status,token_ciphertext,token_iv FROM gmail_revocation_retries WHERE id=?").get(retryId);
+  assert.deepEqual({ ...completedRetry }, { status: "completed", token_ciphertext: "", token_iv: "" });
+  const completedConnection = db.database.prepare("SELECT status,refresh_token_ciphertext,refresh_token_iv FROM gmail_connections WHERE id=?").get("admin-disconnecting");
+  assert.deepEqual({ ...completedConnection }, { status: "disconnected", refresh_token_ciphertext: "", refresh_token_iv: "" });
+});
+
+test("Gmail revocation retry administration preserves failed work", async (t) => {
+  const db = new D1Database();
+  t.after(() => db.close());
+  await testSession(db);
+  const key = btoa(String.fromCharCode(...new Uint8Array(32).fill(7)));
+  const encrypted = await encryptRefreshToken({ GMAIL_TOKEN_KEY_CURRENT_GENERATION: "1", GMAIL_TOKEN_KEY_V1: key }, "admin-failed", "test-user", "failed-refresh-token");
+  const now = "2026-07-12T00:00:00.000Z";
+  db.database.prepare(`INSERT INTO gmail_connections (id,user_id,gmail_email,refresh_token_ciphertext,refresh_token_iv,key_generation,aad_version,status,created_at,updated_at)
+    VALUES (?,?,?,?,?,1,1,'disconnecting',?,?)`).run("admin-failed", "test-user", "failed@example.test", encrypted.ciphertext, encrypted.iv, now, now);
+  const result = await request(db, "POST", "/api/admin/gmail-revocations/retry", {}, {
+    auth: false,
+    GMAIL_REVOCATION_RETRY_SECRET: "test-admin-token",
+    GMAIL_TOKEN_KEY_CURRENT_GENERATION: "1",
+    GMAIL_TOKEN_KEY_V1: key,
+    GMAIL_FETCH: async () => Response.json({ error: "server_error" }, { status: 500 }),
+  }, {
+    omitOrigin: true,
+    headers: { authorization: "Bearer test-admin-token" },
+  });
+  assert.equal(result.response.status, 200);
+  assert.deepEqual(result.body, { succeeded: 0, failed: 1, remaining: 1, errors: ["gmail_revocation_failed"] });
+  const pending = db.database.prepare("SELECT status,refresh_token_ciphertext,refresh_token_iv FROM gmail_connections WHERE id=?").get("admin-failed");
+  assert.equal(pending.status, "disconnecting");
+  assert.equal(pending.refresh_token_ciphertext, encrypted.ciphertext);
+  assert.equal(pending.refresh_token_iv, encrypted.iv);
 });
 
 test("account deletion can retry revocation and leaves no connection ciphertext", async (t) => {

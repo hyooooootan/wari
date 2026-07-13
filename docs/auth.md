@@ -37,4 +37,12 @@ Disconnect and account deletion revoke each Google grant before removing its enc
 
 Create a separate OAuth client in Google Cloud and register `https://<application-host>/api/gmail/oauth/callback` as an authorized redirect URI. Configure Cloudflare Secrets `GMAIL_CLIENT_ID`, `GMAIL_CLIENT_SECRET`, `GMAIL_TOKEN_KEY_V1` (a Base64-encoded 32-byte key), and `GMAIL_TOKEN_KEY_CURRENT_GENERATION=1`. Set `GMAIL_REDIRECT_URI` where an explicit callback URI is required. Do not commit these values.
 
+Create a separate high-entropy value for the Gmail revocation retry route and enter it interactively as a Cloudflare Secret. Do not add the value to `.dev.vars`, a URL, D1, logs, or source-controlled files.
+
+```powershell
+npx wrangler pages secret put GMAIL_REVOCATION_RETRY_SECRET --project-name wari
+```
+
+The administrative caller sends `POST /api/admin/gmail-revocations/retry` with `Authorization: Bearer <secret>`, `Content-Type: application/json`, and `{}` as the request body. The route is unavailable when `GMAIL_REVOCATION_RETRY_SECRET` is unset.
+
 The implemented operation is user-initiated synchronization for 7, 30, or 90 days. Scheduled synchronization, notifications, tracking later email edits or deletion, and Google production verification are not implemented.
