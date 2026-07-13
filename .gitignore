@@ -12,6 +12,7 @@ coverage/
 *.log
 *.sqlite
 *.sqlite3
+*-production.sql
 .wrangler/
 scripts/oci_a1_config.json
 INSTANCE_CREATED.json
