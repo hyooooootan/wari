@@ -14,6 +14,7 @@ const gmailOauthProjectMigrationSql = readFileSync(path.join(repositoryRoot, 'db
 const accountDeletionMigrationSql = readFileSync(path.join(repositoryRoot, 'db', 'migrations', '0006_account_deletion.sql'), 'utf8');
 const householdSyncMigrationSql = readFileSync(path.join(repositoryRoot, 'db', 'migrations', '0007_household_sync_jobs.sql'), 'utf8');
 const gmailRevocationGuardsMigrationSql = readFileSync(path.join(repositoryRoot, 'db', 'migrations', '0008_gmail_revocation_guards.sql'), 'utf8');
+const personalHouseholdsMigrationSql = readFileSync(path.join(repositoryRoot, 'db', 'migrations', '0009_personal_households.sql'), 'utf8');
 const verificationSql = readFileSync(path.join(repositoryRoot, 'db', 'verify_household_ledger.sql'), 'utf8');
 
 const runtimeTables = [
@@ -59,6 +60,7 @@ const requestedIndexes = [
   'idx_project_members_project',
   'idx_project_shares_project',
   'idx_project_user_roles_user',
+  'idx_projects_household_owner',
   'idx_projects_share_token',
   'idx_sessions_user',
   'idx_transaction_items_transaction',
@@ -234,13 +236,14 @@ function seedLegacyDatabase(database) {
 }
 
 function insertProject(database, values) {
+  const [id, name, projectType, currency, shareToken, shareRole, createdAt, updatedAt, ownerUserId = null] = values;
   database
     .prepare(`
       INSERT INTO projects (
-        id, name, project_type, currency, share_token, share_role, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        id, name, project_type, owner_user_id, currency, share_token, share_role, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     `)
-    .run(...values);
+    .run(id, name, projectType, ownerUserId, currency, shareToken, shareRole, createdAt, updatedAt);
 }
 
 test('fresh schema creates the runtime tables and requested indexes', (t) => {
@@ -256,6 +259,7 @@ test('fresh schema creates the runtime tables and requested indexes', (t) => {
   const transactionColumns = database.prepare('PRAGMA table_info(transactions)').all().map((row) => row.name);
 
   assert.ok(projectColumns.includes('finalized_at'));
+  assert.ok(projectColumns.includes('owner_user_id'));
   assert.ok(memberColumns.includes('linked_household_project_id'));
   assert.ok(memberColumns.includes('linked_at'));
   assert.ok(transactionColumns.includes('entry_type'));
@@ -265,6 +269,7 @@ test('fresh schema creates the runtime tables and requested indexes', (t) => {
   assert.ok(transactionColumns.includes('generated_automatically'));
   const connectionStatusSql = database.prepare("SELECT sql FROM sqlite_schema WHERE type='table' AND name='gmail_connections'").get().sql;
   assert.match(connectionStatusSql, /disconnecting/);
+  assert.match(connectionStatusSql, /household_project_id/);
   assert.deepEqual(database.prepare('PRAGMA foreign_key_list(gmail_revocation_retries)').all(), []);
 
   const importTransactionKey = database
@@ -281,7 +286,7 @@ test('fresh schema creates the runtime tables and requested indexes', (t) => {
 });
 
 test('numbered migrations create the runtime tables from an empty database', (t) => {
-  const database = openDatabase(`${baselineSql}\n${migrationSql}\n${authMigrationSql}\n${gmailMigrationSql}\n${gmailOauthProjectMigrationSql}\n${accountDeletionMigrationSql}\n${householdSyncMigrationSql}\n${gmailRevocationGuardsMigrationSql}`);
+  const database = openDatabase(`${baselineSql}\n${migrationSql}\n${authMigrationSql}\n${gmailMigrationSql}\n${gmailOauthProjectMigrationSql}\n${accountDeletionMigrationSql}\n${householdSyncMigrationSql}\n${gmailRevocationGuardsMigrationSql}\n${personalHouseholdsMigrationSql}`);
   t.after(() => database.close());
 
   assert.deepEqual(tableNames(database), runtimeTables);
@@ -306,7 +311,7 @@ test('legacy migration preserves data and creates deterministic ledger rows', (t
   t.after(() => database.close());
   seedLegacyDatabase(database);
 
-  database.exec(`BEGIN IMMEDIATE;\n${migrationSql}\n${authMigrationSql}\n${gmailMigrationSql}\n${gmailOauthProjectMigrationSql}\n${accountDeletionMigrationSql}\n${householdSyncMigrationSql}\n${gmailRevocationGuardsMigrationSql}\nCOMMIT;`);
+  database.exec(`BEGIN IMMEDIATE;\n${migrationSql}\n${authMigrationSql}\n${gmailMigrationSql}\n${gmailOauthProjectMigrationSql}\n${accountDeletionMigrationSql}\n${householdSyncMigrationSql}\n${gmailRevocationGuardsMigrationSql}\n${personalHouseholdsMigrationSql}\nCOMMIT;`);
 
   const freshDatabase = openDatabase(schemaSql);
   t.after(() => freshDatabase.close());
@@ -318,7 +323,7 @@ test('legacy migration preserves data and creates deterministic ledger rows', (t
 
   const migratedProject = database
     .prepare(`
-      SELECT project_type, currency, share_token, share_role, share_expires_at, finalized_at, created_at, updated_at
+      SELECT project_type, owner_user_id, currency, share_token, share_role, share_expires_at, finalized_at, created_at, updated_at
       FROM projects
       WHERE id = 'split-a'
     `)
@@ -326,6 +331,7 @@ test('legacy migration preserves data and creates deterministic ledger rows', (t
 
   assert.deepEqual({ ...migratedProject }, {
     project_type: 'split',
+    owner_user_id: null,
     currency: 'JPY',
     share_token: 'share-token-a',
     share_role: 'viewer',
@@ -555,13 +561,17 @@ test('checks and partial unique indexes enforce ledger identities', (t) => {
   t.after(() => database.close());
   const now = '2026-02-01T00:00:00.000Z';
 
+  for (const id of ['owner-a', 'owner-b', 'owner-c']) {
+    database.prepare('INSERT INTO users (id, google_sub, email, created_at, updated_at) VALUES (?, ?, ?, ?, ?)').run(id, id, `${id}@example.invalid`, now, now);
+  }
   insertProject(database, ['split', 'Split', 'split', 'JPY', null, 'editor', now, now]);
-  insertProject(database, ['house-a', 'House A', 'household', 'JPY', 'shared-token', 'editor', now, now]);
-  insertProject(database, ['house-b', 'House B', 'household', 'JPY', null, 'editor', now, now]);
-  insertProject(database, ['house-c', 'House C', 'household', 'JPY', null, 'editor', now, now]);
+  insertProject(database, ['split-share', 'Split share', 'split', 'JPY', 'shared-token', 'editor', now, now]);
+  insertProject(database, ['house-a', 'House A', 'household', 'JPY', null, 'editor', now, now, 'owner-a']);
+  insertProject(database, ['house-b', 'House B', 'household', 'JPY', null, 'editor', now, now, 'owner-b']);
+  insertProject(database, ['house-c', 'House C', 'household', 'JPY', null, 'editor', now, now, 'owner-c']);
 
   assert.throws(
-    () => insertProject(database, ['house-d', 'House D', 'household', 'JPY', 'shared-token', 'editor', now, now]),
+    () => insertProject(database, ['split-share-duplicate', 'Split share duplicate', 'split', 'JPY', 'shared-token', 'editor', now, now]),
     /UNIQUE constraint failed/
   );
   assert.throws(
@@ -703,5 +713,39 @@ test('foreign-key actions preserve audit rows and restrict allocated member dele
   assert.equal(database.prepare("SELECT transaction_id FROM import_records WHERE id = 'import'").get().transaction_id, null);
 
   database.prepare("DELETE FROM project_members WHERE id = 'allocated-member'").run();
+  assert.deepEqual(database.prepare('PRAGMA foreign_key_check').all(), []);
+});
+
+test('personal household ownership and Gmail connection guards enforce the final boundaries', (t) => {
+  const database = openDatabase(schemaSql);
+  t.after(() => database.close());
+  const now = '2026-04-01T00:00:00.000Z';
+
+  for (const id of ['household-owner', 'other-user']) {
+    database.prepare('INSERT INTO users (id, google_sub, email, created_at, updated_at) VALUES (?, ?, ?, ?, ?)').run(id, id, `${id}@example.invalid`, now, now);
+  }
+  insertProject(database, ['split', 'Split', 'split', 'JPY', null, 'editor', now, now]);
+  insertProject(database, ['household', 'Household', 'household', 'JPY', null, 'editor', now, now, 'household-owner']);
+
+  database.prepare('INSERT INTO project_user_roles (project_id, user_id, role, created_at, updated_at) VALUES (?, ?, ?, ?, ?)').run('split', 'household-owner', 'editor', now, now);
+  database.prepare('INSERT INTO project_shares (id, project_id, token_hash, role, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)').run('split-share', 'split', 'split-hash', 'viewer', now, now);
+
+  assert.throws(
+    () => database.prepare('INSERT INTO project_user_roles (project_id, user_id, role, created_at, updated_at) VALUES (?, ?, ?, ?, ?)').run('household', 'household-owner', 'owner', now, now),
+    /household_roles_forbidden/
+  );
+  assert.throws(
+    () => database.prepare('INSERT INTO project_shares (id, project_id, token_hash, role, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)').run('household-share', 'household', 'household-hash', 'viewer', now, now),
+    /household_shares_forbidden/
+  );
+  assert.throws(
+    () => database.prepare('INSERT INTO gmail_connections (id, user_id, household_project_id, gmail_email, refresh_token_ciphertext, refresh_token_iv, key_generation, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)').run('split-connection', 'household-owner', 'split', 'split@example.invalid', 'cipher', 'iv', 1, now, now),
+    /gmail_household_owner_mismatch/
+  );
+  assert.throws(
+    () => database.prepare('INSERT INTO gmail_connections (id, user_id, household_project_id, gmail_email, refresh_token_ciphertext, refresh_token_iv, key_generation, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)').run('other-connection', 'other-user', 'household', 'other@example.invalid', 'cipher', 'iv', 1, now, now),
+    /gmail_household_owner_mismatch/
+  );
+  database.prepare('INSERT INTO gmail_connections (id, user_id, household_project_id, gmail_email, refresh_token_ciphertext, refresh_token_iv, key_generation, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)').run('valid-connection', 'household-owner', 'household', 'owner@example.invalid', 'cipher', 'iv', 1, now, now);
   assert.deepEqual(database.prepare('PRAGMA foreign_key_check').all(), []);
 });

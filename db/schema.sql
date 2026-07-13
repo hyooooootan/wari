@@ -3,14 +3,19 @@ PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS projects (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL CHECK (length(trim(name)) > 0),
-  project_type TEXT NOT NULL DEFAULT 'split' CHECK (project_type IN ('split', 'household', 'shared_household')),
+  project_type TEXT NOT NULL DEFAULT 'split' CHECK (
+    project_type IN ('split', 'household')
+    AND (project_type = 'split' OR (owner_user_id IS NOT NULL AND share_token IS NULL))
+  ),
+  owner_user_id TEXT,
   currency TEXT NOT NULL DEFAULT 'JPY' CHECK (length(currency) = 3),
   share_token TEXT,
   share_role TEXT NOT NULL DEFAULT 'editor' CHECK (share_role IN ('editor', 'viewer')),
   share_expires_at TEXT,
   finalized_at TEXT,
   created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY (owner_user_id) REFERENCES users(id) ON UPDATE CASCADE ON DELETE RESTRICT
 );
 
 CREATE TABLE IF NOT EXISTS users (
@@ -186,6 +191,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_projects_share_token
 ON projects(share_token)
 WHERE share_token IS NOT NULL;
 
+CREATE UNIQUE INDEX IF NOT EXISTS idx_projects_household_owner
+ON projects(owner_user_id)
+WHERE project_type = 'household' AND owner_user_id IS NOT NULL;
+
 CREATE UNIQUE INDEX IF NOT EXISTS idx_transaction_payments_external_payment
 ON transaction_payments(external_payment_id)
 WHERE external_payment_id IS NOT NULL;
@@ -289,12 +298,14 @@ CREATE INDEX IF NOT EXISTS idx_household_sync_jobs_source
 ON household_sync_jobs(source_project_id, source_transaction_id);
 
 CREATE TABLE IF NOT EXISTS gmail_connections (
-  id TEXT PRIMARY KEY, user_id TEXT NOT NULL, gmail_email TEXT NOT NULL,
+  id TEXT PRIMARY KEY, user_id TEXT NOT NULL, household_project_id TEXT NOT NULL, gmail_email TEXT NOT NULL,
   refresh_token_ciphertext TEXT NOT NULL, refresh_token_iv TEXT NOT NULL,
   key_generation INTEGER NOT NULL CHECK (key_generation > 0), aad_version INTEGER NOT NULL DEFAULT 1 CHECK (aad_version = 1),
   status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'reauthorization_required', 'disconnecting', 'disconnected')),
   created_at TEXT NOT NULL, updated_at TEXT NOT NULL, last_synced_at TEXT,
-  UNIQUE (user_id, gmail_email), FOREIGN KEY (user_id) REFERENCES users(id) ON UPDATE CASCADE ON DELETE CASCADE
+  UNIQUE (user_id, gmail_email),
+  FOREIGN KEY (user_id) REFERENCES users(id) ON UPDATE CASCADE ON DELETE CASCADE,
+  FOREIGN KEY (household_project_id) REFERENCES projects(id) ON UPDATE CASCADE ON DELETE RESTRICT
 );
 CREATE TABLE IF NOT EXISTS gmail_oauth_states (
   state_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL, project_id TEXT, created_at TEXT NOT NULL, expires_at TEXT NOT NULL, used_at TEXT,
@@ -345,3 +356,100 @@ CREATE TABLE IF NOT EXISTS gmail_revocation_retries (
   created_at TEXT NOT NULL, updated_at TEXT NOT NULL, last_attempted_at TEXT NOT NULL, completed_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_gmail_revocation_retries_status ON gmail_revocation_retries(status, updated_at);
+
+CREATE TRIGGER IF NOT EXISTS trg_projects_household_owner_guard
+BEFORE INSERT ON projects
+WHEN NEW.project_type = 'household'
+ AND NOT EXISTS (
+  SELECT 1 FROM users
+  WHERE id = NEW.owner_user_id
+    AND deleted_at IS NULL
+    AND deletion_started_at IS NULL
+)
+BEGIN
+  SELECT RAISE(ABORT, 'household_owner_invalid');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_projects_household_update_guard
+BEFORE UPDATE OF project_type, owner_user_id ON projects
+WHEN NEW.project_type = 'household'
+ AND NOT EXISTS (
+  SELECT 1 FROM users
+  WHERE id = NEW.owner_user_id
+    AND deleted_at IS NULL
+    AND deletion_started_at IS NULL
+)
+BEGIN
+  SELECT RAISE(ABORT, 'household_owner_invalid');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_projects_household_sharing_guard
+BEFORE UPDATE OF project_type, owner_user_id, share_token, share_role, share_expires_at ON projects
+WHEN NEW.project_type = 'household' AND (
+  NEW.share_token IS NOT NULL
+  OR EXISTS (SELECT 1 FROM project_user_roles WHERE project_id = NEW.id)
+  OR EXISTS (SELECT 1 FROM project_shares WHERE project_id = NEW.id)
+)
+BEGIN
+  SELECT RAISE(ABORT, 'household_sharing_forbidden');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_project_user_roles_household_insert
+BEFORE INSERT ON project_user_roles
+WHEN EXISTS (SELECT 1 FROM projects WHERE id = NEW.project_id AND project_type = 'household')
+BEGIN
+  SELECT RAISE(ABORT, 'household_roles_forbidden');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_project_user_roles_household_update
+BEFORE UPDATE ON project_user_roles
+WHEN EXISTS (SELECT 1 FROM projects WHERE id = NEW.project_id AND project_type = 'household')
+BEGIN
+  SELECT RAISE(ABORT, 'household_roles_forbidden');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_project_shares_household_insert
+BEFORE INSERT ON project_shares
+WHEN EXISTS (SELECT 1 FROM projects WHERE id = NEW.project_id AND project_type = 'household')
+BEGIN
+  SELECT RAISE(ABORT, 'household_shares_forbidden');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_project_shares_household_update
+BEFORE UPDATE ON project_shares
+WHEN EXISTS (SELECT 1 FROM projects WHERE id = NEW.project_id AND project_type = 'household')
+BEGIN
+  SELECT RAISE(ABORT, 'household_shares_forbidden');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_gmail_connections_household_guard
+BEFORE INSERT ON gmail_connections
+WHEN NOT EXISTS (
+  SELECT 1
+  FROM projects p
+  JOIN users u ON u.id = p.owner_user_id
+  WHERE p.id = NEW.household_project_id
+    AND p.project_type = 'household'
+    AND p.owner_user_id = NEW.user_id
+    AND u.deleted_at IS NULL
+    AND u.deletion_started_at IS NULL
+)
+BEGIN
+  SELECT RAISE(ABORT, 'gmail_household_owner_mismatch');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_gmail_connections_household_update_guard
+BEFORE UPDATE OF user_id, household_project_id ON gmail_connections
+WHEN NOT EXISTS (
+  SELECT 1
+  FROM projects p
+  JOIN users u ON u.id = p.owner_user_id
+  WHERE p.id = NEW.household_project_id
+    AND p.project_type = 'household'
+    AND p.owner_user_id = NEW.user_id
+    AND u.deleted_at IS NULL
+    AND u.deletion_started_at IS NULL
+)
+BEGIN
+  SELECT RAISE(ABORT, 'gmail_household_owner_mismatch');
+END;
