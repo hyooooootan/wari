@@ -200,11 +200,25 @@ test("project CRUD creates a household owner and enforces share expiry", async (
 test("household creation rolls back project, member, and owner role when owner insertion fails", async (t) => {
   const db=new D1Database();t.after(()=>db.close());
   db.failBatchAt=2;
-  const result=await request(db,"POST","/api/projects",{id:"failed-home",name:"Failed",project_type:"household"});
+  const result=await request(db,"POST","/api/projects",{id:"failed-home",name:"Failed",project_type:"household",initial_member:{id:"failed-owner",display_name:"Owner"}});
   assert.equal(result.response.status,500);
   assert.equal(db.database.prepare("SELECT count(*) AS n FROM projects WHERE id=?").get("failed-home").n,0);
   assert.equal(db.database.prepare("SELECT count(*) AS n FROM project_members WHERE project_id=?").get("failed-home").n,0);
   assert.equal(db.database.prepare("SELECT count(*) AS n FROM project_user_roles WHERE project_id=?").get("failed-home").n,0);
+});
+
+test("household creation preserves the client member and validates the project payload", async (t) => {
+  const db=new D1Database();t.after(()=>db.close());
+  const created=await request(db,"POST","/api/projects",{id:"device-home",name:"Device home",project_type:"household",initial_member:{id:"device-member",display_name:"Device owner"}});
+  assert.equal(created.response.status,201);assert.deepEqual(created.body.project_members.map((member)=>[member.id,member.display_name,member.role]),[["device-member","Device owner","owner"]]);
+  const unknownProjectField=await request(db,"POST","/api/projects",{id:"unknown-project",name:"Unknown",unexpected:true});
+  assert.equal(unknownProjectField.response.status,400);assert.deepEqual(unknownProjectField.body,{error:"unknown_field",field:"unexpected"});
+  const unknownMemberField=await request(db,"POST","/api/projects",{id:"unknown-member",name:"Unknown",project_type:"household",initial_member:{id:"member",display_name:"Owner",role:"owner"}});
+  assert.equal(unknownMemberField.response.status,400);assert.deepEqual(unknownMemberField.body,{error:"unknown_field",field:"role"});
+  const splitWithMember=await request(db,"POST","/api/projects",{id:"split-member",name:"Split",project_type:"split",initial_member:{id:"member",display_name:"Owner"}});
+  assert.equal(splitWithMember.response.status,400);assert.deepEqual(splitWithMember.body,{error:"invalid_field",field:"initial_member"});
+  const split=await request(db,"POST","/api/projects",{id:"plain-split",name:"Split",project_type:"split"});
+  assert.equal(split.response.status,201);assert.equal(split.body.project_members.length,0);
 });
 
 test("Gmail OAuth start validates the selected household and requires a JSON project identifier", async (t) => {

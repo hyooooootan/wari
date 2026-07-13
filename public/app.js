@@ -332,8 +332,21 @@ async function syncOperations(operations, remoteAction = null) {
   renderStatus();
   try {
     const allocationItemIds = new Set();
+    const atomicHouseholdMembers = new Set();
+    const householdMemberByProject = new Map(operations
+      .filter((operation) => operation.action === "create" && operation.table === "project_members" && operation.row.role === "owner")
+      .map((operation) => [operation.row.project_id, operation]));
     for (const operation of operations) {
       if (operation.generated) continue;
+      if (operation.action === "create" && operation.table === "project_members" && atomicHouseholdMembers.has(operation.id)) continue;
+      if (operation.action === "create" && operation.table === "projects" && operation.row.project_type === "household") {
+        const memberOperation = householdMemberByProject.get(operation.id);
+        if (memberOperation) {
+          atomicHouseholdMembers.add(memberOperation.id);
+          await syncOperation({ ...operation, initialMember: memberOperation.row });
+          continue;
+        }
+      }
       if (operation.table === "item_allocations") {
         allocationItemIds.add(itemId(operation.row));
         continue;

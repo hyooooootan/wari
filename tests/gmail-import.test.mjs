@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import { decryptRefreshToken, disconnectGmail, encryptRefreshToken, finishGmailOAuth, importCandidate, startGmailOAuth, syncGmail } from "../functions/lib/gmail.js";
+import { decryptRefreshToken, disconnectGmail, encryptRefreshToken, finishGmailOAuth, importCandidate, startGmailOAuth, syncGmail, updateCandidate } from "../functions/lib/gmail.js";
 import { extractGmailText } from "../functions/lib/gmail-mime.js";
 import { parsePaymentNotification } from "../functions/lib/gmail-parsers.js";
 
@@ -37,6 +37,11 @@ class Database {
     } finally { this.failBatchAt=undefined; }
   }
   close() { this.raw.close(); }
+}
+
+class SerializedDatabase extends Database {
+  constructor() { super(); this.batchQueue=Promise.resolve(); }
+  batch(statements) { const run=()=>super.batch(statements);const result=this.batchQueue.then(run,run);this.batchQueue=result.catch(()=>{});return result; }
 }
 
 function base64Url(value) { return Buffer.from(value).toString("base64url"); }
@@ -93,6 +98,34 @@ test("OAuth callback rejects sharing added after its final read and before conne
   await assert.rejects(()=>finishGmailOAuth(db,env,new Request(`https://example.test/api/gmail/oauth/callback?state=${encodeURIComponent(state)}&code=code`,{headers:{cookie}}),{id:"user-1"}),/gmail_personal_household_required/);
   assert.equal(profileRequested,true);
   assert.equal(db.raw.prepare("SELECT count(*) AS n FROM gmail_connections").get().n,0);
+});
+
+test("parallel OAuth callbacks use the stored connection identifier for token AAD", async (t) => {
+  const db=new SerializedDatabase();t.after(()=>db.close());seed(db);let profileCalls=0;let releaseProfiles;const profilesReady=new Promise((resolve)=>{releaseProfiles=resolve;});let tokenCalls=0;
+  const env=environment(async(url)=>{
+    if(String(url).includes("/token")){tokenCalls+=1;return Response.json({access_token:`access-${tokenCalls}`,refresh_token:`refresh-${tokenCalls}`});}
+    profileCalls+=1;const currentProfile=profileCalls;if(profileCalls===2)releaseProfiles();await profilesReady;return Response.json({emailAddress:currentProfile===1?" Mail@Example.Test ":"mail@example.test"});
+  });
+  const first=await startGmailOAuth(db,env,new Request("https://example.test/api/gmail/oauth/start"),{id:"user-1"},"personal-home");
+  const second=await startGmailOAuth(db,env,new Request("https://example.test/api/gmail/oauth/start"),{id:"user-1"},"personal-home");
+  const callback=(started,code)=>finishGmailOAuth(db,env,new Request(`https://example.test/api/gmail/oauth/callback?state=${encodeURIComponent(new URL(started.url).searchParams.get("state"))}&code=${code}`,{headers:{cookie:started.cookie.split(";",1)[0]}}),{id:"user-1"});
+  const results=await Promise.all([callback(first,"first"),callback(second,"second")]);
+  assert.equal(results[0].connection_id,results[1].connection_id);
+  assert.equal(db.raw.prepare("SELECT count(*) AS n FROM gmail_connections").get().n,1);
+  const stored=db.raw.prepare("SELECT * FROM gmail_connections").get();
+  assert.equal(stored.gmail_email,"mail@example.test");
+  assert.match(await decryptRefreshToken(env,stored),/^refresh-[12]$/);
+});
+
+test("OAuth callback reuses a legacy mixed-case Gmail connection identifier", async (t) => {
+  const db=new Database();t.after(()=>db.close());seed(db);const env=environment(async(url)=>String(url).includes("/token")?Response.json({access_token:"access",refresh_token:"replacement"}):Response.json({emailAddress:"legacy@example.test"}));const now="2026-07-12T00:00:00.000Z";
+  const encrypted=await encryptRefreshToken(env,"legacy-id","user-1","old-refresh");
+  db.raw.prepare("INSERT INTO gmail_connections (id,user_id,gmail_email,refresh_token_ciphertext,refresh_token_iv,key_generation,aad_version,status,created_at,updated_at) VALUES (?,?,?,?,?,?,1,'active',?,?)").run("legacy-id","user-1"," Legacy@Example.Test ",encrypted.ciphertext,encrypted.iv,1,now,now);
+  const started=await startGmailOAuth(db,env,new Request("https://example.test/api/gmail/oauth/start"),{id:"user-1"},"personal-home");
+  const result=await finishGmailOAuth(db,env,new Request(`https://example.test/api/gmail/oauth/callback?state=${encodeURIComponent(new URL(started.url).searchParams.get("state"))}&code=code`,{headers:{cookie:started.cookie.split(";",1)[0]}}),{id:"user-1"});
+  assert.equal(result.connection_id,"legacy-id");
+  assert.equal(db.raw.prepare("SELECT count(*) AS n FROM gmail_connections").get().n,1);
+  assert.equal(await decryptRefreshToken(env,db.raw.prepare("SELECT * FROM gmail_connections WHERE id='legacy-id'").get()),"replacement");
 });
 
 test("multiple message and candidate writes roll back together and permit a later sync retry", async (t) => {
@@ -251,4 +284,30 @@ test("candidate import retry repairs its final status without a second transacti
   await assert.rejects(()=>importCandidate(db,{id:"user-1"},"candidate-2",{project_id:"private-home"}),/injected_statement_failure/);
   await importCandidate(db,{id:"user-1"},"candidate-2",{project_id:"private-home"});
   assert.equal(db.raw.prepare("SELECT count(*) AS n FROM transactions WHERE project_id=?").get("private-home").n,1);assert.equal(db.raw.prepare("SELECT status FROM gmail_import_candidates WHERE id=?").get("candidate-2").status,"imported");
+});
+
+test("candidate import is idempotent for one household and rejects another household and later edits", async (t) => {
+  const db=new Database();t.after(()=>db.close());seed(db);const now="2026-07-12T00:00:00.000Z";
+  for(const projectId of ["home-a","home-b"]){db.raw.prepare("INSERT INTO projects (id,name,project_type,created_at,updated_at) VALUES (?,?,?,?,?)").run(projectId,projectId,"household",now,now);db.raw.prepare("INSERT INTO project_user_roles (project_id,user_id,role,created_at,updated_at) VALUES (?,?,?,?,?)").run(projectId,"user-1","owner",now,now);db.raw.prepare("INSERT INTO project_members (id,project_id,display_name,role,is_active,created_at,updated_at) VALUES (?,?,?,?,?,?,?)").run(`member-${projectId}`,projectId,"Owner","owner",1,now,now);}
+  db.raw.prepare("INSERT INTO gmail_connections (id,user_id,gmail_email,refresh_token_ciphertext,refresh_token_iv,key_generation,aad_version,status,created_at,updated_at) VALUES (?,?,?,?,?,?,1,'active',?,?)").run("idempotent-connection","user-1","idempotent@example.test","x","y",1,now,now);
+  db.raw.prepare("INSERT INTO gmail_sync_runs (id,connection_id,user_id,days,message_limit,status,started_at) VALUES (?,?,?,?,?,'completed',?)").run("idempotent-run","idempotent-connection","user-1",7,1,now);
+  db.raw.prepare("INSERT INTO gmail_messages (id,connection_id,gmail_message_id,sync_run_id,parse_status,created_at) VALUES (?,?,?,?,?,?)").run("idempotent-message","idempotent-connection","idempotent-gmail-id","idempotent-run","parsed",now);
+  db.raw.prepare("INSERT INTO gmail_import_candidates (id,connection_id,gmail_message_row_id,user_id,status,merchant_name,amount,occurred_at,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)").run("idempotent-candidate","idempotent-connection","idempotent-message","user-1","ready","Shop",1000,now,now,now);
+  const first=await importCandidate(db,{id:"user-1"},"idempotent-candidate",{project_id:"home-a"});
+  const repeated=await importCandidate(db,{id:"user-1"},"idempotent-candidate",{project_id:"home-a"});
+  assert.equal(repeated.import.id,first.import.id);assert.equal(repeated.transaction.id,first.transaction.id);assert.equal(db.raw.prepare("SELECT count(*) AS n FROM transactions").get().n,1);
+  await assert.rejects(()=>importCandidate(db,{id:"user-1"},"idempotent-candidate",{project_id:"home-b"}),(error)=>error.status===409&&error.message==="candidate_already_imported");
+  await assert.rejects(()=>updateCandidate(db,{id:"user-1"},"idempotent-candidate",{status:"ready"}),(error)=>error.status===409&&error.message==="candidate_already_imported");
+  assert.equal(db.raw.prepare("SELECT imported_project_id FROM gmail_import_candidates WHERE id='idempotent-candidate'").get().imported_project_id,"home-a");
+});
+
+test("parallel candidate imports create one transaction and return the same result", async (t) => {
+  const db=new SerializedDatabase();t.after(()=>db.close());seed(db);const now="2026-07-12T00:00:00.000Z";
+  db.raw.prepare("INSERT INTO project_members (id,project_id,display_name,role,is_active,created_at,updated_at) VALUES (?,?,?,?,?,?,?)").run("parallel-member","personal-home","Owner","owner",1,now,now);
+  db.raw.prepare("INSERT INTO gmail_connections (id,user_id,gmail_email,refresh_token_ciphertext,refresh_token_iv,key_generation,aad_version,status,created_at,updated_at) VALUES (?,?,?,?,?,?,1,'active',?,?)").run("parallel-connection","user-1","parallel@example.test","x","y",1,now,now);
+  db.raw.prepare("INSERT INTO gmail_sync_runs (id,connection_id,user_id,days,message_limit,status,started_at) VALUES (?,?,?,?,?,'completed',?)").run("parallel-run","parallel-connection","user-1",7,1,now);
+  db.raw.prepare("INSERT INTO gmail_messages (id,connection_id,gmail_message_id,sync_run_id,parse_status,created_at) VALUES (?,?,?,?,?,?)").run("parallel-message","parallel-connection","parallel-gmail-id","parallel-run","parsed",now);
+  db.raw.prepare("INSERT INTO gmail_import_candidates (id,connection_id,gmail_message_row_id,user_id,status,merchant_name,amount,occurred_at,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)").run("parallel-candidate","parallel-connection","parallel-message","user-1","ready","Shop",1000,now,now,now);
+  const results=await Promise.all([importCandidate(db,{id:"user-1"},"parallel-candidate",{project_id:"personal-home"}),importCandidate(db,{id:"user-1"},"parallel-candidate",{project_id:"personal-home"})]);
+  assert.equal(results[0].import.id,results[1].import.id);assert.equal(results[0].transaction.id,results[1].transaction.id);assert.equal(db.raw.prepare("SELECT count(*) AS n FROM transactions").get().n,1);
 });

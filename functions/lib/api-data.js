@@ -62,7 +62,7 @@ export async function listProjectsForUser(db, user) {
 
 export async function createProject(db, input, ownerUser = null) {
   assertObject(input);
-  assertAllowed(input, ["id", "name", "project_type", "currency"]);
+  assertAllowed(input, ["id", "name", "project_type", "currency", "initial_member"]);
   const timestamp = now();
   const project = {
     id: optionalId(input, "id") || makeId("prj"),
@@ -76,7 +76,18 @@ export async function createProject(db, input, ownerUser = null) {
     created_at: timestamp,
     updated_at: timestamp,
   };
+  let initialMember = null;
+  if (has(input, "initial_member")) {
+    if (project.project_type !== "household") throw new ApiError(400, "invalid_field", { field: "initial_member" });
+    assertObject(input.initial_member);
+    assertAllowed(input.initial_member, ["id", "display_name"]);
+    initialMember = {
+      id: requiredId(input.initial_member, "id"),
+      display_name: requiredString(input.initial_member, "display_name", 1, 200),
+    };
+  }
   await assertIdAvailable(db, "projects", project.id);
+  if (initialMember) await assertIdAvailable(db, "project_members", initialMember.id);
   const statements = [
     db.prepare(`INSERT INTO projects (
       id, name, project_type, currency, share_token, share_role, share_expires_at, finalized_at, created_at, updated_at
@@ -97,7 +108,8 @@ export async function createProject(db, input, ownerUser = null) {
     statements.push(
       db.prepare(`INSERT INTO project_members (
         id, project_id, display_name, role, is_active, linked_household_project_id, linked_at, created_at, updated_at
-      ) VALUES (?, ?, ?, 'owner', 1, NULL, NULL, ?, ?)`).bind(makeId("mem"), project.id, "自分", timestamp, timestamp),
+      ) VALUES (?, ?, ?, 'owner', 1, NULL, NULL, ?, ?)`)
+        .bind(initialMember?.id || makeId("mem"), project.id, initialMember?.display_name || "自分", timestamp, timestamp),
     );
   }
   if (ownerUser) {

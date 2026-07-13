@@ -563,3 +563,9 @@ test("Gmail接続準備の認証失効、共有家計簿、作成失敗を日本
     (error) => error.code === "server_error" && /Gmail接続を開始できませんでした/.test(error.message),
   );
 });
+
+test("household row mutation sends the client owner in the project creation request", async () => {
+  const calls=[];const client=WariApi.createApiClient({fetch:async(url,options)=>{calls.push({url,method:options.method,body:options.body?JSON.parse(options.body):null});return Response.json({projects:[{id:"home"}],project_members:[{id:"device-owner",role:"owner"}]},{status:201});}});
+  await client.mutateRow({action:"create",table:"projects",row:{id:"home",name:"Home",project_type:"household",currency:"JPY"},initialMember:{id:"device-owner",display_name:"Device owner",role:"owner",project_id:"home"}});
+  assert.deepEqual(calls,[{url:"/api/projects",method:"POST",body:{id:"home",name:"Home",project_type:"household",currency:"JPY",initial_member:{id:"device-owner",display_name:"Device owner"}}}]);
+});

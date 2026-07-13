@@ -21,6 +21,8 @@ Routes:
 - `POST /api/auth/logout` revokes the current session.
 - `DELETE /api/account` marks the user deleted, revokes sessions, and revokes direct project roles.
 
+Account deletion retains project data. A solely owned project remains stored after the owner's role is revoked, and an administrative recovery path for that project is not implemented. The deletion behavior does not transfer ownership or remove the retained project.
+
 Local tests use `OAUTH_MOCK_USER_JSON` for provider callback tests when needed. Do not set this in production.
 
 ## Gmail payment notification connection

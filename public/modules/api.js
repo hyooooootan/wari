@@ -13,7 +13,7 @@ class ApiError extends Error {
 }
 
 const CREATE_FIELDS = Object.freeze({
-  projects: ["id", "name", "project_type", "currency"],
+  projects: ["id", "name", "project_type", "currency", "initial_member"],
   project_members: ["id", "display_name", "role", "is_active"],
   transactions: [
     "id",
@@ -622,12 +622,10 @@ function createApiClient(options = {}) {
     if (generatedOperation(operation)) return { ok: true, generated_record: true };
     if (table === "projects") {
       if (action === "create") {
-        const result = await createProject(row);
-        if (row.project_type === "household") {
-          const generatedOwner = result?.project_members?.find((member) => member.role === "owner");
-          if (generatedOwner) await deleteProjectMember(generatedOwner.id);
-        }
-        return result;
+        return createProject({
+          ...row,
+          ...(operation.initialMember ? { initial_member: pickFields(operation.initialMember, ["id", "display_name"]) } : {}),
+        });
       }
       if (action === "update") {
         const wasFinalized = projectFinalized.get(id);
