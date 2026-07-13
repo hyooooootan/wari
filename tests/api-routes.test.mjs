@@ -135,6 +135,12 @@ async function createProject(db, project) {
   return result.body;
 }
 
+function insertTestHousehold(db) {
+  const now = "2026-07-12T00:00:00.000Z";
+  db.database.prepare("INSERT INTO projects (id,name,project_type,owner_user_id,created_at,updated_at) VALUES (?,?,?,?,?,?)").run("test-household", "Test household", "household", "test-user", now, now);
+  return "test-household";
+}
+
 async function encryptRevocationRetry(keyValue, id, ownerUserId, token) {
   const keyBytes = Uint8Array.from(atob(keyValue), (character) => character.charCodeAt(0));
   const key = await crypto.subtle.importKey("raw", keyBytes, "AES-GCM", false, ["encrypt"]);
@@ -241,27 +247,20 @@ test("household creation preserves the client member and validates the project p
   assert.equal(split.response.status,201);assert.equal(split.body.project_members.length,0);
 });
 
-test("Gmail OAuth start validates the selected household and requires a JSON project identifier", async (t) => {
+test("Gmail OAuth start selects the personal household and ignores project identifiers", async (t) => {
   const db = new D1Database();
   t.after(() => db.close());
-  await createProject(db, { id: "shared-home", name: "共有中", project_type: "household" });
-  await createProject(db, { id: "private-home", name: "個人用", project_type: "household" });
-  await request(db, "POST", "/api/projects/shared-home/share");
+  await createProject(db, { id: "personal-home", name: "個人用", project_type: "household" });
   const env = { GMAIL_CLIENT_ID: "test-client", GMAIL_CLIENT_SECRET: "test-secret" };
 
   const empty = await request(db, "POST", "/api/gmail/oauth/start", undefined, env);
   assert.equal(empty.response.status, 400);
   assert.deepEqual(empty.body, { error: "invalid_json" });
 
-  const shared = await request(db, "POST", "/api/gmail/oauth/start", { project_id: "shared-home" }, env);
-  assert.equal(shared.response.status, 403);
-  assert.deepEqual(shared.body, { error: "gmail_personal_household_required" });
-  assert.equal(db.database.prepare("SELECT COUNT(*) AS total FROM gmail_oauth_states").get().total, 0);
-
-  const personal = await request(db, "POST", "/api/gmail/oauth/start", { project_id: "private-home" }, env);
+  const personal = await request(db, "POST", "/api/gmail/oauth/start", { project_id: "untrusted-project" }, env);
   assert.equal(personal.response.status, 200);
   assert.match(personal.body.url, /^https:\/\/accounts\.google\.com\/o\/oauth2\/v2\/auth\?/);
-  assert.equal(db.database.prepare("SELECT project_id FROM gmail_oauth_states").get().project_id, "private-home");
+  assert.equal(db.database.prepare("SELECT project_id FROM gmail_oauth_states").get().project_id, "personal-home");
 });
 
 test("household links require target edit access and revoked access blocks later derived writes", async (t) => {
@@ -485,6 +484,7 @@ test("Gmail revocation retry administration processes queued and disconnecting g
   const db = new D1Database();
   t.after(() => db.close());
   await testSession(db);
+  const householdId = insertTestHousehold(db);
   const key = btoa(String.fromCharCode(...new Uint8Array(32).fill(7)));
   const retryId = "admin-retry-row";
   const queued = await encryptRevocationRetry(key, retryId, "removed-user", "queued-refresh-token");
@@ -492,8 +492,8 @@ test("Gmail revocation retry administration processes queued and disconnecting g
   const now = "2026-07-12T00:00:00.000Z";
   db.database.prepare(`INSERT INTO gmail_revocation_retries (id,owner_user_id,source,token_ciphertext,token_iv,key_generation,aad_version,status,attempt_count,last_error_code,created_at,updated_at,last_attempted_at,completed_at)
     VALUES (?,?,'oauth_storage_rejected',?,?,1,1,'pending',1,'gmail_revocation_failed',?,?,?,NULL)`).run(retryId, "removed-user", queued.ciphertext, queued.iv, now, now, now);
-  db.database.prepare(`INSERT INTO gmail_connections (id,user_id,gmail_email,refresh_token_ciphertext,refresh_token_iv,key_generation,aad_version,status,created_at,updated_at)
-    VALUES (?,?,?,?,?,1,1,'disconnecting',?,?)`).run("admin-disconnecting", "test-user", "admin@example.test", connection.ciphertext, connection.iv, now, now);
+  db.database.prepare(`INSERT INTO gmail_connections (id,user_id,household_project_id,gmail_email,refresh_token_ciphertext,refresh_token_iv,key_generation,aad_version,status,created_at,updated_at)
+    VALUES (?,?,?,?,?,?,1,1,'disconnecting',?,?)`).run("admin-disconnecting", "test-user", householdId, "admin@example.test", connection.ciphertext, connection.iv, now, now);
   const env = {
     auth: false,
     GMAIL_REVOCATION_RETRY_SECRET: "test-admin-token",
@@ -517,11 +517,12 @@ test("Gmail revocation retry administration preserves failed work", async (t) =>
   const db = new D1Database();
   t.after(() => db.close());
   await testSession(db);
+  const householdId = insertTestHousehold(db);
   const key = btoa(String.fromCharCode(...new Uint8Array(32).fill(7)));
   const encrypted = await encryptRefreshToken({ GMAIL_TOKEN_KEY_CURRENT_GENERATION: "1", GMAIL_TOKEN_KEY_V1: key }, "admin-failed", "test-user", "failed-refresh-token");
   const now = "2026-07-12T00:00:00.000Z";
-  db.database.prepare(`INSERT INTO gmail_connections (id,user_id,gmail_email,refresh_token_ciphertext,refresh_token_iv,key_generation,aad_version,status,created_at,updated_at)
-    VALUES (?,?,?,?,?,1,1,'disconnecting',?,?)`).run("admin-failed", "test-user", "failed@example.test", encrypted.ciphertext, encrypted.iv, now, now);
+  db.database.prepare(`INSERT INTO gmail_connections (id,user_id,household_project_id,gmail_email,refresh_token_ciphertext,refresh_token_iv,key_generation,aad_version,status,created_at,updated_at)
+    VALUES (?,?,?,?,?,?,1,1,'disconnecting',?,?)`).run("admin-failed", "test-user", householdId, "failed@example.test", encrypted.ciphertext, encrypted.iv, now, now);
   const result = await request(db, "POST", "/api/admin/gmail-revocations/retry", {}, {
     auth: false,
     GMAIL_REVOCATION_RETRY_SECRET: "test-admin-token",
@@ -544,11 +545,12 @@ test("account deletion can retry revocation and leaves no connection ciphertext"
   const db = new D1Database();
   t.after(() => db.close());
   await testSession(db);
+  const householdId = insertTestHousehold(db);
   const key = btoa(String.fromCharCode(...new Uint8Array(32).fill(7)));
   const encrypted = await encryptRefreshToken({ GMAIL_TOKEN_KEY_CURRENT_GENERATION: "1", GMAIL_TOKEN_KEY_V1: key }, "delete-connection", "test-user", "refresh-token");
   const now = "2026-07-12T00:00:00.000Z";
-  db.database.prepare(`INSERT INTO gmail_connections (id,user_id,gmail_email,refresh_token_ciphertext,refresh_token_iv,key_generation,aad_version,status,created_at,updated_at)
-    VALUES (?,?,?,?,?,?,1,'active',?,?)`).run("delete-connection", "test-user", "mail@example.test", encrypted.ciphertext, encrypted.iv, encrypted.key_generation, now, now);
+  db.database.prepare(`INSERT INTO gmail_connections (id,user_id,household_project_id,gmail_email,refresh_token_ciphertext,refresh_token_iv,key_generation,aad_version,status,created_at,updated_at)
+    VALUES (?,?,?,?,?,?,?,1,'active',?,?)`).run("delete-connection", "test-user", householdId, "mail@example.test", encrypted.ciphertext, encrypted.iv, encrypted.key_generation, now, now);
   let revokeAttempts = 0;
   const env = { GMAIL_TOKEN_KEY_CURRENT_GENERATION: "1", GMAIL_TOKEN_KEY_V1: key, GMAIL_FETCH: async () => {
     revokeAttempts += 1;

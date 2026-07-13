@@ -266,7 +266,7 @@ async function dispatchGmail(request, db, env, url, path, user) {
   if (path.length === 3 && path[1] === "oauth" && path[2] === "start") {
     return invoke(request, ["POST"], async () => {
       const input = await readJson(request);
-      const result = await startGmailOAuth(db, env, request, user, input.project_id);
+      const result = await startGmailOAuth(db, env, request, user);
       return json({ url: result.url }, 200, { "set-cookie": result.cookie });
     });
   }
@@ -304,7 +304,7 @@ async function dispatchGmail(request, db, env, url, path, user) {
     return invoke(request, ["PATCH"], async () => json(await updateCandidate(db, user, path[2], await readJson(request))));
   }
   if (path.length === 4 && path[1] === "candidates" && path[3] === "import") {
-    return invoke(request, ["POST"], async () => json(await importCandidate(db, user, path[2], await readJson(request))), 201);
+    return invoke(request, ["POST"], async () => json(await importCandidate(db, user, path[2]), 201), 201);
   }
   return json({ error: "not_found" }, 404);
 }
