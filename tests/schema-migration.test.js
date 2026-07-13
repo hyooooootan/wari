@@ -11,6 +11,7 @@ const migrationSql = readFileSync(path.join(repositoryRoot, 'db', 'migrations', 
 const authMigrationSql = readFileSync(path.join(repositoryRoot, 'db', 'migrations', '0003_auth_ownership_shares.sql'), 'utf8');
 const gmailMigrationSql = readFileSync(path.join(repositoryRoot, 'db', 'migrations', '0004_gmail_payment_import.sql'), 'utf8');
 const gmailOauthProjectMigrationSql = readFileSync(path.join(repositoryRoot, 'db', 'migrations', '0005_gmail_oauth_project.sql'), 'utf8');
+const accountDeletionMigrationSql = readFileSync(path.join(repositoryRoot, 'db', 'migrations', '0006_account_deletion.sql'), 'utf8');
 const verificationSql = readFileSync(path.join(repositoryRoot, 'db', 'verify_household_ledger.sql'), 'utf8');
 
 const runtimeTables = [
@@ -185,7 +186,7 @@ function schemaObjects(database) {
       type: row.type,
       name: row.name,
       table: row.tbl_name,
-      sql: row.sql.replace(/\bIF NOT EXISTS\b/gi, '').replace(/\s+/g, ' ').trim(),
+      sql: row.sql.replace(/\bIF NOT EXISTS\b/gi, '').replace(/\s+/g, ' ').replace(/\s*,\s*/g, ', ').replace(/\s*\)/g, ')').trim(),
     }));
 }
 
@@ -268,7 +269,7 @@ test('fresh schema creates the seven runtime tables and requested indexes', (t) 
 });
 
 test('numbered migrations create the runtime tables from an empty database', (t) => {
-  const database = openDatabase(`${baselineSql}\n${migrationSql}\n${authMigrationSql}\n${gmailMigrationSql}\n${gmailOauthProjectMigrationSql}`);
+  const database = openDatabase(`${baselineSql}\n${migrationSql}\n${authMigrationSql}\n${gmailMigrationSql}\n${gmailOauthProjectMigrationSql}\n${accountDeletionMigrationSql}`);
   t.after(() => database.close());
 
   assert.deepEqual(tableNames(database), runtimeTables);
@@ -293,7 +294,7 @@ test('legacy migration preserves data and creates deterministic ledger rows', (t
   t.after(() => database.close());
   seedLegacyDatabase(database);
 
-  database.exec(`BEGIN IMMEDIATE;\n${migrationSql}\n${authMigrationSql}\n${gmailMigrationSql}\n${gmailOauthProjectMigrationSql}\nCOMMIT;`);
+  database.exec(`BEGIN IMMEDIATE;\n${migrationSql}\n${authMigrationSql}\n${gmailMigrationSql}\n${gmailOauthProjectMigrationSql}\n${accountDeletionMigrationSql}\nCOMMIT;`);
 
   const freshDatabase = openDatabase(schemaSql);
   t.after(() => freshDatabase.close());

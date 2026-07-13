@@ -19,11 +19,13 @@ Routes:
 - `POST /api/auth/google/start` creates OAuth state and returns the Google authorization URL.
 - `GET /api/auth/google/callback` exchanges the OAuth code, verifies the ID token, creates or updates the user, and creates a session.
 - `POST /api/auth/logout` revokes the current session.
-- `DELETE /api/account` marks the user deleted, revokes sessions, and revokes direct project roles.
+- `DELETE /api/account` records that deletion has started, revokes Gmail grants, then marks the user deleted and revokes sessions and direct project roles. If grant revocation fails, the same session may retry deletion while other authenticated API routes remain unavailable.
 
 Account deletion retains project data. A solely owned project remains stored after the owner's role is revoked, and an administrative recovery path for that project is not implemented. The deletion behavior does not transfer ownership or remove the retained project.
 
-Local tests use `OAUTH_MOCK_USER_JSON` for provider callback tests when needed. Do not set this in production.
+Local tests use `OAUTH_MOCK_USER_JSON` for provider callback tests when needed. Never configure `OAUTH_MOCK_USER_JSON` as a production Cloudflare Secret or Variable. Deployed Cloudflare Pages requests ignore the mock value even if it is configured by mistake.
+
+Do not deploy the ownership migrations to an existing D1 database that contains projects reachable through legacy shared URLs until an administrator has assigned every existing project to its real user. The migration deliberately assigns pre-existing projects to the deleted `owner_unknown` placeholder and does not select an arbitrary user. Complete and verify the real-user assignments before deploying application code that requires authenticated ownership.
 
 ## Gmail payment notification connection
 

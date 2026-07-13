@@ -56,8 +56,10 @@ export async function finishGoogleCallback(db, env, request, timestamp = now()) 
       AND used_at IS NULL`).bind(stateHash, timestamp).first();
   if (!row) throw new ApiError(400, "invalid_oauth_state");
   if (!timingSafeEqual(row.code_verifier_hash, await sha256Hex(cookie.verifier))) throw new ApiError(400, "invalid_oauth_state");
-  await db.prepare("UPDATE oauth_states SET used_at = ? WHERE state_hash = ?").bind(timestamp, stateHash).run();
-  const profile = env.OAUTH_MOCK_USER_JSON
+  const claimed = await db.prepare(`UPDATE oauth_states SET used_at = ?
+    WHERE state_hash = ? AND used_at IS NULL AND expires_at > ?`).bind(timestamp, stateHash, timestamp).run();
+  if (changedRows(claimed) !== 1) throw new ApiError(400, "invalid_oauth_state");
+  const profile = env.OAUTH_MOCK_USER_JSON && env.CF_PAGES !== "1"
     ? parseMockProfile(env.OAUTH_MOCK_USER_JSON)
     : await exchangeAndVerify(env, code, cookie.verifier, row.redirect_uri);
   return { profile, clearCookie: clearCookieHeader(OAUTH_COOKIE) };
@@ -171,4 +173,8 @@ function bounded(value, field, minimum, maximum) {
 
 function now() {
   return new Date().toISOString();
+}
+
+function changedRows(result) {
+  return Number(result?.meta?.changes ?? result?.changes ?? result?.meta?.rows_written ?? 0);
 }

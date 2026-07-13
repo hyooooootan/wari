@@ -55,19 +55,24 @@ export async function finishGmailOAuth(db, env, request, user) {
   const encrypted = await encryptRefreshToken(env, connectionId, user.id, token.refresh_token);
   const personalSql = personalHouseholdExistsSql();
   const personalBindings = personalHouseholdBindings(user.id, state.project_id, usedAt);
+  const activeUserSql = "SELECT 1 FROM users WHERE id=? AND deleted_at IS NULL AND deletion_started_at IS NULL";
   const connectionWrite = existing
-    ? db.prepare(`UPDATE gmail_connections SET gmail_email=?,refresh_token_ciphertext=?,refresh_token_iv=?,key_generation=?,aad_version=1,status='active',updated_at=? WHERE id=? AND user_id=? AND EXISTS(${personalSql})`)
-      .bind(gmailEmail,encrypted.ciphertext,encrypted.iv,encrypted.key_generation,usedAt,connectionId,user.id,...personalBindings)
+    ? db.prepare(`UPDATE gmail_connections SET gmail_email=?,refresh_token_ciphertext=?,refresh_token_iv=?,key_generation=?,aad_version=1,status='active',updated_at=? WHERE id=? AND user_id=? AND EXISTS(${personalSql}) AND EXISTS(${activeUserSql})`)
+      .bind(gmailEmail,encrypted.ciphertext,encrypted.iv,encrypted.key_generation,usedAt,connectionId,user.id,...personalBindings,user.id)
     : db.prepare(`INSERT INTO gmail_connections (id,user_id,gmail_email,refresh_token_ciphertext,refresh_token_iv,key_generation,aad_version,status,created_at,updated_at)
-      SELECT ?,?,?,?,?,?,1,'active',?,? WHERE EXISTS(${personalSql})
+      SELECT ?,?,?,?,?,?,1,'active',?,? WHERE EXISTS(${personalSql}) AND EXISTS(${activeUserSql})
       ON CONFLICT(user_id,gmail_email) DO UPDATE SET refresh_token_ciphertext=excluded.refresh_token_ciphertext,
       refresh_token_iv=excluded.refresh_token_iv,key_generation=excluded.key_generation,aad_version=1,status='active',updated_at=excluded.updated_at`)
-      .bind(connectionId,user.id,gmailEmail,encrypted.ciphertext,encrypted.iv,encrypted.key_generation,usedAt,usedAt,...personalBindings);
+      .bind(connectionId,user.id,gmailEmail,encrypted.ciphertext,encrypted.iv,encrypted.key_generation,usedAt,usedAt,...personalBindings,user.id);
   const results = await db.batch([
-    db.prepare(`UPDATE gmail_oauth_states SET used_at=used_at WHERE state_hash=? AND used_at=? AND project_id=? AND EXISTS(${personalSql})`).bind(stateHash, usedAt, state.project_id, ...personalBindings),
+    db.prepare(`UPDATE gmail_oauth_states SET used_at=used_at WHERE state_hash=? AND used_at=? AND project_id=? AND EXISTS(${personalSql}) AND EXISTS(${activeUserSql})`).bind(stateHash, usedAt, state.project_id, ...personalBindings, user.id),
     connectionWrite,
   ]);
-  if (!changedRows(results[0]) || !changedRows(results[1])) throw new ApiError(403, "gmail_personal_household_required");
+  if (!changedRows(results[0]) || !changedRows(results[1])) {
+    const activeUser = await db.prepare(`SELECT 1 AS active FROM users
+      WHERE id=? AND deleted_at IS NULL AND deletion_started_at IS NULL`).bind(user.id).first();
+    throw new ApiError(403, activeUser ? "gmail_personal_household_required" : "account_unavailable");
+  }
   return { connection_id: connectionId, clearCookie: clearCookieHeader(STATE_COOKIE) };
 }
 
@@ -86,13 +91,13 @@ export async function disconnectGmail(db, env, user, connectionId) {
 }
 
 export async function disconnectAllGmail(db, env, user) {
-  const rows = await db.prepare("SELECT * FROM gmail_connections WHERE user_id=? AND status!='disconnected'").bind(user.id).all();
+  const rows = await db.prepare("SELECT * FROM gmail_connections WHERE user_id=? AND refresh_token_ciphertext!=''").bind(user.id).all();
   for (const connection of rows.results || []) {
     const token = await decryptRefreshToken(env, connection);
     await revokeGoogleToken(env, token);
   }
   const timestamp = new Date().toISOString();
-  await db.prepare("UPDATE gmail_connections SET refresh_token_ciphertext='',refresh_token_iv='',status='disconnected',updated_at=? WHERE user_id=? AND status!='disconnected'").bind(timestamp,user.id).run();
+  await db.prepare("UPDATE gmail_connections SET refresh_token_ciphertext='',refresh_token_iv='',status='disconnected',updated_at=? WHERE user_id=?").bind(timestamp,user.id).run();
 }
 
 export async function syncGmail(db, env, user, connectionId, input = {}) {

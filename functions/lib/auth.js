@@ -41,10 +41,12 @@ export async function ensureUser(db, profile, timestamp = now()) {
   const name = typeof profile.name === "string" && profile.name.trim() ? profile.name.trim().slice(0, 320) : null;
   const existing = await db.prepare("SELECT * FROM users WHERE google_sub = ?").bind(sub).first();
   if (existing) {
-    await db.prepare(`UPDATE users
-      SET email = ?, name = ?, deleted_at = NULL, updated_at = ?
-      WHERE id = ?`).bind(email, name, timestamp, existing.id).run();
-    return { ...existing, email, name, deleted_at: null, updated_at: timestamp };
+    if (existing.deleted_at || existing.deletion_started_at) throw new ApiError(403, "account_unavailable");
+    const result = await db.prepare(`UPDATE users
+      SET email = ?, name = ?, updated_at = ?
+      WHERE id = ? AND deleted_at IS NULL AND deletion_started_at IS NULL`).bind(email, name, timestamp, existing.id).run();
+    if (changedRows(result) !== 1) throw new ApiError(403, "account_unavailable");
+    return { ...existing, email, name, updated_at: timestamp };
   }
   const user = {
     id: `usr_${crypto.randomUUID()}`,
@@ -53,11 +55,12 @@ export async function ensureUser(db, profile, timestamp = now()) {
     name,
     created_at: timestamp,
     updated_at: timestamp,
+    deletion_started_at: null,
     deleted_at: null,
   };
   await db.prepare(`INSERT INTO users (
-    id, google_sub, email, name, created_at, updated_at, deleted_at
-  ) VALUES (?, ?, ?, ?, ?, ?, NULL)`).bind(
+    id, google_sub, email, name, created_at, updated_at, deletion_started_at, deleted_at
+  ) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL)`).bind(
     user.id,
     user.google_sub,
     user.email,
@@ -73,23 +76,27 @@ export async function createSession(db, userId, timestamp = now()) {
   const csrfToken = randomToken(32);
   const sessionHash = await sha256Hex(sessionId);
   const expiresAt = new Date(Date.parse(timestamp) + SESSION_TTL_SECONDS * 1000).toISOString();
-  await db.prepare(`INSERT INTO sessions (
+  const result = await db.prepare(`INSERT INTO sessions (
     id_hash, user_id, csrf_token, created_at, expires_at, revoked_at
-  ) VALUES (?, ?, ?, ?, ?, NULL)`).bind(sessionHash, userId, csrfToken, timestamp, expiresAt).run();
+  ) SELECT ?, ?, ?, ?, ?, NULL
+    WHERE EXISTS (
+      SELECT 1 FROM users WHERE id = ? AND deleted_at IS NULL AND deletion_started_at IS NULL
+    )`).bind(sessionHash, userId, csrfToken, timestamp, expiresAt, userId).run();
+  if (changedRows(result) !== 1) throw new ApiError(403, "account_unavailable");
   return { sessionId, csrfToken, expiresAt };
 }
 
-export async function getSessionUser(db, request, timestamp = now()) {
+export async function getSessionUser(db, request, timestamp = now(), options = {}) {
   const sessionId = parseCookies(request).get(SESSION_COOKIE);
   if (!sessionId) return null;
   const sessionHash = await sha256Hex(sessionId);
-  const row = await db.prepare(`SELECT sessions.*, users.google_sub, users.email, users.name, users.deleted_at
+  const row = await db.prepare(`SELECT sessions.*, users.google_sub, users.email, users.name, users.deletion_started_at, users.deleted_at
     FROM sessions
     JOIN users ON users.id = sessions.user_id
     WHERE sessions.id_hash = ?
       AND sessions.revoked_at IS NULL
       AND sessions.expires_at > ?`).bind(sessionHash, timestamp).first();
-  if (!row || row.deleted_at) return null;
+  if (!row || row.deleted_at || (row.deletion_started_at && options.allowDeletionStarted !== true)) return null;
   return {
     id: row.user_id,
     google_sub: row.google_sub,
@@ -98,11 +105,18 @@ export async function getSessionUser(db, request, timestamp = now()) {
     session_hash: row.id_hash,
     csrf_token: row.csrf_token,
     expires_at: row.expires_at,
+    deletion_started_at: row.deletion_started_at,
   };
 }
 
 export async function requireUser(db, request) {
   const user = await getSessionUser(db, request);
+  if (!user) throw new ApiError(401, "authentication_required");
+  return user;
+}
+
+export async function requireAccountDeletionUser(db, request) {
+  const user = await getSessionUser(db, request, now(), { allowDeletionStarted: true });
   if (!user) throw new ApiError(401, "authentication_required");
   return user;
 }
@@ -144,4 +158,8 @@ function requiredString(value, field, maximum) {
 
 function now() {
   return new Date().toISOString();
+}
+
+function changedRows(result) {
+  return Number(result?.meta?.changes ?? result?.changes ?? result?.meta?.rows_written ?? 0);
 }

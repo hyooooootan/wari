@@ -65,12 +65,17 @@ class D1Database {
   batch(statements) {
     this.database.exec("BEGIN IMMEDIATE");
     try {
-      const results = statements.map((statement) => statement.runSync());
+      const results = statements.map((statement, index) => {
+        if (this.failBatchAt === index) throw new Error("injected_batch_failure");
+        return statement.runSync();
+      });
       this.database.exec("COMMIT");
       return results;
     } catch (error) {
       this.database.exec("ROLLBACK");
       throw error;
+    } finally {
+      this.failBatchAt = undefined;
     }
   }
 }
@@ -411,6 +416,21 @@ test("direct upsert and cancellation helpers reuse the generated transaction", a
     const cancellation = await cancelGeneratedForSource(db, "split", "tx-source", { now });
     assert.equal(cancellation.count, 1);
     assert.equal(queryOne(database, "SELECT status FROM transactions WHERE id = ?", created.transaction_id).status, "cancelled");
+  } finally {
+    database.close();
+  }
+});
+
+test("household synchronization rolls back every target statement when a batch statement fails", async () => {
+  const { database, db } = createFixture();
+  try {
+    await syncSplitTransactionToHouseholds(db, "tx-source", { now });
+    const before = queryAll(database, `SELECT id,paid_amount,status,updated_at FROM transactions WHERE generated_automatically=1 ORDER BY id`);
+    database.prepare("UPDATE item_allocations SET allocated_amount=allocated_amount+5 WHERE transaction_item_id='item-food'").run();
+    db.failBatchAt = 4;
+    await assert.rejects(() => syncSplitTransactionToHouseholds(db, "tx-source", { now, validate: false }), /injected_batch_failure/);
+    const after = queryAll(database, `SELECT id,paid_amount,status,updated_at FROM transactions WHERE generated_automatically=1 ORDER BY id`);
+    assert.deepEqual(after, before);
   } finally {
     database.close();
   }

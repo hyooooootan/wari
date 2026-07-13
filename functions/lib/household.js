@@ -26,6 +26,15 @@ async function executeStatements(db, statements) {
   return results;
 }
 
+async function queueOrExecute(db, statements, options = {}) {
+  if (options.statementCollector) {
+    options.statementCollector.push(...statements);
+    return false;
+  }
+  await executeStatements(db, statements);
+  return true;
+}
+
 function nowValue(value) {
   const candidate = typeof value === "string"
     ? value
@@ -96,6 +105,22 @@ async function loadSourceTransaction(db, transactionId) {
 
 async function loadProject(db, projectId) {
   return first(db, "SELECT * FROM projects WHERE id = ?", [projectId]);
+}
+
+async function canWriteHousehold(db, user, projectId) {
+  if (!user) return true;
+  const row = await first(
+    db,
+    `SELECT 1 AS allowed
+     FROM project_user_roles
+     WHERE project_id = ?
+       AND user_id = ?
+       AND role IN ('owner', 'editor')
+       AND revoked_at IS NULL
+     LIMIT 1`,
+    [projectId, user.id],
+  );
+  return Boolean(row);
 }
 
 async function loadSourceMember(db, projectId, memberId) {
@@ -321,6 +346,8 @@ async function resolveUpsertContext(db, input, sourceMemberInput, optionsInput) 
       householdMember,
       allocations,
       now: input.now,
+      user: optionsInput?.user,
+      statementCollector: optionsInput?.statementCollector,
     };
   }
 
@@ -352,6 +379,8 @@ async function resolveUpsertContext(db, input, sourceMemberInput, optionsInput) 
     householdMember,
     allocations,
     now: options.now,
+    user: options.user,
+    statementCollector: options.statementCollector,
   };
 }
 
@@ -375,6 +404,9 @@ export async function upsertGeneratedHouseholdTransaction(db, input, sourceMembe
   if (householdProject?.project_type !== "household" || householdProject.id !== sourceMember.linked_household_project_id) {
     const cancelled = await cancelForMember(db, sourceTransaction.project_id, sourceTransaction.id, sourceMember.id, context);
     return { status: "skipped", reason: "household_not_found", transaction_id: sourceTransaction.id, cancelled };
+  }
+  if (!await canWriteHousehold(db, optionsInput.user, householdProject.id)) {
+    return { status: "skipped", reason: "household_access_lost", transaction_id: sourceTransaction.id };
   }
   if (!householdMember || Number(householdMember.is_active) !== 1 || householdMember.project_id !== householdProject.id) {
     const cancelled = await cancelForMember(db, sourceTransaction.project_id, sourceTransaction.id, sourceMember.id, context);
@@ -547,8 +579,10 @@ export async function upsertGeneratedHouseholdTransaction(db, input, sourceMembe
     );
   }
 
-  await executeStatements(db, statements);
-  const transaction = await first(db, "SELECT * FROM transactions WHERE id = ?", [transactionId]);
+  const executed = await queueOrExecute(db, statements, context);
+  const transaction = executed
+    ? await first(db, "SELECT * FROM transactions WHERE id = ?", [transactionId])
+    : existing || { id: transactionId, project_id: householdProject.id };
   return {
     status: "upserted",
     action: existing ? "updated" : "created",
@@ -566,6 +600,9 @@ export async function cancelGeneratedHouseholdTransaction(db, generatedTransacti
   if (!generatedTransaction) return { status: "not_found", transaction_id: null };
   if (Number(generatedTransaction.generated_automatically) !== 1) {
     return { status: "skipped", reason: "not_generated", transaction_id: generatedTransaction.id };
+  }
+  if (!await canWriteHousehold(db, options.user, generatedTransaction.project_id)) {
+    return { status: "skipped", reason: "household_access_lost", transaction_id: generatedTransaction.id };
   }
 
   const now = nowValue(options);
@@ -602,7 +639,7 @@ export async function cancelGeneratedHouseholdTransaction(db, generatedTransacti
        )`,
     ).bind(now, generatedTransaction.id),
   ];
-  await executeStatements(db, statements);
+  await queueOrExecute(db, statements, options);
   return { status: "cancelled", transaction_id: generatedTransaction.id };
 }
 
@@ -618,11 +655,15 @@ export async function cancelGeneratedForSource(db, sourceProjectId, sourceTransa
     values.push(typeof sourceTransactionId === "object" ? sourceTransactionId.id : sourceTransactionId);
   }
   const generatedRows = await all(db, sql, values);
+  const statementCollector = options.statementCollector || [];
+  const operationOptions = { ...options, statementCollector };
   const transactionIds = [];
   for (const generatedRow of generatedRows) {
-    const result = await cancelGeneratedHouseholdTransaction(db, generatedRow, options);
+    if (!await canWriteHousehold(db, options.user, generatedRow.project_id)) continue;
+    const result = await cancelGeneratedHouseholdTransaction(db, generatedRow, operationOptions);
     if (result.status === "cancelled") transactionIds.push(generatedRow.id);
   }
+  if (!options.statementCollector) await executeStatements(db, statementCollector);
   return { status: "cancelled", count: transactionIds.length, transaction_ids: transactionIds };
 }
 
@@ -664,12 +705,16 @@ export async function syncSplitTransactionToHouseholds(db, transactionInput, opt
   }
 
   const existingRows = await findGeneratedRows(db, sourceTransaction.project_id, sourceTransaction.id);
+  const statementCollector = options.statementCollector || [];
+  const operationOptions = { ...options, statementCollector };
   if (TERMINAL_SOURCE_STATUSES.has(sourceTransaction.status)) {
     const cancelled = [];
     for (const row of existingRows) {
-      const result = await cancelGeneratedHouseholdTransaction(db, row, options);
+      if (!await canWriteHousehold(db, options.user, row.project_id)) continue;
+      const result = await cancelGeneratedHouseholdTransaction(db, row, operationOptions);
       if (result.status === "cancelled") cancelled.push(row.id);
     }
+    if (!options.statementCollector) await executeStatements(db, statementCollector);
     return { status: "cancelled", reason: "source_cancelled", source_transaction_id: sourceTransaction.id, upserted: [], cancelled };
   }
 
@@ -693,6 +738,7 @@ export async function syncSplitTransactionToHouseholds(db, transactionInput, opt
     if (Number(burdens[sourceMember.id] || 0) === 0) continue;
     const householdProject = await loadProject(db, sourceMember.linked_household_project_id);
     if (householdProject?.project_type !== "household") continue;
+    if (!await canWriteHousehold(db, options.user, householdProject.id)) continue;
     const householdMember = await loadHouseholdMember(db, householdProject.id);
     if (!householdMember) continue;
     const allocations = await loadMemberAllocations(db, sourceTransaction.id, sourceMember.id);
@@ -703,15 +749,17 @@ export async function syncSplitTransactionToHouseholds(db, transactionInput, opt
   const cancelled = [];
   for (const existingRow of existingRows) {
     if (desired.has(desiredKey(existingRow.project_id, existingRow.origin_member_id))) continue;
-    const result = await cancelGeneratedHouseholdTransaction(db, existingRow, options);
+    if (!await canWriteHousehold(db, options.user, existingRow.project_id)) continue;
+    const result = await cancelGeneratedHouseholdTransaction(db, existingRow, operationOptions);
     if (result.status === "cancelled") cancelled.push(existingRow.id);
   }
 
   const upserted = [];
   for (const context of contexts) {
-    const result = await upsertGeneratedHouseholdTransaction(db, context);
+    const result = await upsertGeneratedHouseholdTransaction(db, context, undefined, operationOptions);
     if (result.status === "upserted") upserted.push(result);
   }
+  if (!options.statementCollector) await executeStatements(db, statementCollector);
   return {
     status: "synced",
     source_transaction_id: sourceTransaction.id,
@@ -747,10 +795,13 @@ export async function syncSplitProjectToHouseholds(db, projectInput, options = {
        AND origin_project_id = ?`,
     [project.id],
   );
+  const statementCollector = options.statementCollector || [];
+  const operationOptions = { ...options, statementCollector };
   const cancelled = [];
   for (const generatedRow of generatedRows) {
     if (generatedRow.origin_transaction_id && generatedRow.origin_member_id && sourceTransactionIds.has(generatedRow.origin_transaction_id)) continue;
-    const result = await cancelGeneratedHouseholdTransaction(db, generatedRow, options);
+    if (!await canWriteHousehold(db, options.user, generatedRow.project_id)) continue;
+    const result = await cancelGeneratedHouseholdTransaction(db, generatedRow, operationOptions);
     if (result.status === "cancelled") cancelled.push(generatedRow.id);
   }
 
@@ -761,8 +812,9 @@ export async function syncSplitProjectToHouseholds(db, projectInput, options = {
 
   const transactionResults = [];
   for (const sourceTransaction of sourceTransactions) {
-    transactionResults.push(await syncSplitTransactionToHouseholds(db, sourceTransaction, { ...options, validate: false }));
+    transactionResults.push(await syncSplitTransactionToHouseholds(db, sourceTransaction, { ...operationOptions, validate: false }));
   }
+  if (!options.statementCollector) await executeStatements(db, statementCollector);
   return {
     status: "synced",
     project_id: project.id,

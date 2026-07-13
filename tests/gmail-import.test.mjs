@@ -100,6 +100,18 @@ test("OAuth callback rejects sharing added after its final read and before conne
   assert.equal(db.raw.prepare("SELECT count(*) AS n FROM gmail_connections").get().n,0);
 });
 
+test("OAuth callback rejects connection storage when account deletion starts during provider reads", async (t) => {
+  const db=new Database();t.after(()=>db.close());seed(db);const env=environment(async(url)=>{
+    if(String(url).includes("/token"))return Response.json({access_token:"access-secret",refresh_token:"refresh-secret"});
+    db.raw.prepare("UPDATE users SET deletion_started_at=? WHERE id=?").run("2026-07-12T00:00:00.000Z","user-1");
+    return Response.json({emailAddress:"mail@example.test"});
+  });
+  const started=await startGmailOAuth(db,env,new Request("https://example.test/api/gmail/oauth/start"),{id:"user-1"},"personal-home");
+  const state=new URL(started.url).searchParams.get("state");const cookie=started.cookie.split(";",1)[0];
+  await assert.rejects(()=>finishGmailOAuth(db,env,new Request(`https://example.test/api/gmail/oauth/callback?state=${encodeURIComponent(state)}&code=code`,{headers:{cookie}}),{id:"user-1"}),/account_unavailable/);
+  assert.equal(db.raw.prepare("SELECT count(*) AS n FROM gmail_connections").get().n,0);
+});
+
 test("parallel OAuth callbacks use the stored connection identifier for token AAD", async (t) => {
   const db=new SerializedDatabase();t.after(()=>db.close());seed(db);let profileCalls=0;let releaseProfiles;const profilesReady=new Promise((resolve)=>{releaseProfiles=resolve;});let tokenCalls=0;
   const env=environment(async(url)=>{

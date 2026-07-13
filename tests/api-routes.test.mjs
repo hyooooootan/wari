@@ -5,6 +5,9 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { onRequest } from "../functions/api/[[path]].js";
 import { sha256Hex } from "../functions/lib/crypto.js";
+import { createGoogleStart, finishGoogleCallback } from "../functions/lib/oauth.js";
+import { encryptRefreshToken } from "../functions/lib/gmail.js";
+import { createSession, ensureUser } from "../functions/lib/auth.js";
 
 const repositoryRoot = fileURLToPath(new URL("..", import.meta.url));
 const schema = readFileSync(`${repositoryRoot}/db/schema.sql`, "utf8");
@@ -242,6 +245,87 @@ test("Gmail OAuth start validates the selected household and requires a JSON pro
   assert.equal(personal.response.status, 200);
   assert.match(personal.body.url, /^https:\/\/accounts\.google\.com\/o\/oauth2\/v2\/auth\?/);
   assert.equal(db.database.prepare("SELECT project_id FROM gmail_oauth_states").get().project_id, "private-home");
+});
+
+test("household links require target edit access and revoked access blocks later derived writes", async (t) => {
+  const db = new D1Database();
+  t.after(() => db.close());
+  await createProject(db, { id: "allowed-home", name: "Allowed", project_type: "household" });
+  await createProject(db, { id: "split-access", name: "Split", project_type: "split" });
+  await request(db, "POST", "/api/projects/split-access/members", { id: "linked-member", display_name: "Member" });
+  const now = "2026-07-12T00:00:00.000Z";
+  db.database.prepare("INSERT INTO users (id,google_sub,email,created_at,updated_at) VALUES (?,?,?,?,?)").run("other-user", "other-sub", "other@example.test", now, now);
+  db.database.prepare("INSERT INTO projects (id,name,project_type,created_at,updated_at) VALUES (?,?,?,?,?)").run("forbidden-home", "Forbidden", "household", now, now);
+  db.database.prepare("INSERT INTO project_members (id,project_id,display_name,role,is_active,created_at,updated_at) VALUES (?,?,?,?,1,?,?)").run("forbidden-owner", "forbidden-home", "Owner", "owner", now, now);
+  db.database.prepare("INSERT INTO project_user_roles (project_id,user_id,role,created_at,updated_at) VALUES (?,?,?,?,?)").run("forbidden-home", "other-user", "owner", now, now);
+
+  const forbidden = await request(db, "PATCH", "/api/project-members/linked-member/household-link", { action: "link", household_project_id: "forbidden-home" });
+  assert.equal(forbidden.response.status, 404);
+  assert.equal(db.database.prepare("SELECT linked_household_project_id FROM project_members WHERE id='linked-member'").get().linked_household_project_id, null);
+
+  const linked = await request(db, "PATCH", "/api/project-members/linked-member/household-link", { action: "link", household_project_id: "allowed-home" });
+  assert.equal(linked.response.status, 200);
+  await request(db, "POST", "/api/projects/split-access/transactions", { id: "access-txn", merchant_name: "Store", paid_amount: 100, occurred_at: "2026-07-12" });
+  await request(db, "POST", "/api/transactions/access-txn/items", { id: "access-item", name: "Item", amount: 100 });
+  await request(db, "PUT", "/api/items/access-item/allocations", { allocations: [{ id: "access-allocation", project_member_id: "linked-member", allocated_amount: 100 }] });
+  const generated = db.database.prepare("SELECT id,paid_amount,status FROM transactions WHERE project_id='allowed-home' AND origin_transaction_id='access-txn'").get();
+  assert.equal(generated.paid_amount, 100);
+
+  db.database.prepare("UPDATE project_user_roles SET revoked_at=? WHERE project_id='allowed-home' AND user_id='test-user'").run(now);
+  const updated = await request(db, "PUT", "/api/items/access-item/allocations", { allocations: [{ id: "access-allocation", project_member_id: "linked-member", allocated_amount: 40 }] });
+  assert.equal(updated.response.status, 200);
+  const afterUpdate = db.database.prepare("SELECT paid_amount,status FROM transactions WHERE id=?").get(generated.id);
+  assert.deepEqual({ ...afterUpdate }, { paid_amount: 100, status: "provisional" });
+  const removed = await request(db, "DELETE", "/api/transactions/access-txn");
+  assert.equal(removed.response.status, 200);
+  const afterDelete = db.database.prepare("SELECT paid_amount,status FROM transactions WHERE id=?").get(generated.id);
+  assert.deepEqual({ ...afterDelete }, { paid_amount: 100, status: "provisional" });
+});
+
+test("Google login state is claimed once before mock profile handling", async (t) => {
+  const db = new D1Database();
+  t.after(() => db.close());
+  const env = { GOOGLE_CLIENT_ID: "client", OAUTH_MOCK_USER_JSON: JSON.stringify({ sub: "sub", email: "user@example.test" }) };
+  const started = await createGoogleStart(db, env, new Request("https://example.test/api/auth/google/start"));
+  const state = new URL(started.url).searchParams.get("state");
+  const cookie = started.cookie.split(";", 1)[0];
+  const callback = () => finishGoogleCallback(db, env, new Request(`https://example.test/api/auth/google/callback?state=${encodeURIComponent(state)}&code=code`, { headers: { cookie } }));
+  const results = await Promise.allSettled([callback(), callback()]);
+  assert.equal(results.filter((result) => result.status === "fulfilled").length, 1);
+  assert.equal(results.filter((result) => result.status === "rejected" && result.reason?.code === "invalid_oauth_state").length, 1);
+});
+
+test("account deletion can retry revocation and leaves no connection ciphertext", async (t) => {
+  const db = new D1Database();
+  t.after(() => db.close());
+  await testSession(db);
+  const key = btoa(String.fromCharCode(...new Uint8Array(32).fill(7)));
+  const encrypted = await encryptRefreshToken({ GMAIL_TOKEN_KEY_CURRENT_GENERATION: "1", GMAIL_TOKEN_KEY_V1: key }, "delete-connection", "test-user", "refresh-token");
+  const now = "2026-07-12T00:00:00.000Z";
+  db.database.prepare(`INSERT INTO gmail_connections (id,user_id,gmail_email,refresh_token_ciphertext,refresh_token_iv,key_generation,aad_version,status,created_at,updated_at)
+    VALUES (?,?,?,?,?,?,1,'active',?,?)`).run("delete-connection", "test-user", "mail@example.test", encrypted.ciphertext, encrypted.iv, encrypted.key_generation, now, now);
+  let revokeAttempts = 0;
+  const env = { GMAIL_TOKEN_KEY_CURRENT_GENERATION: "1", GMAIL_TOKEN_KEY_V1: key, GMAIL_FETCH: async () => {
+    revokeAttempts += 1;
+    return revokeAttempts === 1 ? Response.json({ error: "server_error" }, { status: 500 }) : new Response(null, { status: 200 });
+  } };
+  const failed = await request(db, "DELETE", "/api/account", undefined, env);
+  assert.equal(failed.response.status, 502);
+  const started = db.database.prepare("SELECT deletion_started_at,deleted_at FROM users WHERE id='test-user'").get();
+  assert.equal(typeof started.deletion_started_at, "string");
+  assert.equal(started.deleted_at, null);
+  assert.notEqual(db.database.prepare("SELECT refresh_token_ciphertext FROM gmail_connections WHERE id='delete-connection'").get().refresh_token_ciphertext, "");
+  assert.equal((await request(db, "GET", "/api/projects", undefined, env)).response.status, 401);
+  await assert.rejects(() => ensureUser(db, { sub: "google-sub-test", email: "test@example.test" }), /account_unavailable/);
+  await assert.rejects(() => createSession(db, "test-user"), /account_unavailable/);
+
+  const retried = await request(db, "DELETE", "/api/account", undefined, env);
+  assert.equal(retried.response.status, 200);
+  assert.equal(revokeAttempts, 2);
+  const completed = db.database.prepare("SELECT deleted_at FROM users WHERE id='test-user'").get();
+  assert.equal(typeof completed.deleted_at, "string");
+  const connection = db.database.prepare("SELECT refresh_token_ciphertext,refresh_token_iv,status FROM gmail_connections WHERE id='delete-connection'").get();
+  assert.deepEqual({ ...connection }, { refresh_token_ciphertext: "", refresh_token_iv: "", status: "disconnected" });
 });
 
 test("row CRUD stays project-scoped and household records follow finalize and reopen", async (t) => {

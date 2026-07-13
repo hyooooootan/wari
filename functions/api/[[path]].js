@@ -36,6 +36,7 @@ import {
   ensureUser,
   getSessionUser,
   requireUser,
+  requireAccountDeletionUser,
   revokeCurrentSession,
   sessionCookieHeaders,
   assertCsrf,
@@ -153,7 +154,7 @@ async function dispatch(request, db, env, url, path) {
   if (path[0] === "imports" && path.length === 3 && path[2] === "reconcile") {
     return invoke(request, ["POST"], async () => {
       await requireProjectRole(db, user, await projectIdForImport(db, path[1]), "editor");
-      return handleReconcile(request, db, path[1]);
+      return handleReconcile(request, db, path[1], user);
     });
   }
   return json({ error: "not_found" }, 404);
@@ -203,8 +204,12 @@ async function dispatchAuth(request, db, env, url, path) {
 
 async function dispatchAccount(request, db, env) {
   return invoke(request, ["DELETE"], async () => {
-    const user = await requireUser(db, request);
+    const user = await requireAccountDeletionUser(db, request);
     assertCsrf(request, user);
+    const startedAt = user.deletion_started_at || new Date().toISOString();
+    const started = await db.prepare(`UPDATE users SET deletion_started_at = COALESCE(deletion_started_at, ?), updated_at = ?
+      WHERE id = ? AND deleted_at IS NULL`).bind(startedAt, startedAt, user.id).run();
+    if (Number(started?.meta?.changes ?? 0) !== 1) throw new ApiError(401, "authentication_required");
     await disconnectAllGmail(db, env, user);
     const timestamp = new Date().toISOString();
     await db.batch([
@@ -286,13 +291,13 @@ async function dispatchProjects(request, db, url, path, user) {
     if (request.method === "PATCH") {
       await requireProjectRole(db, user, projectId, "editor");
       const result = await updateProject(db, projectId, await readJson(request));
-      if (result.project.project_type !== "split") await cancelGeneratedForSource(db, projectId);
-      else await syncSplitProjectToHouseholds(db, projectId, { validate: false });
+      if (result.project.project_type !== "split") await cancelGeneratedForSource(db, projectId, undefined, { user });
+      else await syncSplitProjectToHouseholds(db, projectId, { validate: false, user });
       return json(result);
     }
     if (request.method === "DELETE") {
       await requireProjectRole(db, user, projectId, "owner");
-      await cancelGeneratedForSource(db, projectId);
+      await cancelGeneratedForSource(db, projectId, undefined, { user });
       return json(await deleteProject(db, projectId));
     }
     return methodNotAllowed(["GET", "PATCH", "DELETE"]);
@@ -315,13 +320,13 @@ async function dispatchProjects(request, db, url, path, user) {
   if (path[2] === "finalize" && path.length === 3) {
     return invoke(request, ["POST"], async () => {
       await requireProjectRole(db, user, projectId, "editor");
-      return finalizeProject(db, projectId);
+      return finalizeProject(db, projectId, user);
     });
   }
   if (path[2] === "reopen" && path.length === 3) {
     return invoke(request, ["POST"], async () => {
       await requireProjectRole(db, user, projectId, "editor");
-      return reopenProject(db, projectId);
+      return reopenProject(db, projectId, user);
     });
   }
   return json({ error: "not_found" }, 404);
@@ -346,13 +351,13 @@ async function dispatchProjectMembers(request, db, url, path, user) {
     if (request.method === "PATCH") {
       await requireProjectRole(db, user, projectId, "editor");
       const result = await updateProjectMember(db, path[3], await readJson(request), projectId);
-      await syncSplitProjectToHouseholds(db, projectId, { validate: false });
+      await syncSplitProjectToHouseholds(db, projectId, { validate: false, user });
       return json(result);
     }
     if (request.method === "DELETE") {
       await requireProjectRole(db, user, projectId, "editor");
       const result = await deleteProjectMember(db, path[3], projectId);
-      await syncSplitProjectToHouseholds(db, projectId, { validate: false });
+      await syncSplitProjectToHouseholds(db, projectId, { validate: false, user });
       return json(result);
     }
     return methodNotAllowed(["PATCH", "DELETE"]);
@@ -366,14 +371,14 @@ async function dispatchMember(request, db, path, user) {
     if (request.method === "PATCH") {
       await requireProjectRole(db, user, await projectIdForMember(db, memberId), "editor");
       const result = await updateProjectMember(db, memberId, await readJson(request));
-      await syncSplitProjectToHouseholds(db, result.project_member.project_id, { validate: false });
+      await syncSplitProjectToHouseholds(db, result.project_member.project_id, { validate: false, user });
       return json(result);
     }
     if (request.method === "DELETE") {
       await requireProjectRole(db, user, await projectIdForMember(db, memberId), "editor");
       const member = await memberProject(db, memberId);
       const result = await deleteProjectMember(db, memberId);
-      await syncSplitProjectToHouseholds(db, member.project_id, { validate: false });
+      await syncSplitProjectToHouseholds(db, member.project_id, { validate: false, user });
       return json(result);
     }
     return methodNotAllowed(["PATCH", "DELETE"]);
@@ -381,8 +386,12 @@ async function dispatchMember(request, db, path, user) {
   if (path.length === 3 && path[2] === "household-link") {
     return invoke(request, ["PATCH"], async () => {
       await requireProjectRole(db, user, await projectIdForMember(db, memberId), "editor");
-      const result = await updateMemberHouseholdLink(db, memberId, await readJson(request));
-      await syncSplitProjectToHouseholds(db, result.project_member.project_id, { validate: false });
+      const input = await readJson(request);
+      if (input?.action !== "unlink" && input?.household_project_id !== undefined) {
+        await requireProjectRole(db, user, input.household_project_id, "editor");
+      }
+      const result = await updateMemberHouseholdLink(db, memberId, input);
+      await syncSplitProjectToHouseholds(db, result.project_member.project_id, { validate: false, user });
       return json(result);
     });
   }
@@ -399,7 +408,7 @@ async function dispatchProjectTransactions(request, db, url, path, user) {
     if (request.method === "POST") {
       await requireProjectRole(db, user, projectId, "editor");
       const result = await createTransaction(db, projectId, await readJson(request));
-      await syncSplitTransactionToHouseholds(db, result.transaction.id, { validate: false });
+      await syncSplitTransactionToHouseholds(db, result.transaction.id, { validate: false, user });
       return json(result, 201);
     }
     return methodNotAllowed(["GET", "POST"]);
@@ -422,13 +431,13 @@ async function dispatchTransaction(request, db, path, user) {
     if (request.method === "PATCH") {
       await requireProjectRole(db, user, await projectIdForTransaction(db, transactionId), "editor");
       const result = await updateTransaction(db, transactionId, await readJson(request));
-      await syncSplitTransactionToHouseholds(db, transactionId, { validate: false });
+      await syncSplitTransactionToHouseholds(db, transactionId, { validate: false, user });
       return json(result);
     }
     if (request.method === "DELETE") {
       await requireProjectRole(db, user, await projectIdForTransaction(db, transactionId), "editor");
       const result = await deleteTransaction(db, transactionId);
-      await syncSplitTransactionToHouseholds(db, transactionId, { sourceProjectId: result.project_id, validate: false });
+      await syncSplitTransactionToHouseholds(db, transactionId, { sourceProjectId: result.project_id, validate: false, user });
       return json({ ok: true });
     }
     return methodNotAllowed(["GET", "PATCH", "DELETE"]);
@@ -450,7 +459,7 @@ async function dispatchTransaction(request, db, path, user) {
       return invoke(request, ["POST"], async () => {
         await requireProjectRole(db, user, await projectIdForTransaction(db, transactionId), "editor");
         const result = await createTransactionItem(db, transactionId, await readJson(request));
-        await syncSplitTransactionToHouseholds(db, transactionId, { validate: false });
+        await syncSplitTransactionToHouseholds(db, transactionId, { validate: false, user });
         return json(result, 201);
       });
     }
@@ -484,13 +493,13 @@ async function dispatchItem(request, db, path, user) {
     if (request.method === "PATCH") {
       await requireProjectRole(db, user, await projectIdForItem(db, itemId), "editor");
       const result = await updateTransactionItem(db, itemId, await readJson(request));
-      await syncSplitTransactionToHouseholds(db, result.transaction_item.transaction_id, { validate: false });
+      await syncSplitTransactionToHouseholds(db, result.transaction_item.transaction_id, { validate: false, user });
       return json(result);
     }
     if (request.method === "DELETE") {
       await requireProjectRole(db, user, await projectIdForItem(db, itemId), "editor");
       const result = await deleteTransactionItem(db, itemId);
-      await syncSplitTransactionToHouseholds(db, result.transaction_id, { sourceProjectId: result.project_id, validate: false });
+      await syncSplitTransactionToHouseholds(db, result.transaction_id, { sourceProjectId: result.project_id, validate: false, user });
       return json({ ok: true });
     }
     return methodNotAllowed(["PATCH", "DELETE"]);
@@ -503,7 +512,7 @@ async function replaceAllocations(request, db, itemId, user) {
   return invoke(request, ["PUT"], async () => {
     await requireProjectRole(db, user, await projectIdForItem(db, itemId), "editor");
     const result = await replaceItemAllocations(db, itemId, await readJson(request));
-    await syncSplitTransactionToHouseholds(db, result.transaction_id, { validate: false });
+    await syncSplitTransactionToHouseholds(db, result.transaction_id, { validate: false, user });
     return json(result);
   });
 }
@@ -535,7 +544,7 @@ async function dispatchProjectImports(request, db, url, path, user) {
         ? await importCall(() => createReceiptImport(db, projectId, body))
         : await importCall(() => createNotificationImport(db, projectId, body));
     }
-    await syncSplitProjectToHouseholds(db, projectId, { validate: false });
+    await syncSplitProjectToHouseholds(db, projectId, { validate: false, user });
     return json(result, 201);
   });
 }
@@ -544,7 +553,7 @@ function publicUser(user) {
   return { id: user.id, email: user.email, name: user.name };
 }
 
-async function handleReconcile(request, db, importId) {
+async function handleReconcile(request, db, importId, user) {
   const body = await readJson(request);
   validateReconcileInput(body);
   const record = await db.prepare("SELECT * FROM import_records WHERE id = ?").bind(importId).first();
@@ -564,25 +573,25 @@ async function handleReconcile(request, db, importId) {
     }
   }
   const result = await reconcileImport(db, record.project_id, importId, body);
-  await syncSplitProjectToHouseholds(db, record.project_id, { validate: false });
+  await syncSplitProjectToHouseholds(db, record.project_id, { validate: false, user });
   return json(result);
 }
 
-async function finalizeProject(db, projectId) {
+async function finalizeProject(db, projectId, user) {
   const project = await requireProject(db, projectId);
   if (project.project_type !== "split") throw new ApiError(409, "project_not_split");
   const validation = await validateSplitProject(db, project.id);
   if (!validation.valid) throw new ApiError(422, "invalid_project", { validation });
   const result = await markProjectFinalized(db, project.id);
-  const synchronization = await syncSplitProjectToHouseholds(db, project.id, { validate: false });
+  const synchronization = await syncSplitProjectToHouseholds(db, project.id, { validate: false, user });
   return json({ ...result, validation, synchronization });
 }
 
-async function reopenProject(db, projectId) {
+async function reopenProject(db, projectId, user) {
   const project = await requireProject(db, projectId);
   if (project.project_type !== "split") throw new ApiError(409, "project_not_split");
   const result = await markProjectReopened(db, projectId);
-  const synchronization = await syncSplitProjectToHouseholds(db, projectId, { validate: false });
+  const synchronization = await syncSplitProjectToHouseholds(db, projectId, { validate: false, user });
   return json({ ...result, synchronization });
 }
 
