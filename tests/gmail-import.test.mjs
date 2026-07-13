@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import { decryptRefreshToken, disconnectGmail, encryptRefreshToken, finishGmailOAuth, importCandidate, startGmailOAuth, syncGmail, updateCandidate } from "../functions/lib/gmail.js";
+import { decryptRefreshToken, disconnectGmail, encryptRefreshToken, finishGmailOAuth, importCandidate, retryGmailRevocations, startGmailOAuth, syncGmail, updateCandidate } from "../functions/lib/gmail.js";
 import { extractGmailText } from "../functions/lib/gmail-mime.js";
 import { parsePaymentNotification } from "../functions/lib/gmail-parsers.js";
 
@@ -15,7 +15,7 @@ class Statement {
   bind(...bindings) { return new Statement(this.database, this.sql, bindings); }
   async first() { return this.database.prepare(this.sql).get(...this.bindings) ?? null; }
   async all() { return { results: this.database.prepare(this.sql).all(...this.bindings) }; }
-  async run() { if(this.database.owner?.failSqlOnce&&this.sql.includes(this.database.owner.failSqlOnce)){this.database.owner.failSqlOnce=null;throw new Error("injected_statement_failure");}const value = this.database.prepare(this.sql).run(...this.bindings); return { meta: { changes: Number(value.changes) } }; }
+  async run() { if(this.database.owner?.beforeRunSql&&this.sql.includes(this.database.owner.beforeRunSql)){const beforeRun=this.database.owner.beforeRun;this.database.owner.beforeRunSql=null;this.database.owner.beforeRun=null;await beforeRun();}if(this.database.owner?.failSqlOnce&&this.sql.includes(this.database.owner.failSqlOnce)){this.database.owner.failSqlOnce=null;throw new Error("injected_statement_failure");}const value = this.database.prepare(this.sql).run(...this.bindings); return { meta: { changes: Number(value.changes) } }; }
 }
 class Database {
   constructor() { this.raw = new DatabaseSync(":memory:"); this.raw.exec(schema); }
@@ -183,12 +183,56 @@ test("sync revalidates its selected personal household against each sharing mech
   });}
 });
 
-test("failed revocation retains encrypted token for retry", async (t) => {
+test("sync batch leaves no message or candidate after account deletion starts", async (t) => {
+  const db=new Database();t.after(()=>db.close());seed(db);const now="2026-07-12T00:00:00.000Z";const env=environment(async(url)=>{if(String(url).includes("oauth2.googleapis.com/token"))return Response.json({access_token:"access-secret"});if(String(url).includes("/messages?"))return Response.json({messages:[{id:"deletion-message"}]});return Response.json({payload:{mimeType:"text/plain",headers:[{name:"From",value:"notice@jcb.co.jp"}],body:{data:base64Url("amount 1200 2026/07/10 shop")}}});});
+  const encrypted=await encryptRefreshToken(env,"deletion-sync","user-1","refresh-secret");db.raw.prepare("INSERT INTO gmail_connections (id,user_id,gmail_email,refresh_token_ciphertext,refresh_token_iv,key_generation,aad_version,status,created_at,updated_at) VALUES (?,?,?,?,?,?,1,'active',?,?)").run("deletion-sync","user-1","deletion@example.test",encrypted.ciphertext,encrypted.iv,1,now,now);
+  db.beforeBatch=async()=>db.raw.prepare("UPDATE users SET deletion_started_at=? WHERE id=?").run(now,"user-1");
+  const result=await syncGmail(db,env,{id:"user-1"},"deletion-sync",{days:7,limit:1});assert.equal(result.run.status,"failed");assert.equal(result.run.candidate_count,0);assert.equal(db.raw.prepare("SELECT count(*) AS n FROM gmail_messages").get().n,0);assert.equal(db.raw.prepare("SELECT count(*) AS n FROM gmail_import_candidates").get().n,0);
+});
+
+test("failed revocation leaves the connection disconnecting with its encrypted token", async (t) => {
   const db=new Database();t.after(()=>db.close());seed(db);const env=environment(async()=>new Response("unavailable",{status:503}));
   const encrypted=await encryptRefreshToken(env,"revoke-connection","user-1","refresh-secret");
   db.raw.prepare(`INSERT INTO gmail_connections (id,user_id,gmail_email,refresh_token_ciphertext,refresh_token_iv,key_generation,aad_version,status,created_at,updated_at) VALUES (?,?,?,?,?,?,1,'active',?,?)`).run("revoke-connection","user-1","revoke@example.test",encrypted.ciphertext,encrypted.iv,1,"2026-07-12T00:00:00.000Z","2026-07-12T00:00:00.000Z");
   await assert.rejects(()=>disconnectGmail(db,env,{id:"user-1"},"revoke-connection"),/gmail_revocation_failed/);
-  const row=db.raw.prepare("SELECT status,refresh_token_ciphertext FROM gmail_connections WHERE id=?").get("revoke-connection");assert.equal(row.status,"active");assert.equal(row.refresh_token_ciphertext,encrypted.ciphertext);
+  const row=db.raw.prepare("SELECT status,refresh_token_ciphertext FROM gmail_connections WHERE id=?").get("revoke-connection");assert.equal(row.status,"disconnecting");assert.equal(row.refresh_token_ciphertext,encrypted.ciphertext);
+});
+
+test("OAuth storage rejection revokes the acquired token without creating a connection or retry row", async (t) => {
+  const db=new Database();t.after(()=>db.close());seed(db);const calls=[];const env=environment(async(url)=>{calls.push(String(url));if(String(url).includes("/token"))return Response.json({access_token:"access-secret",refresh_token:"refresh-secret"});if(String(url).includes("/profile")){db.raw.prepare("UPDATE users SET deletion_started_at=? WHERE id=?").run("2026-07-12T00:00:00.000Z","user-1");return Response.json({emailAddress:"mail@example.test"});}return new Response(null,{status:200});});
+  const started=await startGmailOAuth(db,env,new Request("https://example.test/api/gmail/oauth/start"),{id:"user-1"},"personal-home");
+  await assert.rejects(()=>finishGmailOAuth(db,env,new Request(`https://example.test/api/gmail/oauth/callback?state=${encodeURIComponent(new URL(started.url).searchParams.get("state"))}&code=code`,{headers:{cookie:started.cookie.split(";",1)[0]}}),{id:"user-1"}),/account_unavailable/);
+  assert.equal(calls.filter(url=>url.includes("/revoke")).length,1);
+  assert.equal(db.raw.prepare("SELECT count(*) AS n FROM gmail_connections").get().n,0);
+  assert.equal(db.raw.prepare("SELECT count(*) AS n FROM gmail_revocation_retries").get().n,0);
+});
+
+test("OAuth revocation failure stores an encrypted retry and retry completion erases its ciphertext", async (t) => {
+  const db=new Database();t.after(()=>db.close());seed(db);let allowRevocation=false;const env=environment(async(url)=>{if(String(url).includes("/token"))return Response.json({access_token:"access-secret",refresh_token:"refresh-secret"});if(String(url).includes("/profile")){db.raw.prepare("UPDATE users SET deletion_started_at=? WHERE id=?").run("2026-07-12T00:00:00.000Z","user-1");return Response.json({emailAddress:"mail@example.test"});}return new Response(null,{status:allowRevocation?200:503});});
+  const started=await startGmailOAuth(db,env,new Request("https://example.test/api/gmail/oauth/start"),{id:"user-1"},"personal-home");
+  await assert.rejects(()=>finishGmailOAuth(db,env,new Request(`https://example.test/api/gmail/oauth/callback?state=${encodeURIComponent(new URL(started.url).searchParams.get("state"))}&code=code`,{headers:{cookie:started.cookie.split(";",1)[0]}}),{id:"user-1"}),/account_unavailable/);
+  const pending=db.raw.prepare("SELECT * FROM gmail_revocation_retries").get();
+  assert.equal(pending.status,"pending");assert.equal(Buffer.from(pending.token_iv,"base64").length,12);assert.notEqual(pending.token_ciphertext,"refresh-secret");assert.equal(pending.owner_user_id,"user-1");
+  assert.doesNotMatch(JSON.stringify(pending),/refresh-secret/);
+  allowRevocation=true;const retried=await retryGmailRevocations(db,env,{limit:10});assert.deepEqual(retried,{completed:1,failed:0});
+  const completed=db.raw.prepare("SELECT status,token_ciphertext,token_iv,completed_at FROM gmail_revocation_retries WHERE id=?").get(pending.id);assert.equal(completed.status,"completed");assert.equal(completed.token_ciphertext,"");assert.equal(completed.token_iv,"");assert.notEqual(completed.completed_at,null);
+});
+
+test("OAuth connection batch failure also queues a failed revocation", async (t) => {
+  const db=new Database();t.after(()=>db.close());seed(db);const env=environment(async(url)=>{if(String(url).includes("/token"))return Response.json({access_token:"access-secret",refresh_token:"refresh-secret"});if(String(url).includes("/profile"))return Response.json({emailAddress:"mail@example.test"});return new Response(null,{status:503});});
+  const started=await startGmailOAuth(db,env,new Request("https://example.test/api/gmail/oauth/start"),{id:"user-1"},"personal-home");db.failBatchAt=1;
+  await assert.rejects(()=>finishGmailOAuth(db,env,new Request(`https://example.test/api/gmail/oauth/callback?state=${encodeURIComponent(new URL(started.url).searchParams.get("state"))}&code=code`,{headers:{cookie:started.cookie.split(";",1)[0]}}),{id:"user-1"}),/injected_batch_failure/);
+  assert.equal(db.raw.prepare("SELECT count(*) AS n FROM gmail_connections").get().n,0);const retry=db.raw.prepare("SELECT status,token_ciphertext,token_iv FROM gmail_revocation_retries").get();assert.equal(retry.status,"pending");assert.notEqual(retry.token_ciphertext,"refresh-secret");assert.equal(Buffer.from(retry.token_iv,"base64").length,12);
+});
+
+test("disconnecting connections reject synchronization and successful retry erases the token", async (t) => {
+  const db=new Database();t.after(()=>db.close());seed(db);let available=false;const env=environment(async()=>new Response(null,{status:available?200:503}));const encrypted=await encryptRefreshToken(env,"disconnect-retry","user-1","refresh-secret");const now="2026-07-12T00:00:00.000Z";
+  db.raw.prepare("INSERT INTO gmail_connections (id,user_id,gmail_email,refresh_token_ciphertext,refresh_token_iv,key_generation,aad_version,status,created_at,updated_at) VALUES (?,?,?,?,?,?,1,'active',?,?)").run("disconnect-retry","user-1","retry@example.test",encrypted.ciphertext,encrypted.iv,1,now,now);
+  await assert.rejects(()=>disconnectGmail(db,env,{id:"user-1"},"disconnect-retry"),/gmail_revocation_failed/);
+  await assert.rejects(()=>syncGmail(db,env,{id:"user-1"},"disconnect-retry",{days:7,limit:1}),(error)=>error.status===409&&error.message==="gmail_connection_unavailable");
+  assert.equal(db.raw.prepare("SELECT count(*) AS n FROM gmail_sync_runs").get().n,0);
+  available=true;const result=await retryGmailRevocations(db,env,{limit:10});assert.deepEqual(result,{completed:1,failed:0});
+  const row=db.raw.prepare("SELECT status,refresh_token_ciphertext,refresh_token_iv FROM gmail_connections WHERE id=?").get("disconnect-retry");assert.deepEqual({...row},{status:"disconnected",refresh_token_ciphertext:"",refresh_token_iv:""});
 });
 
 test("shared household rejects Gmail candidate import", async (t) => {
@@ -219,6 +263,29 @@ test("candidate import rejects a role added between permission read and its writ
   assert.equal(db.raw.prepare("SELECT count(*) AS n FROM import_records WHERE project_id=?").get("personal-home").n,0);
   assert.equal(db.raw.prepare("SELECT count(*) AS n FROM transactions WHERE project_id=?").get("personal-home").n,0);
   assert.equal(db.raw.prepare("SELECT status FROM gmail_import_candidates WHERE id=?").get("race-candidate").status,"ready");
+});
+
+test("candidate import batch rejects account deletion started after its permission read", async (t) => {
+  const db=new Database();t.after(()=>db.close());seed(db);const now="2026-07-12T00:00:00.000Z";
+  db.raw.prepare("INSERT INTO project_members (id,project_id,display_name,role,is_active,created_at,updated_at) VALUES (?,?,?,?,?,?,?)").run("deletion-member","personal-home","Owner","owner",1,now,now);
+  db.raw.prepare("INSERT INTO gmail_connections (id,user_id,gmail_email,refresh_token_ciphertext,refresh_token_iv,key_generation,aad_version,status,created_at,updated_at) VALUES (?,?,?,?,?,?,1,'active',?,?)").run("deletion-import-connection","user-1","deletion-import@example.test","x","y",1,now,now);
+  db.raw.prepare("INSERT INTO gmail_sync_runs (id,connection_id,user_id,days,message_limit,status,started_at) VALUES (?,?,?,?,?,'completed',?)").run("deletion-import-run","deletion-import-connection","user-1",7,1,now);
+  db.raw.prepare("INSERT INTO gmail_messages (id,connection_id,gmail_message_id,sync_run_id,parse_status,created_at) VALUES (?,?,?,?,?,?)").run("deletion-import-message","deletion-import-connection","deletion-import-gmail","deletion-import-run","parsed",now);
+  db.raw.prepare("INSERT INTO gmail_import_candidates (id,connection_id,gmail_message_row_id,user_id,status,merchant_name,amount,occurred_at,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)").run("deletion-import-candidate","deletion-import-connection","deletion-import-message","user-1","ready","Shop",1000,now,now,now);
+  db.beforeBatch=async()=>db.raw.prepare("UPDATE users SET deletion_started_at=? WHERE id=?").run(now,"user-1");
+  await assert.rejects(()=>importCandidate(db,{id:"user-1"},"deletion-import-candidate",{project_id:"personal-home"}),/gmail_import_target_forbidden/);
+  assert.equal(db.raw.prepare("SELECT count(*) AS n FROM import_records").get().n,0);assert.equal(db.raw.prepare("SELECT count(*) AS n FROM transactions").get().n,0);assert.equal(db.raw.prepare("SELECT status FROM gmail_import_candidates WHERE id=?").get("deletion-import-candidate").status,"ready");
+});
+
+test("candidate edit detects a concurrent import and does not restore its prior status", async (t) => {
+  const db=new Database();t.after(()=>db.close());seed(db);const now="2026-07-12T00:00:00.000Z";
+  db.raw.prepare("INSERT INTO gmail_connections (id,user_id,gmail_email,refresh_token_ciphertext,refresh_token_iv,key_generation,aad_version,status,created_at,updated_at) VALUES (?,?,?,?,?,?,1,'active',?,?)").run("edit-race-connection","user-1","edit@example.test","x","y",1,now,now);
+  db.raw.prepare("INSERT INTO gmail_sync_runs (id,connection_id,user_id,days,message_limit,status,started_at) VALUES (?,?,?,?,?,'completed',?)").run("edit-race-run","edit-race-connection","user-1",7,1,now);
+  db.raw.prepare("INSERT INTO gmail_messages (id,connection_id,gmail_message_id,sync_run_id,parse_status,created_at) VALUES (?,?,?,?,?,?)").run("edit-race-message","edit-race-connection","edit-race-gmail","edit-race-run","parsed",now);
+  db.raw.prepare("INSERT INTO gmail_import_candidates (id,connection_id,gmail_message_row_id,user_id,status,merchant_name,amount,occurred_at,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)").run("edit-race-candidate","edit-race-connection","edit-race-message","user-1","ready","Before",1000,now,now,now);
+  db.beforeRunSql="UPDATE gmail_import_candidates SET merchant_name";db.beforeRun=async()=>db.raw.prepare("UPDATE gmail_import_candidates SET status='imported',updated_at=? WHERE id=?").run("2026-07-12T00:00:01.000Z","edit-race-candidate");
+  await assert.rejects(()=>updateCandidate(db,{id:"user-1"},"edit-race-candidate",{merchant_name:"After",status:"ready"}),(error)=>error.status===409&&error.message==="candidate_already_imported");
+  const row=db.raw.prepare("SELECT status,merchant_name FROM gmail_import_candidates WHERE id=?").get("edit-race-candidate");assert.deepEqual({...row},{status:"imported",merchant_name:"Before"});
 });
 
 test("sync remains available when a shared household and a personal household coexist", async (t) => {

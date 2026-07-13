@@ -253,10 +253,13 @@ BEFORE INSERT ON household_sync_guards
 WHEN NOT EXISTS (
   SELECT 1
   FROM project_user_roles
-  WHERE project_id = NEW.project_id
-    AND user_id = NEW.user_id
-    AND role IN ('owner', 'editor')
-    AND revoked_at IS NULL
+  JOIN users ON users.id = project_user_roles.user_id
+  WHERE project_user_roles.project_id = NEW.project_id
+    AND project_user_roles.user_id = NEW.user_id
+    AND project_user_roles.role IN ('owner', 'editor')
+    AND project_user_roles.revoked_at IS NULL
+    AND users.deleted_at IS NULL
+    AND users.deletion_started_at IS NULL
 )
 BEGIN
   SELECT RAISE(ABORT, 'household_sync_access_denied');
@@ -289,7 +292,7 @@ CREATE TABLE IF NOT EXISTS gmail_connections (
   id TEXT PRIMARY KEY, user_id TEXT NOT NULL, gmail_email TEXT NOT NULL,
   refresh_token_ciphertext TEXT NOT NULL, refresh_token_iv TEXT NOT NULL,
   key_generation INTEGER NOT NULL CHECK (key_generation > 0), aad_version INTEGER NOT NULL DEFAULT 1 CHECK (aad_version = 1),
-  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'reauthorization_required', 'disconnected')),
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'reauthorization_required', 'disconnecting', 'disconnected')),
   created_at TEXT NOT NULL, updated_at TEXT NOT NULL, last_synced_at TEXT,
   UNIQUE (user_id, gmail_email), FOREIGN KEY (user_id) REFERENCES users(id) ON UPDATE CASCADE ON DELETE CASCADE
 );
@@ -332,3 +335,13 @@ CREATE INDEX IF NOT EXISTS idx_gmail_sync_runs_connection ON gmail_sync_runs(con
 CREATE INDEX IF NOT EXISTS idx_gmail_messages_run ON gmail_messages(sync_run_id);
 CREATE INDEX IF NOT EXISTS idx_gmail_candidates_user_status ON gmail_import_candidates(user_id, status, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_gmail_candidates_amount_date ON gmail_import_candidates(user_id, amount, occurred_at);
+CREATE TABLE IF NOT EXISTS gmail_revocation_retries (
+  id TEXT PRIMARY KEY, owner_user_id TEXT NOT NULL,
+  source TEXT NOT NULL CHECK (source IN ('oauth_storage_rejected')),
+  token_ciphertext TEXT NOT NULL, token_iv TEXT NOT NULL,
+  key_generation INTEGER NOT NULL CHECK (key_generation > 0), aad_version INTEGER NOT NULL DEFAULT 1 CHECK (aad_version = 1),
+  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'completed')),
+  attempt_count INTEGER NOT NULL DEFAULT 1 CHECK (attempt_count >= 1), last_error_code TEXT,
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL, last_attempted_at TEXT NOT NULL, completed_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_gmail_revocation_retries_status ON gmail_revocation_retries(status, updated_at);

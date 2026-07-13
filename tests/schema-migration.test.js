@@ -13,6 +13,7 @@ const gmailMigrationSql = readFileSync(path.join(repositoryRoot, 'db', 'migratio
 const gmailOauthProjectMigrationSql = readFileSync(path.join(repositoryRoot, 'db', 'migrations', '0005_gmail_oauth_project.sql'), 'utf8');
 const accountDeletionMigrationSql = readFileSync(path.join(repositoryRoot, 'db', 'migrations', '0006_account_deletion.sql'), 'utf8');
 const householdSyncMigrationSql = readFileSync(path.join(repositoryRoot, 'db', 'migrations', '0007_household_sync_jobs.sql'), 'utf8');
+const gmailRevocationGuardsMigrationSql = readFileSync(path.join(repositoryRoot, 'db', 'migrations', '0008_gmail_revocation_guards.sql'), 'utf8');
 const verificationSql = readFileSync(path.join(repositoryRoot, 'db', 'verify_household_ledger.sql'), 'utf8');
 
 const runtimeTables = [
@@ -20,6 +21,7 @@ const runtimeTables = [
   'gmail_import_candidates',
   'gmail_messages',
   'gmail_oauth_states',
+  'gmail_revocation_retries',
   'gmail_sync_runs',
   'household_sync_guards',
   'household_sync_jobs',
@@ -44,6 +46,7 @@ const requestedIndexes = [
   'idx_gmail_connections_user',
   'idx_gmail_messages_run',
   'idx_gmail_oauth_states_expiry',
+  'idx_gmail_revocation_retries_status',
   'idx_gmail_sync_runs_connection',
   'idx_household_sync_jobs_source',
   'idx_household_sync_jobs_status',
@@ -240,7 +243,7 @@ function insertProject(database, values) {
     .run(...values);
 }
 
-test('fresh schema creates the seven runtime tables and requested indexes', (t) => {
+test('fresh schema creates the runtime tables and requested indexes', (t) => {
   const database = openDatabase(schemaSql);
   t.after(() => database.close());
 
@@ -260,6 +263,9 @@ test('fresh schema creates the seven runtime tables and requested indexes', (t) 
   assert.ok(transactionColumns.includes('origin_transaction_id'));
   assert.ok(transactionColumns.includes('origin_member_id'));
   assert.ok(transactionColumns.includes('generated_automatically'));
+  const connectionStatusSql = database.prepare("SELECT sql FROM sqlite_schema WHERE type='table' AND name='gmail_connections'").get().sql;
+  assert.match(connectionStatusSql, /disconnecting/);
+  assert.deepEqual(database.prepare('PRAGMA foreign_key_list(gmail_revocation_retries)').all(), []);
 
   const importTransactionKey = database
     .prepare('PRAGMA foreign_key_list(import_records)')
@@ -275,7 +281,7 @@ test('fresh schema creates the seven runtime tables and requested indexes', (t) 
 });
 
 test('numbered migrations create the runtime tables from an empty database', (t) => {
-  const database = openDatabase(`${baselineSql}\n${migrationSql}\n${authMigrationSql}\n${gmailMigrationSql}\n${gmailOauthProjectMigrationSql}\n${accountDeletionMigrationSql}\n${householdSyncMigrationSql}`);
+  const database = openDatabase(`${baselineSql}\n${migrationSql}\n${authMigrationSql}\n${gmailMigrationSql}\n${gmailOauthProjectMigrationSql}\n${accountDeletionMigrationSql}\n${householdSyncMigrationSql}\n${gmailRevocationGuardsMigrationSql}`);
   t.after(() => database.close());
 
   assert.deepEqual(tableNames(database), runtimeTables);
@@ -300,7 +306,7 @@ test('legacy migration preserves data and creates deterministic ledger rows', (t
   t.after(() => database.close());
   seedLegacyDatabase(database);
 
-  database.exec(`BEGIN IMMEDIATE;\n${migrationSql}\n${authMigrationSql}\n${gmailMigrationSql}\n${gmailOauthProjectMigrationSql}\n${accountDeletionMigrationSql}\n${householdSyncMigrationSql}\nCOMMIT;`);
+  database.exec(`BEGIN IMMEDIATE;\n${migrationSql}\n${authMigrationSql}\n${gmailMigrationSql}\n${gmailOauthProjectMigrationSql}\n${accountDeletionMigrationSql}\n${householdSyncMigrationSql}\n${gmailRevocationGuardsMigrationSql}\nCOMMIT;`);
 
   const freshDatabase = openDatabase(schemaSql);
   t.after(() => freshDatabase.close());

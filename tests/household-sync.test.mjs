@@ -498,3 +498,19 @@ test("target permission guards stop creation, updates, and cancellation after pr
     });
   }
 });
+
+test("household synchronization rejects derived writes after account deletion starts", async () => {
+  const { database, db } = createFixture();
+  try {
+    const user = grantFixtureAccess(database);
+    const before = generatedGraph(database);
+    db.beforeBatch = () => database.prepare("UPDATE users SET deletion_started_at = ? WHERE id = ?").run(now, user.id);
+    await assert.rejects(
+      () => syncSplitTransactionToHouseholds(db, "tx-source", { now, user, validate: false }),
+      /household_sync_access_denied/,
+    );
+    assert.deepEqual(generatedGraph(database), before);
+  } finally {
+    database.close();
+  }
+});

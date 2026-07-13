@@ -125,10 +125,13 @@ async function canWriteHousehold(db, user, projectId) {
     db,
     `SELECT 1 AS allowed
      FROM project_user_roles
-     WHERE project_id = ?
-       AND user_id = ?
-       AND role IN ('owner', 'editor')
-       AND revoked_at IS NULL
+     JOIN users ON users.id = project_user_roles.user_id
+     WHERE project_user_roles.project_id = ?
+       AND project_user_roles.user_id = ?
+       AND project_user_roles.role IN ('owner', 'editor')
+       AND project_user_roles.revoked_at IS NULL
+       AND users.deleted_at IS NULL
+       AND users.deletion_started_at IS NULL
      LIMIT 1`,
     [projectId, user.id],
   );
