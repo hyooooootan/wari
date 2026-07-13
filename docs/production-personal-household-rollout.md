@@ -61,6 +61,8 @@
 
 ## OAuth設定
 
+環境変数の用途、型、Secret名、Pages設定コマンドは`docs/production-oauth-configuration.md`に集約している。移行後検査には`db/verify_household_ledger.sql`と`db/verify_personal_households.sql`を使う。
+
 値そのものを本書へ記録せず、CloudflareとGoogle Cloud Consoleで人が確認する。
 
 ### Googleログイン
