@@ -95,22 +95,38 @@ async function testSession(db) {
   return db.session;
 }
 
-async function request(db, method, path, body, extraEnv = {}) {
+async function request(db, method, path, body, extraEnv = {}, options = {}) {
   const init = { method, headers: {} };
   if (db && extraEnv.auth !== false) {
-    const session = await testSession(db);
+    const session = options.session || await testSession(db);
     init.headers.cookie = `wari_session=${session.sessionId}; wari_csrf=${session.csrf}`;
     if (["POST", "PUT", "PATCH", "DELETE"].includes(method)) init.headers["x-csrf-token"] = session.csrf;
   }
+  if (["POST", "PUT", "PATCH", "DELETE"].includes(method) && !options.omitOrigin) init.headers.origin = "https://example.test";
   if (body !== undefined) {
     init.headers["content-type"] = "application/json";
     init.body = JSON.stringify(body);
   }
+  if (options.rawBody !== undefined) init.body = options.rawBody;
+  Object.assign(init.headers, options.headers);
   const response = await onRequest({
     request: new Request(`https://example.test${path}`, init),
-    env: { DB: db, ...extraEnv },
+    env: { DB: db, APP_ORIGIN: "https://example.test", ...extraEnv },
   });
   return { response, body: await response.json() };
+}
+
+async function createTestSession(db, userId) {
+  const now = "2026-07-12T00:00:00.000Z";
+  const sessionId = `${userId}-session`;
+  const csrf = `${userId}-csrf`;
+  db.database.prepare(`INSERT INTO users (
+    id, google_sub, email, name, created_at, updated_at
+  ) VALUES (?, ?, ?, ?, ?, ?)`).run(userId, `${userId}-sub`, `${userId}@example.test`, userId, now, now);
+  db.database.prepare(`INSERT INTO sessions (
+    id_hash, user_id, csrf_token, created_at, expires_at
+  ) VALUES (?, ?, ?, ?, ?)`).run(await sha256Hex(sessionId), userId, csrf, now, "2099-01-01T00:00:00.000Z");
+  return { sessionId, csrf };
 }
 
 async function createProject(db, project) {
@@ -287,7 +303,7 @@ test("household links require target edit access and revoked access blocks later
   assert.deepEqual({ ...afterDelete }, { paid_amount: 100, status: "provisional" });
 });
 
-test("failed derived synchronization is persisted, retried, and blocked after target access loss", async (t) => {
+test("failed derived synchronization retry validates requester, origin, and an empty JSON body", async (t) => {
   const db = new D1Database();
   t.after(() => db.close());
   await createProject(db, { id: "retry-home", name: "Retry home", project_type: "household" });
@@ -321,7 +337,64 @@ test("failed derived synchronization is persisted, retried, and blocked after ta
   assert.equal(pending.requested_by_user_id, "test-user");
   assert.equal(pending.attempt_count, 1);
 
-  const retried = await request(db, "POST", `/api/household-sync-jobs/${encodeURIComponent(pending.id)}/retry`);
+  const otherSession = await createTestSession(db, "other-retry-user");
+  const roleTimestamp = "2026-07-12T00:00:00.000Z";
+  for (const projectId of ["retry-home", "retry-split"]) {
+    db.database.prepare(
+      "INSERT INTO project_user_roles (project_id,user_id,role,created_at,updated_at) VALUES (?,?,?,?,?)",
+    ).run(projectId, "other-retry-user", "editor", roleTimestamp, roleTimestamp);
+  }
+  const otherUser = await request(db, "POST", `/api/household-sync-jobs/${encodeURIComponent(pending.id)}/retry`, {}, {}, { session: otherSession });
+  assert.equal(otherUser.response.status, 404);
+  assert.deepEqual(otherUser.body, { status: "not_found", job_id: pending.id });
+  assert.deepEqual(
+    { ...db.database.prepare("SELECT status,attempt_count FROM household_sync_jobs WHERE id = ?").get(pending.id) },
+    { status: "pending", attempt_count: 1 },
+  );
+  assert.equal(db.database.prepare("SELECT paid_amount FROM transactions WHERE id = ?").get(generatedId).paid_amount, 100);
+
+  const missingContentType = await request(db, "POST", `/api/household-sync-jobs/${encodeURIComponent(pending.id)}/retry`, undefined, {}, {
+    rawBody: new Uint8Array([123, 125]),
+  });
+  assert.equal(missingContentType.response.status, 415);
+  assert.deepEqual(missingContentType.body, { error: "unsupported_content_type" });
+  const form = await request(db, "POST", `/api/household-sync-jobs/${encodeURIComponent(pending.id)}/retry`, undefined, {}, {
+    rawBody: "value=1", headers: { "content-type": "application/x-www-form-urlencoded" },
+  });
+  assert.equal(form.response.status, 415);
+  assert.deepEqual(form.body, { error: "unsupported_content_type" });
+  const nonJson = await request(db, "POST", `/api/household-sync-jobs/${encodeURIComponent(pending.id)}/retry`, undefined, {}, {
+    rawBody: "value", headers: { "content-type": "text/plain" },
+  });
+  assert.equal(nonJson.response.status, 415);
+  assert.deepEqual(nonJson.body, { error: "unsupported_content_type" });
+  const missingOrigin = await request(db, "POST", `/api/household-sync-jobs/${encodeURIComponent(pending.id)}/retry`, {}, {}, { omitOrigin: true });
+  assert.equal(missingOrigin.response.status, 403);
+  assert.deepEqual(missingOrigin.body, { error: "invalid_origin" });
+  const mismatchedOrigin = await request(db, "POST", `/api/household-sync-jobs/${encodeURIComponent(pending.id)}/retry`, {}, {}, {
+    headers: { origin: "https://other.example.test" },
+  });
+  assert.equal(mismatchedOrigin.response.status, 403);
+  assert.deepEqual(mismatchedOrigin.body, { error: "invalid_origin" });
+  const extraJson = await request(db, "POST", `/api/household-sync-jobs/${encodeURIComponent(pending.id)}/retry`, { retry: true });
+  assert.equal(extraJson.response.status, 400);
+  assert.deepEqual(extraJson.body, { error: "unknown_field", field: "retry" });
+  const failedCsrf = await request(db, "POST", `/api/household-sync-jobs/${encodeURIComponent(pending.id)}/retry`, {}, {}, {
+    headers: { "x-csrf-token": "" },
+  });
+  assert.equal(failedCsrf.response.status, 403);
+  assert.deepEqual(failedCsrf.body, { error: "csrf_failed" });
+  const mismatchedCsrfCookie = await request(db, "POST", `/api/household-sync-jobs/${encodeURIComponent(pending.id)}/retry`, {}, {}, {
+    headers: { cookie: "wari_session=test-session; wari_csrf=wrong-csrf" },
+  });
+  assert.equal(mismatchedCsrfCookie.response.status, 403);
+  assert.deepEqual(mismatchedCsrfCookie.body, { error: "csrf_failed" });
+  const wrongMethod = await request(db, "GET", `/api/household-sync-jobs/${encodeURIComponent(pending.id)}/retry`);
+  assert.equal(wrongMethod.response.status, 405);
+  assert.equal(wrongMethod.response.headers.get("allow"), "POST");
+  assert.deepEqual(wrongMethod.body, { error: "method_not_allowed" });
+
+  const retried = await request(db, "POST", `/api/household-sync-jobs/${encodeURIComponent(pending.id)}/retry`, {});
   assert.equal(retried.response.status, 200);
   assert.equal(retried.body.status, "completed");
   assert.equal(db.database.prepare("SELECT paid_amount FROM transactions WHERE id = ?").get(generatedId).paid_amount, 40);
@@ -336,7 +409,7 @@ test("failed derived synchronization is persisted, retried, and blocked after ta
   db.database.prepare(
     "UPDATE project_user_roles SET revoked_at = ? WHERE project_id = 'retry-home' AND user_id = 'test-user'",
   ).run("2026-07-13T00:00:00.000Z");
-  const blocked = await request(db, "POST", `/api/household-sync-jobs/${encodeURIComponent(pending.id)}/retry`);
+  const blocked = await request(db, "POST", `/api/household-sync-jobs/${encodeURIComponent(pending.id)}/retry`, {});
   assert.equal(blocked.response.status, 200);
   assert.equal(blocked.body.status, "blocked");
   assert.equal(db.database.prepare("SELECT paid_amount FROM transactions WHERE id = ?").get(generatedId).paid_amount, 40);
@@ -347,7 +420,7 @@ test("failed derived synchronization is persisted, retried, and blocked after ta
   db.database.prepare(
     "UPDATE project_user_roles SET revoked_at = ? WHERE project_id = 'retry-split' AND user_id = 'test-user'",
   ).run("2026-07-13T00:00:01.000Z");
-  const sourceBlocked = await request(db, "POST", `/api/household-sync-jobs/${encodeURIComponent(pending.id)}/retry`);
+  const sourceBlocked = await request(db, "POST", `/api/household-sync-jobs/${encodeURIComponent(pending.id)}/retry`, {});
   assert.equal(sourceBlocked.response.status, 200);
   assert.equal(sourceBlocked.body.status, "blocked");
   assert.equal(db.database.prepare("SELECT paid_amount FROM transactions WHERE id = ?").get(generatedId).paid_amount, 40);

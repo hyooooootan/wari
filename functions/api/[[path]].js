@@ -140,6 +140,8 @@ async function dispatch(request, db, env, url, path) {
   if (path[0] === "gmail") return dispatchGmail(request, db, env, url, path, user);
   if (path[0] === "household-sync-jobs" && path.length === 3 && path[2] === "retry") {
     return invoke(request, ["POST"], async () => {
+      assertOrigin(request, env, { requireOrigin: true, requireJson: true });
+      assertAllowedBody(await readJson(request), new Set());
       const result = await retryHouseholdSyncJob(db, path[1], user);
       return json(result, result.status === "not_found" ? 404 : 200);
     });

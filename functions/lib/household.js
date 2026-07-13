@@ -996,15 +996,14 @@ async function updateRetryFailure(db, job, status, errorCode, now) {
 export async function retryHouseholdSyncJob(db, jobId, user, options = {}) {
   const job = await loadSyncJob(db, jobId);
   if (!job) return { status: "not_found", job_id: jobId };
+  if (user.id !== job.requested_by_user_id) return { status: "not_found", job_id: jobId };
   const now = nowValue(options);
   const sourceProject = await loadProject(db, job.source_project_id);
   if (!sourceProject) {
-    if (user.id !== job.requested_by_user_id) return { status: "not_found", job_id: jobId };
     const rejected = await updateRetryFailure(db, job, "rejected", "source_project_not_found", now);
     return { status: "rejected", sync_pending: false, job_id: rejected.id };
   }
   if (!await canWriteHousehold(db, user, job.source_project_id)) {
-    if (user.id !== job.requested_by_user_id) return { status: "not_found", job_id: jobId };
     const blocked = await updateRetryFailure(db, job, "blocked", "source_access_lost", now);
     return { status: "blocked", sync_pending: false, job_id: blocked.id };
   }
