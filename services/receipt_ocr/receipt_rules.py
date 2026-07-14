@@ -42,6 +42,7 @@ def parse_receipt(lines):
     ranked = score_candidates(candidates, validations, lines)
     total = select_amount(ranked, "total")
     subtotal = select_amount(ranked, "subtotal")
+    tax = select_amount(ranked, "tax")
     paid_at, paid_time, date_warning = guess_datetime("\n".join(line.text for line in lines))
     if date_warning:
         warnings.append(date_warning)
@@ -62,6 +63,7 @@ def parse_receipt(lines):
         "store_name": guess_store_name(lines),
         "total_amount": total.value if total else None,
         "subtotal_amount": subtotal.value if subtotal else None,
+        "tax_amount": tax.value if tax else None,
         "paid_at": paid_at,
         "paid_time": paid_time,
         "items": items,
@@ -87,7 +89,11 @@ def extract_amount_candidates(lines, warnings):
     for index, line in enumerate(lines):
         row = row_text(lines, line)
         kind = classify_amount_row(row)
-        for raw in re.findall(r"(?:[¥￥]\s*)?([0-9OIl]{1,3}(?:,[0-9OIl]{3})+|[0-9OIl]{2,7})", row):
+        product_code_spans = product_code_ranges(row)
+        for match in re.finditer(r"(?:[¥￥]\s*)?([0-9OIl]{1,3}(?:,[0-9OIl]{3})+|[0-9OIl]{2,7})", row):
+            raw = match.group(1)
+            if any(start <= match.start(1) < end for start, end in product_code_spans):
+                continue
             normalized = normalize_amount_token(raw)
             if normalized is None:
                 continue
@@ -96,7 +102,8 @@ def extract_amount_candidates(lines, warnings):
                 correction_warnings.add(f"金額候補 {raw} を {value:,} 円として扱いました。")
             if is_identifier_row(row, value):
                 continue
-            candidates.append(AmountCandidate(value, kind, index, row, float(line.confidence), float(line.x), float(line.y)))
+            candidate_kind = "item" if kind == "unknown" and product_code_spans else kind
+            candidates.append(AmountCandidate(value, candidate_kind, index, row, float(line.confidence), float(line.x), float(line.y)))
     warnings.extend(sorted(correction_warnings))
     return unique_candidates(candidates)
 
@@ -121,7 +128,12 @@ def is_identifier_row(text, value):
     return value >= 100000 and re.search(r"[A-Z]\d{8,}|\d{10,}", text)
 
 
+def product_code_ranges(text):
+    return [match.span(1) for match in re.finditer(r"(?<!\d)(\d{5,8})(?=\s*[*＊])", text)]
+
+
 def classify_amount_row(text):
+    text = re.sub(r"\s+", "", text)
     if contains_any(text, DEPOSIT_LABELS):
         return "deposit"
     if contains_any(text, CHANGE_LABELS):
@@ -174,7 +186,7 @@ def matches(left, right):
 
 
 def group_by_kind(candidates):
-    result = {kind: [] for kind in ("total", "subtotal", "tax", "discount", "deposit", "change", "unknown")}
+    result = {kind: [] for kind in ("total", "subtotal", "tax", "discount", "deposit", "change", "item", "unknown")}
     for candidate in candidates:
         result[candidate.kind].append(candidate)
     return result
@@ -212,7 +224,8 @@ def select_amount(candidates, kind):
         return matches_for_kind[0]
     if kind == "total":
         unknown = [candidate for candidate in candidates if candidate.kind == "unknown"]
-        return unknown[0] if unknown else None
+        if len(unknown) == 1:
+            return unknown[0]
     return None
 
 
@@ -257,11 +270,24 @@ def guess_datetime(text):
 
 
 def row_text(lines, target):
-    row = [line for line in lines if abs(line.y - target.y) <= max(10, target.h * 0.8)]
+    heights = sorted(max(1.0, line.h) for line in lines)
+    median_height = heights[len(heights) // 2] if heights else 10
+    tolerance = max(4.0, median_height * 0.45)
+    target_center = target.y + target.h / 2
+    row = [line for line in lines if abs((line.y + line.h / 2) - target_center) <= tolerance]
     return " ".join(line.text for line in sorted(row, key=lambda line: line.x))
 
 
 def guess_store_name(lines):
+    for index, line in enumerate(lines[:12]):
+        match = re.search(r"([^\s\d]{2,}店)", line.text)
+        if not match:
+            continue
+        location = match.group(1)
+        brands = [candidate.text.strip() for candidate in lines[max(0, index - 4) : index] if 2 <= len(candidate.text.strip()) <= 24 and not re.search(r"\d|TEL|FAX", candidate.text, re.I) and (re.search(r"[\u3040-\u30ff\u3400-\u9fff]", candidate.text) or len(candidate.text.strip()) >= 4)]
+        if brands:
+            return f"{brands[-1]} {location}"
+        return location
     candidates = []
     for line in lines[:10]:
         text = line.text.strip()
@@ -279,14 +305,14 @@ def guess_items(lines):
     processed_rows = set()
     for index, line in enumerate(lines):
         row = row_text(lines, line)
-        row_key = round(line.y / max(8, line.h))
+        row_key = round((line.y + line.h / 2) / max(6, line.h * 0.45))
         if row_key in processed_rows:
             continue
         processed_rows.add(row_key)
         if line.y >= stop_y or contains_any(row, NON_ITEM_LABELS) or is_identifier_row(row, 0):
             continue
         amounts = [token[0] for token in (normalize_amount_token(raw) for raw in re.findall(r"(?:[¥￥]\s*)?([0-9OIl]{1,3}(?:,[0-9OIl]{3})+|[0-9OIl]{2,7})", row)) if token]
-        name = re.sub(r"(?:[¥￥]\s*)?[0-9OIl]{1,3}(?:,[0-9OIl]{3})+|(?:[¥￥]\s*)?[0-9OIl]{2,7}", "", row).strip(" ※")
+        name = re.sub(r"(?:[¥￥]\s*)?[0-9OIl]{1,3}(?:,[0-9OIl]{3})+|(?:[¥￥]\s*)?[0-9OIl]{2,7}", "", row).strip(" ※*＊")
         if amounts and len(name) >= 2:
             items.append({"name": name, "amount": amounts[-1], "source_index": index})
     return [{"name": item["name"], "amount": item["amount"]} for item in items[:30]]

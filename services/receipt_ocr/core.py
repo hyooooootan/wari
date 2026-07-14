@@ -11,6 +11,7 @@ from pathlib import Path
 os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
 
 import numpy as np
+import cv2
 from PIL import Image, ImageEnhance, ImageOps
 from paddlex import create_model
 from pillow_heif import register_heif_opener
@@ -26,7 +27,7 @@ TEXT_DET_LIMIT = int(os.environ.get("LOCAL_OCR_DET_LIMIT", "480"))
 TEXT_DET_MODEL = os.environ.get("LOCAL_OCR_DET_MODEL", "PP-OCRv5_mobile_det")
 TEXT_REC_MODEL = os.environ.get("LOCAL_OCR_REC_MODEL", "PP-OCRv6_small_rec")
 TEXT_REC_BATCH_SIZE = int(os.environ.get("LOCAL_OCR_BATCH_SIZE", "8"))
-MAX_OCR_ATTEMPTS = max(1, min(2, int(os.environ.get("LOCAL_OCR_MAX_ATTEMPTS", "2"))))
+MAX_OCR_ATTEMPTS = max(1, min(4, int(os.environ.get("LOCAL_OCR_MAX_ATTEMPTS", "3"))))
 _OCR = None
 
 register_heif_opener()
@@ -90,18 +91,30 @@ def read_receipt_from_data_url(image_data_url):
 
 def read_receipt_from_path(source_path):
     source_path = Path(source_path)
-    prepared_path = source_path.with_suffix(".prepared.png")
     started_at = time.monotonic()
+    prepared_paths = []
     try:
-        prepare_image(source_path, prepared_path, vertical_range=(0.0, 0.72))
+        prepared_path = source_path.with_suffix(".prepared.png")
+        prepared_paths.append(prepared_path)
+        prepare_image(source_path, prepared_path, vertical_range=(0.0, 0.78), variant="contrast")
         lines = run_paddle(prepared_path)
         parsed = parse_receipt_with_rules(lines)
         if MAX_OCR_ATTEMPTS > 1 and (parsed.get("total_amount") is None or parsed.get("needs_review")):
             band_path = source_path.with_suffix(".total-band.png")
-            prepare_image(source_path, band_path, vertical_range=(0.42, 0.9))
+            prepared_paths.append(band_path)
+            prepare_image(source_path, band_path, vertical_range=(0.42, 0.98), variant="contrast")
             band_lines = run_paddle(band_path)
             parsed = merge_receipt_results(parsed, parse_receipt_with_rules(band_lines))
             lines.extend(band_lines)
+        for variant in ("clahe", "adaptive")[: max(0, MAX_OCR_ATTEMPTS - 2)]:
+            if not parsed.get("needs_review"):
+                break
+            variant_path = source_path.with_suffix(f".{variant}.png")
+            prepared_paths.append(variant_path)
+            prepare_image(source_path, variant_path, vertical_range=(0.0, 0.98), variant=variant)
+            variant_lines = run_paddle(variant_path)
+            parsed = select_better_result(parsed, parse_receipt_with_rules(variant_lines))
+            lines.extend(variant_lines)
         parsed["model"] = "paddleocr-onnxruntime"
         parsed["processing_time_ms"] = round((time.monotonic() - started_at) * 1000)
         parsed["ocr_lines"] = [
@@ -110,7 +123,7 @@ def read_receipt_from_path(source_path):
         ]
         return parsed
     finally:
-        for path in (prepared_path, source_path.with_suffix(".total-band.png")):
+        for path in prepared_paths:
             try:
                 path.unlink(missing_ok=True)
             except OSError:
@@ -127,16 +140,67 @@ def decode_data_url(image_data_url):
     return f".{ext}", base64.b64decode(match.group(2), validate=True)
 
 
-def prepare_image(source_path, output_path, vertical_range=(0.0, 0.72)):
+def prepare_image(source_path, output_path, vertical_range=(0.0, 0.72), variant="contrast"):
     image = ImageOps.exif_transpose(Image.open(source_path)).convert("RGB")
+    image = orient_receipt(image)
+    image = rectify_receipt(image)
     image = crop_likely_receipt(image)
     top_ratio, bottom_ratio = vertical_range
     top = max(0, min(image.height - 1, int(image.height * top_ratio)))
     bottom = max(top + 1, min(image.height, int(image.height * bottom_ratio)))
     image = image.crop((0, top, image.width, bottom))
     image.thumbnail((MAX_OCR_SIDE, MAX_OCR_SIDE), Image.Resampling.LANCZOS)
-    image = ImageEnhance.Contrast(image).enhance(1.2)
+    image = enhance_receipt(image, variant)
     image.save(output_path)
+
+
+def orient_receipt(image):
+    if image.width <= image.height * 1.25:
+        return image
+    clockwise = image.transpose(Image.Transpose.ROTATE_270)
+    counterclockwise = image.transpose(Image.Transpose.ROTATE_90)
+    return max((clockwise, counterclockwise), key=receipt_orientation_score)
+
+
+def receipt_orientation_score(image):
+    array = np.asarray(image.convert("L"))
+    dark = array < 160
+    projection = dark.sum(axis=1)
+    return float(np.percentile(projection, 90) - np.median(projection))
+
+
+def rectify_receipt(image):
+    array = np.asarray(image)
+    gray = cv2.cvtColor(array, cv2.COLOR_RGB2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(blur, 40, 130)
+    contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    minimum_area = array.shape[0] * array.shape[1] * 0.16
+    for contour in sorted(contours, key=cv2.contourArea, reverse=True):
+        if cv2.contourArea(contour) < minimum_area:
+            break
+        polygon = cv2.approxPolyDP(contour, 0.02 * cv2.arcLength(contour, True), True)
+        if len(polygon) != 4:
+            continue
+        warped = warp_quad(array, polygon.reshape(4, 2))
+        if warped is not None and warped.shape[0] > 180 and warped.shape[1] > 100:
+            return Image.fromarray(warped)
+    return image
+
+
+def enhance_receipt(image, variant):
+    if variant == "contrast":
+        return ImageEnhance.Contrast(image).enhance(1.35)
+    array = np.asarray(image)
+    gray = cv2.cvtColor(array, cv2.COLOR_RGB2GRAY)
+    if variant == "clahe":
+        enhanced = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8)).apply(gray)
+    elif variant == "adaptive":
+        denoised = cv2.fastNlMeansDenoising(gray, None, 7, 7, 21)
+        enhanced = cv2.adaptiveThreshold(denoised, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 9)
+    else:
+        enhanced = gray
+    return Image.fromarray(cv2.cvtColor(enhanced, cv2.COLOR_GRAY2RGB))
 
 
 def crop_likely_receipt(image):
@@ -162,9 +226,32 @@ def crop_likely_receipt(image):
     top = max(0, int((min(ys) - 2) * scale_y))
     right = min(image.width, int((max(xs) + 3) * scale_x))
     bottom = min(image.height, int((max(ys) + 3) * scale_y))
-    if (right - left) < image.width * 0.2 or (bottom - top) < image.height * 0.2:
+    if (right - left) < image.width * 0.16 or (bottom - top) < image.height * 0.65:
         return image
     return image.crop((left, top, right, bottom))
+
+
+def order_quad(points):
+    points = np.asarray(points, dtype=np.float32)
+    sums = points.sum(axis=1)
+    differences = np.diff(points, axis=1).reshape(-1)
+    return np.array([
+        points[np.argmin(sums)],
+        points[np.argmin(differences)],
+        points[np.argmax(sums)],
+        points[np.argmax(differences)],
+    ], dtype=np.float32)
+
+
+def warp_quad(array, points):
+    source = order_quad(points)
+    width = int(max(np.linalg.norm(source[2] - source[3]), np.linalg.norm(source[1] - source[0])))
+    height = int(max(np.linalg.norm(source[1] - source[2]), np.linalg.norm(source[0] - source[3])))
+    if width < 2 or height < 2:
+        return None
+    destination = np.array([[0, 0], [width - 1, 0], [width - 1, height - 1], [0, height - 1]], dtype=np.float32)
+    matrix = cv2.getPerspectiveTransform(source, destination)
+    return cv2.warpPerspective(array, matrix, (width, height), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
 
 
 def get_ocr():
@@ -188,8 +275,8 @@ def run_paddle(image_path):
         x, y, w, h = box_metrics(None, polygon)
         if w < 2 or h < 2:
             continue
-        crop = image.crop((max(0, int(x)), max(0, int(y)), min(image.width, int(x + w) + 1), min(image.height, int(y + h) + 1)))
-        recognized = next(recognizer.predict(np.asarray(crop)))
+        crop = crop_text_polygon(np.asarray(image), polygon, x, y, w, h)
+        recognized = next(recognizer.predict(crop))
         text = normalize_text(recognized.get("rec_text", ""))
         if not text:
             continue
@@ -197,6 +284,15 @@ def run_paddle(image_path):
         det_score = float(detection_scores[index]) if index < len(detection_scores) else rec_score
         lines.append(OcrLine(text=text, confidence=min(rec_score, det_score), x=x, y=y, w=w, h=h))
     return sorted(lines, key=lambda line: (line.y, line.x))
+
+
+def crop_text_polygon(array, polygon, x, y, w, h):
+    points = np.asarray(polygon, dtype=np.float32)
+    if points.shape == (4, 2):
+        warped = warp_quad(array, points)
+        if warped is not None:
+            return warped
+    return array[max(0, int(y)) : min(array.shape[0], int(y + h) + 1), max(0, int(x)) : min(array.shape[1], int(x + w) + 1)]
 
 
 def box_metrics(box, poly):
@@ -245,7 +341,7 @@ def parse_receipt(lines):
 
 def merge_receipt_results(primary, fallback):
     merged = dict(primary)
-    for key in ("total_amount", "subtotal_amount", "paid_at", "paid_time"):
+    for key in ("total_amount", "subtotal_amount", "tax_amount", "paid_at", "paid_time"):
         field_key = "paid_at" if key in ("paid_at", "paid_time") else key
         primary_score = primary.get("field_confidence", {}).get(field_key, 0)
         fallback_score = fallback.get("field_confidence", {}).get(field_key, 0)
@@ -258,6 +354,16 @@ def merge_receipt_results(primary, fallback):
             merged[key] = fallback.get(key, merged.get(key))
     merged["confidence"] = max(primary.get("confidence", 0), fallback.get("confidence", 0))
     return merged
+
+
+def select_better_result(primary, candidate):
+    def quality(result):
+        fields = result.get("field_confidence", {})
+        return fields.get("total_amount", 0) * 3 + fields.get("subtotal_amount", 0) + fields.get("paid_at", 0) + fields.get("items", 0)
+
+    if quality(candidate) > quality(primary):
+        return candidate
+    return primary
 
 
 def lines_before_payment(lines):

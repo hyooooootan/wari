@@ -54,6 +54,17 @@ class ReceiptRulesTest(unittest.TestCase):
         self.assertEqual(result["total_amount"], 450)
         self.assertGreaterEqual(result["field_confidence"]["total_amount"], 0.7)
 
+    def test_product_code_is_not_selected_as_total_or_item_amount(self):
+        result = parse_receipt(lines("012356*チキンねぎ塩焼 ¥344", "合計 ¥5,382"))
+        self.assertEqual(result["total_amount"], 5382)
+        self.assertEqual(result["items"], [{"name": "チキンねぎ塩焼", "amount": 344}])
+
+    def test_spaced_total_label_is_recognized(self):
+        result = parse_receipt(lines("小 計 4,984", "外税計 398", "合 計 ¥5,382"))
+        self.assertEqual(result["subtotal_amount"], 4984)
+        self.assertEqual(result["tax_amount"], 398)
+        self.assertEqual(result["total_amount"], 5382)
+
 
 if __name__ == "__main__":
     unittest.main()

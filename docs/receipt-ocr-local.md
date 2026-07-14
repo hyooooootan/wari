@@ -4,9 +4,11 @@ Oracle A1 では `OCR_BACKEND=local` を使います。PaddleOCR が文字列と
 
 HEIC/HEIF は `pillow-heif` で開きます。ブラウザから送る元画像、A1 側の画像データ URL、画像本体の各経路で同じ形式を扱えます。
 
+EXIF 回転、横向き写真の向き補正、紙面四隅の射影補正、コントラスト調整、局所コントラスト補正、適応的二値化を使います。紙の折れ目で隠れた文字は復元せず、確認表示に回します。
+
 ## 実行環境
 
-`scripts/oracle_a1_bootstrap_wari_ocr.sh` は Ubuntu または Oracle Linux で Python 仮想環境、PaddleOCR、PaddlePaddle、Pillow を準備し、`wari-receipt-ocr` を登録します。サービスは `127.0.0.1:4190` で待ち受けます。外部公開には Cloudflare Tunnel を使い、Oracle の受信規則で 4190 番を公開しません。
+`scripts/oracle_a1_bootstrap_wari_ocr.sh` は Ubuntu または Oracle Linux で Python 仮想環境、PP-OCR の ONNX モデル実行環境、Pillow を準備し、`wari-receipt-ocr` を登録します。サービスは `127.0.0.1:4190` で待ち受けます。外部公開には Cloudflare Tunnel を使い、Oracle の受信規則で 4190 番を公開しません。
 
 Cloudflare Pages Functions と A1 の双方に同じ `RECEIPT_OCR_SHARED_SECRET` を設定します。秘密値、OCI API 鍵、SSH 秘密鍵をリポジトリや出力へ入れません。
 
@@ -32,12 +34,12 @@ RECEIPT_OCR_SHARED_SECRET=<Cloudflare と同じ秘密値>
 LOCAL_OCR_MAX_SIDE=1600
 LOCAL_OCR_DET_LIMIT=1280
 LOCAL_OCR_BATCH_SIZE=4
-LOCAL_OCR_MAX_ATTEMPTS=2
+LOCAL_OCR_MAX_ATTEMPTS=3
 RECEIPT_OCR_REVIEW_THRESHOLD=0.68
 RECEIPT_OCR_AMOUNT_TOLERANCE=1
 ```
 
-再試行は初回結果で合計が取れない、または確認表示になった場合に限り、合計欄の画像帯域を一回追加で認識します。連続的な OCR 実行は行いません。
+再試行は初回結果で合計が取れない、または確認表示になった場合に限り、合計欄の画像帯域、局所コントラスト補正、適応的二値化を順に試します。連続的な OCR 実行は行いません。
 
 ## 確認
 
