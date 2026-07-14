@@ -52,17 +52,20 @@ function seed(db) {
   db.raw.prepare("INSERT INTO projects (id,name,project_type,owner_user_id,created_at,updated_at) VALUES (?,?,?,?,?,?)").run("personal-home","Personal","household","user-1",now,now);
 }
 
-async function syncFixture(messageBodies, existing = []) {
+async function syncFixture(messageBodies, existing = [], options = {}) {
   const db = new Database();
   seed(db);
   const now = "2026-07-12T00:00:00.000Z";
   let detailCalls = 0;
   const env = environment(async (url) => {
     if (String(url).includes("oauth2.googleapis.com/token")) return Response.json({ access_token: "access-secret" });
-    if (String(url).includes("/messages?")) return Response.json({ messages: Object.keys(messageBodies).map((id) => ({ id })) });
+    if (String(url).includes("/messages?")) {
+      options.onList?.(new URL(String(url)));
+      return Response.json({ messages: Object.keys(messageBodies).map((id) => ({ id })) });
+    }
     const id = decodeURIComponent(String(url).split("/messages/")[1].split("?")[0]);
     detailCalls += 1;
-    return Response.json({ payload: { mimeType: "text/plain", headers: [{ name: "From", value: "notice@example.test" }, { name: "Date", value: "Fri, 10 Jul 2026 12:30:00 +0900" }], body: { data: base64Url(messageBodies[id]) } } });
+    return Response.json({ internalDate: options.internalDate, payload: { mimeType: "text/plain", headers: [{ name: "From", value: "notice@example.test" }, { name: "Date", value: options.dateHeader || "Fri, 10 Jul 2026 12:30:00 +0900" }], body: { data: base64Url(messageBodies[id]) } } });
   });
   const encrypted = await encryptRefreshToken(env, "sync-fixture-connection", "user-1", "refresh-secret");
   db.raw.prepare("INSERT INTO gmail_connections (id,user_id,household_project_id,gmail_email,refresh_token_ciphertext,refresh_token_iv,key_generation,aad_version,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,1,'active',?,?)").run("sync-fixture-connection", "user-1", "personal-home", "mail@example.test", encrypted.ciphertext, encrypted.iv, 1, now, now);
@@ -101,6 +104,7 @@ test("Gmail sync passes a stable query and page token across pages", async (t) =
   assert.equal(requests.length, 2);
   assert.equal(requests[0].searchParams.get("maxResults"), "40");
   assert.equal(requests[1].searchParams.get("maxResults"), "40");
+  assert.equal(requests[0].searchParams.get("q"), 'after:' + first.query_after + ' from:statement@vpass.ne.jp -subject:"一定金額到達のお知らせ"');
   assert.equal(requests[0].searchParams.get("q"), requests[1].searchParams.get("q"));
   assert.equal(requests[1].searchParams.get("pageToken"), "next-page");
   assert.equal(first.has_more, true);
@@ -205,7 +209,7 @@ test("multiple message and candidate writes roll back together and permit a late
   const db=new Database();t.after(()=>db.close());seed(db);const env=environment(async(url)=>{
     if(String(url).includes("oauth2.googleapis.com/token"))return Response.json({access_token:"access-secret"});
     if(String(url).includes("/messages?"))return Response.json({messages:[{id:"retry-message-1"},{id:"retry-message-2"}]});
-    return Response.json({payload:{mimeType:"text/plain",headers:[{name:"From",value:"notice@jcb.co.jp"}],body:{data:base64Url("amount 1200 2026/07/10 shop")}}});
+    return Response.json({internalDate:"1760000000000",payload:{mimeType:"text/plain",headers:[{name:"From",value:"notice@jcb.co.jp"}],body:{data:base64Url("amount 1200 2026/07/10 shop")}}});
   });
   const encrypted=await encryptRefreshToken(env,"retry-connection","user-1","refresh-secret");
   db.raw.prepare(`INSERT INTO gmail_connections (id,user_id,household_project_id,gmail_email,refresh_token_ciphertext,refresh_token_iv,key_generation,aad_version,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,1,'active',?,?)`).run("retry-connection","user-1","personal-home","retry@example.test",encrypted.ciphertext,encrypted.iv,1,"2026-07-12T00:00:00.000Z","2026-07-12T00:00:00.000Z");
@@ -362,7 +366,7 @@ test("nested mixed and alternative MIME prefers plain text and decodes Base64URL
   const text = extractGmailText(payload);
   assert.match(text, /1,280円/);
   assert.doesNotMatch(text, /HTML only/);
-  const parsed = parsePaymentNotification(text, { from:"notice@paypay.ne.jp" });
+  const parsed = parsePaymentNotification(text, { from:"notice@paypay.ne.jp", received_at:"2026-07-10T03:04:05.000Z" });
   assert.equal(parsed.amount, 1280);
   assert.equal(parsed.merchant_name, "テスト商店");
   assert.equal(parsed.provider, "paypay");
@@ -447,8 +451,8 @@ test("parallel candidate imports create one transaction and return the same resu
 test("payment parsing requires a nonzero body amount and distinguishes review states", () => {
   assert.equal(parsePaymentNotification("newsletter", { date:"Fri, 10 Jul 2026 12:30:00 +0900" }).parse_status, "parse_error");
   assert.equal(parsePaymentNotification("merchant: Shop\ndate: 2026/07/10", {}).parse_status, "parse_error");
-  assert.equal(parsePaymentNotification("amount: 1200\ndate: 2026/07/10", {}).parse_status, "needs_review");
-  assert.equal(parsePaymentNotification("amount: 1200\nmerchant: Shop\ndate: 2026/07/10", {}).parse_status, "parsed");
+  assert.equal(parsePaymentNotification("amount: 1200\ndate: 2026/07/10", { received_at:"2026-07-10T03:04:05.000Z" }).parse_status, "needs_review");
+  assert.equal(parsePaymentNotification("amount: 1200\nmerchant: Shop\ndate: 2026/07/10", { received_at:"2026-07-10T03:04:05.000Z" }).parse_status, "parsed");
   assert.equal(parsePaymentNotification("amount: 0\nmerchant: Shop\ndate: 2026/07/10", {}).parse_status, "parse_error");
 });
 
@@ -489,7 +493,7 @@ test("sync reparses existing messages without candidates and preserves all count
   t.after(() => review.db.close());
   const reviewResult = await syncGmail(review.db, review.env, { id: "user-1" }, "sync-fixture-connection", { days: 7, limit: 10 });
   assert.equal(reviewResult.run.candidate_count, 1);
-  assert.equal(review.db.raw.prepare("SELECT status FROM gmail_import_candidates").get().status, "needs_review");
+  assert.equal(review.db.raw.prepare("SELECT status FROM gmail_import_candidates").get().status, "ready");
 
   const error = await syncFixture({ "reparse-error": "newsletter" }, [["reparse-error", false]]);
   t.after(() => error.db.close());
@@ -507,4 +511,41 @@ test("sync reparses existing messages without candidates and preserves all count
   t.after(() => mixed.db.close());
   const mixedResult = await syncGmail(mixed.db, mixed.env, { id: "user-1" }, "sync-fixture-connection", { days: 7, limit: 10 });
   assert.deepEqual({ listed: mixedResult.run.listed_count, processed: mixedResult.run.processed_count, candidates: mixedResult.run.candidate_count, duplicates: mixedResult.run.duplicate_count }, { listed: 2, processed: 2, candidates: 1, duplicates: 0 });
+});
+
+test("Gmail received time uses internalDate before the Date header and ignores body dates", async (t) => {
+  const internal = await syncFixture({ internal: "amount: 1200\nmerchant: Shop\ndate: 2000/01/01" }, [], { internalDate: "1760000000000", dateHeader: "Fri, 10 Jul 2026 12:30:00 +0900" });
+  t.after(() => internal.db.close());
+  const result = await syncGmail(internal.db, internal.env, { id: "user-1" }, "sync-fixture-connection", { days: 7, limit: 1 });
+  const expected = new Date(1760000000000).toISOString();
+  assert.equal(result.candidate_count, 1);
+  assert.equal(internal.db.raw.prepare("SELECT received_at FROM gmail_messages").get().received_at, expected);
+  assert.equal(internal.db.raw.prepare("SELECT occurred_at FROM gmail_import_candidates").get().occurred_at, expected);
+
+  const fallback = await syncFixture({ fallback: "amount: 1200\nmerchant: Shop\ndate: 2000/01/01" }, [], { internalDate: "invalid", dateHeader: "Fri, 10 Jul 2026 12:30:00 +0900" });
+  t.after(() => fallback.db.close());
+  await syncGmail(fallback.db, fallback.env, { id: "user-1" }, "sync-fixture-connection", { days: 7, limit: 1 });
+  assert.equal(fallback.db.raw.prepare("SELECT occurred_at FROM gmail_import_candidates").get().occurred_at, "2026-07-10T03:30:00.000Z");
+});
+
+test("SMBC cumulative and threshold notices become hidden ignored candidates and are not fetched again", async (t) => {
+  const fixture = await syncFixture({ notice: "対象期間内のご利用累計金額が一定金額に到達しました\nご利用累計金額\n75,855円\n通知設定金額 70,000円" });
+  t.after(() => fixture.db.close());
+  const first = await syncGmail(fixture.db, fixture.env, { id: "user-1" }, "sync-fixture-connection", { days: 7, limit: 1 });
+  assert.equal(first.candidate_count, 0);
+  assert.equal(first.ignored_count, 1);
+  assert.equal(fixture.db.raw.prepare("SELECT status,amount FROM gmail_import_candidates").get().status, "ignored");
+  assert.equal(fixture.db.raw.prepare("SELECT amount FROM gmail_import_candidates").get().amount, null);
+  assert.equal(fixture.detailCalls(), 1);
+  const second = await syncGmail(fixture.db, fixture.env, { id: "user-1" }, "sync-fixture-connection", { days: 7, limit: 1 });
+  assert.equal(second.candidate_count, 0);
+  assert.equal(second.ignored_count, 0);
+  assert.equal(second.duplicate_count, 1);
+  assert.equal(fixture.detailCalls(), 1);
+});
+
+test("payment amount parsing excludes billing and cumulative labels", () => {
+  assert.equal(parsePaymentNotification("ご利用累計金額\n75,855円\n通知設定金額 70,000円", { received_at: "2026-07-10T00:00:00.000Z" }).parse_status, "ignored");
+  assert.equal(parsePaymentNotification("請求金額: 75,855円", { received_at: "2026-07-10T00:00:00.000Z" }).parse_status, "parse_error");
+  assert.equal(parsePaymentNotification("ご利用金額: 1,200円\n利用先: Shop", { received_at: "2026-07-10T00:00:00.000Z" }).parse_status, "parsed");
 });

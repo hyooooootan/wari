@@ -89,3 +89,13 @@ test("Gmail sync paginates sequentially to 1000 items without exposing page toke
   assert.match(source, /if \(syncButton\) syncButton\.disabled = true/);
   assert.doesNotMatch(source, /toast\([^\n]*pageToken/);
 });
+
+test("Gmail sync refreshes candidates after every page and shows SMBC progress", () => {
+  assert.match(source, /const gmailSyncProgress = new Map\(\)/);
+  assert.match(source, /await refreshGmailImport\(false\);\s*render\(\);\s*renderGmailProgress\(\);/);
+  assert.match(source, /Gmail同期中\\n確認済み:/);
+  assert.match(source, /新規候補: \$\{progress\.candidate_count\}件/);
+  assert.match(source, /除外: \$\{progress\.ignored_count\}件/);
+  assert.match(source, /取込対象: 三井住友カード/);
+  assert.match(source, /同期完了: 検索\$\{totals\.listed_count\}件、新規候補\$\{totals\.candidate_count\}件、重複\$\{totals\.duplicate_count\}件、除外\$\{totals\.ignored_count\}件/);
+});
