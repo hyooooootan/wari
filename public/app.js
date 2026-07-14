@@ -2153,18 +2153,6 @@ document.addEventListener("click", async (event) => {
       const days = Number(document.querySelector(`[data-gmail-days="${CSS.escape(button.dataset.gmailSync)}"]`)?.value || 30);
       await syncGmailImport(button.dataset.gmailSync, days);
       return;
-      if (false) {
-        try {
-        const result = await Api.syncGmail(button.dataset.gmailSync, days, 100);
-        toast(gmailSyncMessage(result?.run));
-      } catch (error) {
-        toast(error.message || "Gmail同期を実行できませんでした");
-      } finally {
-        await refreshGmailImport();
-      }
-        }
-      }
-      return;
     }
     if (button.dataset.gmailDisconnect) {
       await Api.disconnectGmail(button.dataset.gmailDisconnect);
