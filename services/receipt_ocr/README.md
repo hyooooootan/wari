@@ -113,6 +113,18 @@ For existing Wari compatibility, the service also includes:
 
 ## Other backends
 
+PaddleOCR local backend on Oracle A1:
+
+```bash
+pip install -r services/receipt_ocr/requirements-local.txt
+export OCR_BACKEND=local
+export OCR_HOST=127.0.0.1
+export RECEIPT_OCR_SHARED_SECRET='Cloudflare と同じ秘密値'
+python -m services.receipt_ocr.api
+```
+
+See `docs/receipt-ocr-local.md` for the rule parser, review fields, and A1 settings.
+
 Gemini image OCR:
 
 ```bash

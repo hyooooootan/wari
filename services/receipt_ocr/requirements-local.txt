@@ -1,3 +1,5 @@
 paddleocr
-paddlepaddle
+paddlex
+onnxruntime
 pillow
+pillow-heif

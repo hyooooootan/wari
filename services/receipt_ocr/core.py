@@ -3,22 +3,33 @@ import json
 import os
 import re
 import tempfile
+import time
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 
 os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
-os.environ.setdefault("PADDLE_PDX_ENABLE_MKLDNN_BYDEFAULT", "0")
 
+import numpy as np
 from PIL import Image, ImageEnhance, ImageOps
-from paddleocr import PaddleOCR
+from paddlex import create_model
+from pillow_heif import register_heif_opener
+
+try:
+    from services.receipt_ocr.receipt_rules import parse_receipt as parse_receipt_with_rules
+except ImportError:
+    from receipt_rules import parse_receipt as parse_receipt_with_rules
 
 
 MAX_OCR_SIDE = int(os.environ.get("LOCAL_OCR_MAX_SIDE", "720"))
 TEXT_DET_LIMIT = int(os.environ.get("LOCAL_OCR_DET_LIMIT", "480"))
-TEXT_DET_MODEL = os.environ.get("LOCAL_OCR_DET_MODEL", "PP-OCRv6_tiny_det")
+TEXT_DET_MODEL = os.environ.get("LOCAL_OCR_DET_MODEL", "PP-OCRv5_mobile_det")
 TEXT_REC_MODEL = os.environ.get("LOCAL_OCR_REC_MODEL", "PP-OCRv6_small_rec")
+TEXT_REC_BATCH_SIZE = int(os.environ.get("LOCAL_OCR_BATCH_SIZE", "8"))
+MAX_OCR_ATTEMPTS = max(1, min(2, int(os.environ.get("LOCAL_OCR_MAX_ATTEMPTS", "2"))))
 _OCR = None
+
+register_heif_opener()
 
 TEXT_CORRECTIONS = {
     "=FamilyMart": "FamilyMart",
@@ -78,18 +89,21 @@ def read_receipt_from_data_url(image_data_url):
 
 
 def read_receipt_from_path(source_path):
+    source_path = Path(source_path)
     prepared_path = source_path.with_suffix(".prepared.png")
+    started_at = time.monotonic()
     try:
         prepare_image(source_path, prepared_path, vertical_range=(0.0, 0.72))
         lines = run_paddle(prepared_path)
-        parsed = parse_receipt(lines)
-        if parsed.get("total_amount") is None:
+        parsed = parse_receipt_with_rules(lines)
+        if MAX_OCR_ATTEMPTS > 1 and (parsed.get("total_amount") is None or parsed.get("needs_review")):
             band_path = source_path.with_suffix(".total-band.png")
             prepare_image(source_path, band_path, vertical_range=(0.42, 0.9))
             band_lines = run_paddle(band_path)
-            parsed = merge_receipt_results(parsed, parse_receipt(band_lines))
+            parsed = merge_receipt_results(parsed, parse_receipt_with_rules(band_lines))
             lines.extend(band_lines)
-        parsed["model"] = "paddleocr-local"
+        parsed["model"] = "paddleocr-onnxruntime"
+        parsed["processing_time_ms"] = round((time.monotonic() - started_at) * 1000)
         parsed["ocr_lines"] = [
             {"text": line.text, "confidence": line.confidence, "x": line.x, "y": line.y, "w": line.w, "h": line.h}
             for line in lines
@@ -114,8 +128,7 @@ def decode_data_url(image_data_url):
 
 
 def prepare_image(source_path, output_path, vertical_range=(0.0, 0.72)):
-    image = Image.open(source_path).convert("RGB")
-    image = ImageOps.exif_transpose(image)
+    image = ImageOps.exif_transpose(Image.open(source_path)).convert("RGB")
     image = crop_likely_receipt(image)
     top_ratio, bottom_ratio = vertical_range
     top = max(0, min(image.height - 1, int(image.height * top_ratio)))
@@ -157,34 +170,32 @@ def crop_likely_receipt(image):
 def get_ocr():
     global _OCR
     if _OCR is None:
-        _OCR = PaddleOCR(
-            lang="japan",
-            use_doc_orientation_classify=False,
-            use_doc_unwarping=False,
-            use_textline_orientation=False,
-            text_detection_model_name=TEXT_DET_MODEL,
-            text_recognition_model_name=TEXT_REC_MODEL,
-            text_det_limit_side_len=TEXT_DET_LIMIT,
-            text_det_limit_type="max",
-            text_recognition_batch_size=16,
+        _OCR = (
+            create_model(TEXT_DET_MODEL, engine="onnxruntime", device="cpu"),
+            create_model(TEXT_REC_MODEL, engine="onnxruntime", device="cpu"),
         )
     return _OCR
 
 
 def run_paddle(image_path):
-    result = get_ocr().predict(str(image_path))
+    detector, recognizer = get_ocr()
+    detection = next(detector.predict(str(image_path)))
+    image = Image.open(image_path).convert("RGB")
     lines = []
-    for page in result:
-        texts = page.get("rec_texts", [])
-        scores = page.get("rec_scores", [])
-        boxes = page.get("rec_boxes", [])
-        polys = page.get("rec_polys", [])
-        for i, text in enumerate(texts):
-            text = normalize_text(text)
-            if not text:
-                continue
-            x, y, w, h = box_metrics(boxes[i] if i < len(boxes) else None, polys[i] if i < len(polys) else None)
-            lines.append(OcrLine(text=text, confidence=float(scores[i]), x=x, y=y, w=w, h=h))
+    polygons = detection.get("dt_polys", [])
+    detection_scores = detection.get("dt_scores", [])
+    for index, polygon in enumerate(polygons):
+        x, y, w, h = box_metrics(None, polygon)
+        if w < 2 or h < 2:
+            continue
+        crop = image.crop((max(0, int(x)), max(0, int(y)), min(image.width, int(x + w) + 1), min(image.height, int(y + h) + 1)))
+        recognized = next(recognizer.predict(np.asarray(crop)))
+        text = normalize_text(recognized.get("rec_text", ""))
+        if not text:
+            continue
+        rec_score = float(recognized.get("rec_score", 0.0))
+        det_score = float(detection_scores[index]) if index < len(detection_scores) else rec_score
+        lines.append(OcrLine(text=text, confidence=min(rec_score, det_score), x=x, y=y, w=w, h=h))
     return sorted(lines, key=lambda line: (line.y, line.x))
 
 
@@ -235,10 +246,16 @@ def parse_receipt(lines):
 def merge_receipt_results(primary, fallback):
     merged = dict(primary)
     for key in ("total_amount", "subtotal_amount", "paid_at", "paid_time"):
-        if merged.get(key) is None and fallback.get(key) is not None:
+        field_key = "paid_at" if key in ("paid_at", "paid_time") else key
+        primary_score = primary.get("field_confidence", {}).get(field_key, 0)
+        fallback_score = fallback.get("field_confidence", {}).get(field_key, 0)
+        if fallback.get(key) is not None and (merged.get(key) is None or fallback_score > primary_score):
             merged[key] = fallback[key]
     if not merged.get("items") and fallback.get("items"):
         merged["items"] = fallback["items"]
+    if fallback.get("confidence", 0) > primary.get("confidence", 0):
+        for key in ("field_confidence", "needs_review", "warnings", "validations", "notes"):
+            merged[key] = fallback.get(key, merged.get(key))
     merged["confidence"] = max(primary.get("confidence", 0), fallback.get("confidence", 0))
     return merged
 

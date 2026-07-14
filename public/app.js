@@ -1925,13 +1925,16 @@ async function handleSplitReceipt(input) {
     if (!project) throw new Error("プロジェクトを選択してください");
     const result = await readReceiptFile(input.files[0], project.id);
     receipt.items = (result.items || []).map((item) => ({ name: String(item.name || "").trim(), amount: integer(item.amount) })).filter((item) => item.name && item.amount > 0);
-    receipt.status = `${receipt.items.length}件を読み取りました`;
-    receipt.type = "success";
+    const warnings = Array.isArray(result.warnings) ? result.warnings.filter(Boolean) : [];
+    receipt.status = result.needs_review
+      ? `${receipt.items.length}件を読み取りました。内容を確認してください。${warnings[0] ? ` ${warnings[0]}` : ""}`
+      : `${receipt.items.length}件を読み取りました`;
+    receipt.type = result.needs_review ? "warning" : "success";
     const scope = target === "createSplit" ? "createSplit" : "split";
     if (result.store_name) ui.drafts[scope].store = result.store_name;
     if (result.total_amount) ui.drafts[scope].amount = String(integer(result.total_amount));
     render();
-    toast("レシートを読み取りました");
+    toast(result.needs_review ? "レシートの読み取り結果を確認してください" : "レシートを読み取りました");
   } catch (error) {
     receipt.status = error.message || "読み取れませんでした";
     receipt.type = "error";

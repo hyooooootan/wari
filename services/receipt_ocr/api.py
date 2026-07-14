@@ -62,7 +62,9 @@ class ReceiptOcrHandler(BaseHTTPRequestHandler):
 
         try:
             result = self.read_ocr_request()
-            result.pop("ocr_lines", None)
+            if os.environ.get("OCR_DEBUG_OUTPUT", "").lower() not in ("1", "true", "yes"):
+                result.pop("ocr_lines", None)
+                result.pop("amount_candidates", None)
             self.send_json(200, result)
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
