@@ -181,11 +181,11 @@ export async function syncGmail(db, env, user, connectionId, input = {}) {
     const pending=[];
     for (const item of messages) {
       const exists=await db.prepare(`SELECT m.id,c.id AS candidate_id FROM gmail_messages m LEFT JOIN gmail_import_candidates c ON c.gmail_message_row_id=m.id WHERE m.connection_id=? AND m.gmail_message_id=?`).bind(connectionId,item.id).first();
-      if(exists?.candidate_id){duplicates++;continue;}
+      if(exists){duplicates++;continue;}
       try {
         const message=await googleJson(env,`https://gmail.googleapis.com/gmail/v1/users/me/messages/${encodeURIComponent(item.id)}?format=full`,token.access_token);
         const headers=Object.fromEntries((message.payload?.headers||[]).map(h=>[String(h.name).toLowerCase(),h.value]));
-        const parsed=parsePaymentNotification(extractGmailText(message.payload),headers); const messageRowId=exists?.id||crypto.randomUUID(); const candidateId=crypto.randomUUID();
+        const parsed=parsePaymentNotification(extractGmailText(message.payload),headers); const messageRowId=exists?.id||crypto.randomUUID(); const candidateId=parsed.parse_status === "parse_error" ? null : crypto.randomUUID();
         const warning=parsed.amount!==null&&parsed.occurred_at?await duplicateWarning(db,user.id,parsed.amount,parsed.occurred_at):0;
         const now=new Date().toISOString();
         pending.push({ exists: Boolean(exists), messageRowId, candidateId, gmailMessageId:item.id, parsed,
@@ -202,12 +202,14 @@ export async function syncGmail(db, env, user, connectionId, input = {}) {
       for(const record of pending){
         if(!record.exists){statements.push(db.prepare(`INSERT INTO gmail_messages (id,connection_id,gmail_message_id,sync_run_id,parse_status,provider,received_at,created_at)
           SELECT ?,?,?,?,?,?,?,? WHERE EXISTS(${personalSql}) AND EXISTS(${syncWriteSql})`).bind(record.messageRowId,connectionId,record.gmailMessageId,runId,record.parsed.parse_status,record.parsed.provider,record.receivedAt,record.now,...personalBindings,...syncWriteBindings));}
-        statements.push(db.prepare(`INSERT INTO gmail_import_candidates (id,connection_id,gmail_message_row_id,user_id,status,provider,merchant_name,amount,occurred_at,payment_method,external_transaction_id,duplicate_warning,created_at,updated_at)
-          SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,? WHERE EXISTS(${personalSql}) AND EXISTS(${syncWriteSql})`).bind(record.candidateId,connectionId,record.messageRowId,user.id,record.parsed.parse_status === "parsed" ? "ready" : record.parsed.parse_status,record.parsed.provider,record.parsed.merchant_name,record.parsed.amount,record.parsed.occurred_at,record.parsed.payment_method,record.parsed.external_transaction_id,record.warning,record.now,record.now,...personalBindings,...syncWriteBindings));
+        if(record.candidateId){
+          statements.push(db.prepare(`INSERT INTO gmail_import_candidates (id,connection_id,gmail_message_row_id,user_id,status,provider,merchant_name,amount,occurred_at,payment_method,external_transaction_id,duplicate_warning,created_at,updated_at)
+            SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,? WHERE EXISTS(${personalSql}) AND EXISTS(${syncWriteSql})`).bind(record.candidateId,connectionId,record.messageRowId,user.id,record.parsed.parse_status === "parsed" ? "ready" : record.parsed.parse_status,record.parsed.provider,record.parsed.merchant_name,record.parsed.amount,record.parsed.occurred_at,record.parsed.payment_method,record.parsed.external_transaction_id,record.warning,record.now,record.now,...personalBindings,...syncWriteBindings));
+        }
       }
       const results=await db.batch(statements);
       if(!changedRows(results[0]))throw new ApiError(403,"gmail_personal_household_lost");
-      processed+=pending.length;candidates+=pending.length;
+      processed+=pending.length;candidates+=pending.filter((record)=>record.candidateId).length;
     }
   } catch(error) {
     errors++; errorCode=safeErrorCode(error); status=error?.status===401?"reauthorization_required":error?.status===429?"rate_limited":"failed";
@@ -228,7 +230,8 @@ export async function updateCandidate(db,user,id,input){const row=await ownedCan
   const updated=await db.prepare(`UPDATE gmail_import_candidates SET merchant_name=?,amount=?,occurred_at=?,payment_method=?,external_transaction_id=?,status=?,updated_at=? WHERE id=? AND user_id=? AND updated_at=? AND imported_project_id IS NULL AND import_record_id IS NULL AND status IN ('needs_review','ready','ignored','parse_error') AND EXISTS(${activeUserExistsSql()})`).bind(next.merchant_name,next.amount,next.occurred_at,next.payment_method,next.external_transaction_id,next.status,new Date().toISOString(),id,user.id,row.updated_at,user.id).run();if(!changedRows(updated)){const current=await ownedCandidate(db,user,id);if(current.status==="imported"||current.imported_project_id||current.import_record_id)throw new ApiError(409,"candidate_already_imported");throw new ApiError(409,"candidate_update_conflict");}return{candidate:await ownedCandidate(db,user,id)};}
 export async function importCandidate(db,user,id){const candidate=await ownedCandidate(db,user,id);const projectId=bounded(candidate.household_project_id,"household_project_id",128);if(candidate.status==="imported"||candidate.imported_project_id||candidate.import_record_id)return importedCandidateResult(db,candidate,projectId);if(candidate.status==="ignored")throw new ApiError(409,"candidate_not_importable");
   await requirePersonalHousehold(db,user.id,projectId,"gmail_import_target_forbidden");
-  if(!candidate.merchant_name||candidate.amount===null||!candidate.occurred_at)throw new ApiError(409,"candidate_incomplete");
+  const merchantName=String(candidate.merchant_name||"").trim();
+  if(!merchantName||!Number.isSafeInteger(candidate.amount)||candidate.amount===0||!candidate.occurred_at)throw new ApiError(409,"candidate_incomplete");
   const message=await db.prepare("SELECT gmail_message_id FROM gmail_messages WHERE id=?").bind(candidate.gmail_message_row_id).first();
   if(!message)throw new ApiError(409,"candidate_incomplete");
   const sourceRecordId=`gmail:${candidate.connection_id}:${message.gmail_message_id}`;
@@ -238,7 +241,7 @@ export async function importCandidate(db,user,id){const candidate=await ownedCan
   const timestamp=new Date().toISOString();
   const occurredAt=normalizeDate(candidate.occurred_at);
   if(!occurredAt)throw new ApiError(409,"candidate_incomplete");
-  const normalizedMerchant=normalizeMerchantName(candidate.merchant_name);
+  const normalizedMerchant=normalizeMerchantName(merchantName);
   const paymentMethod=schemaPaymentMethod(candidate.payment_method);
   const status=candidate.amount<0?"refunded":"provisional";
   const entryType=candidate.amount<0?"refund":"purchase";
@@ -251,12 +254,12 @@ export async function importCandidate(db,user,id){const candidate=await ownedCan
   const unimportedBindings=[id,user.id,candidate.updated_at,...personalBindings,user.id];
   const statements=[];
   if(!existingImport){statements.push(db.prepare(`INSERT INTO import_records (id,project_id,transaction_id,source_type,source_record_id,source_status,merchant_raw,merchant_normalized,gross_amount_raw,paid_amount_raw,occurred_at_raw,settled_at_raw,payment_method_raw,external_transaction_id,image_url,raw_text,raw_payload,parse_confidence,parser_version,match_score,match_reason_json,created_at,updated_at)
-    SELECT ?,?,NULL,'gmail_notification',?,'parsed',?,?,?,?,?,NULL,?,?,NULL,NULL,NULL,NULL,NULL,NULL,NULL,?,? WHERE ${unimportedGuard}`).bind(importId,projectId,sourceRecordId,candidate.merchant_name,normalizedMerchant,candidate.amount,candidate.amount,occurredAt,normalizePaymentMethod(candidate.payment_method),candidate.external_transaction_id,timestamp,timestamp,...unimportedBindings));}
+    SELECT ?,?,NULL,'gmail_notification',?,'parsed',?,?,?,?,?,NULL,?,?,NULL,NULL,NULL,NULL,NULL,NULL,NULL,?,? WHERE ${unimportedGuard}`).bind(importId,projectId,sourceRecordId,merchantName,normalizedMerchant,candidate.amount,candidate.amount,occurredAt,normalizePaymentMethod(candidate.payment_method),candidate.external_transaction_id,timestamp,timestamp,...unimportedBindings));}
   const claimResultIndex=statements.length;
   statements.push(db.prepare(`UPDATE gmail_import_candidates SET imported_project_id=?,import_record_id=?,updated_at=? WHERE id=? AND user_id=? AND updated_at=? AND imported_project_id IS NULL AND import_record_id IS NULL AND status IN ('needs_review','ready','parse_error') AND EXISTS(SELECT 1 FROM import_records WHERE id=? AND project_id=?) AND EXISTS(${personalSql}) AND EXISTS(${activeUserExistsSql()})`).bind(projectId,importId,timestamp,id,user.id,candidate.updated_at,importId,projectId,...personalBindings,user.id));
   if(!existingImport?.transaction_id){
     statements.push(db.prepare(`INSERT INTO transactions (id,project_id,merchant_name,merchant_normalized,gross_amount,paid_amount,discount_amount,point_amount,category,status,occurred_at,settled_at,note,entry_type,origin_project_id,origin_transaction_id,origin_member_id,generated_automatically,created_at,updated_at)
-      SELECT ?,?,?,?,?,?,0,0,NULL,?,?,NULL,NULL,?,NULL,NULL,NULL,1,?,? WHERE ${candidateGuard} AND EXISTS(SELECT 1 FROM import_records WHERE id=? AND transaction_id IS NULL)`).bind(transactionId,projectId,candidate.merchant_name,normalizedMerchant,candidate.amount,candidate.amount,status,occurredAt,entryType,timestamp,timestamp,...guardBindings,importId));
+      SELECT ?,?,?,?,?,?,0,0,NULL,?,?,NULL,NULL,?,NULL,NULL,NULL,1,?,? WHERE ${candidateGuard} AND EXISTS(SELECT 1 FROM import_records WHERE id=? AND transaction_id IS NULL)`).bind(transactionId,projectId,merchantName,normalizedMerchant,candidate.amount,candidate.amount,status,occurredAt,entryType,timestamp,timestamp,...guardBindings,importId));
     const summaryId=`gmail-summary:${importId}`;
     statements.push(db.prepare(`INSERT INTO transaction_items (id,transaction_id,name,amount,quantity,item_type,category,sort_order,is_hidden,created_at,updated_at)
       SELECT ?,?,'Total',?,1,'summary',NULL,0,0,?,? WHERE ${candidateGuard} AND EXISTS(SELECT 1 FROM transactions WHERE id=?)`).bind(summaryId,transactionId,candidate.amount,timestamp,timestamp,...guardBindings,transactionId));

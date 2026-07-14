@@ -380,3 +380,37 @@ test("parallel candidate imports create one transaction and return the same resu
   const results=await Promise.all([importCandidate(db,{id:"user-1"},"parallel-candidate",{project_id:"personal-home"}),importCandidate(db,{id:"user-1"},"parallel-candidate",{project_id:"personal-home"})]);
   assert.equal(results[0].import.id,results[1].import.id);assert.equal(results[0].transaction.id,results[1].transaction.id);assert.equal(db.raw.prepare("SELECT count(*) AS n FROM transactions").get().n,1);
 });
+
+test("payment parsing requires a nonzero body amount and distinguishes review states", () => {
+  assert.equal(parsePaymentNotification("newsletter", { date:"Fri, 10 Jul 2026 12:30:00 +0900" }).parse_status, "parse_error");
+  assert.equal(parsePaymentNotification("merchant: Shop\ndate: 2026/07/10", {}).parse_status, "parse_error");
+  assert.equal(parsePaymentNotification("amount: 1200\ndate: 2026/07/10", {}).parse_status, "needs_review");
+  assert.equal(parsePaymentNotification("amount: 1200\nmerchant: Shop\ndate: 2026/07/10", {}).parse_status, "parsed");
+  assert.equal(parsePaymentNotification("amount: 0\nmerchant: Shop\ndate: 2026/07/10", {}).parse_status, "parse_error");
+});
+
+test("sync records non-payment messages without creating candidates and skips them on resync", async (t) => {
+  const db=new Database();t.after(()=>db.close());seed(db);const now="2026-07-12T00:00:00.000Z";
+  const env=environment(async(url)=>{
+    if(String(url).includes("oauth2.googleapis.com/token"))return Response.json({access_token:"access-secret"});
+    if(String(url).includes("/messages?"))return Response.json({messages:[{id:"newsletter-message"}]});
+    return Response.json({id:"newsletter-message",payload:{mimeType:"text/plain",headers:[{name:"From",value:"news@example.test"},{name:"Date",value:"Fri, 10 Jul 2026 12:30:00 +0900"}],body:{data:base64Url("普通のお知らせ")}}});
+  });
+  const encrypted=await encryptRefreshToken(env,"nonpayment-connection","user-1","refresh-secret");
+  db.raw.prepare("INSERT INTO gmail_connections (id,user_id,household_project_id,gmail_email,refresh_token_ciphertext,refresh_token_iv,key_generation,aad_version,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,1,'active',?,?)").run("nonpayment-connection","user-1","personal-home","mail@example.test",encrypted.ciphertext,encrypted.iv,1,now,now);
+  const first=await syncGmail(db,env,{id:"user-1"},"nonpayment-connection",{days:7,limit:1});
+  const second=await syncGmail(db,env,{id:"user-1"},"nonpayment-connection",{days:7,limit:1});
+  assert.equal(first.run.candidate_count,0);assert.equal(db.raw.prepare("SELECT count(*) AS n FROM gmail_import_candidates").get().n,0);
+  assert.equal(db.raw.prepare("SELECT parse_status FROM gmail_messages").get().parse_status,"parse_error");assert.equal(second.run.duplicate_count,1);
+});
+
+test("candidate import rejects blank merchant names and zero or null amounts", async (t) => {
+  const db=new Database();t.after(()=>db.close());seed(db);const now="2026-07-12T00:00:00.000Z";
+  db.raw.prepare("INSERT INTO gmail_connections (id,user_id,household_project_id,gmail_email,refresh_token_ciphertext,refresh_token_iv,key_generation,aad_version,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,1,'active',?,?)").run("incomplete-connection","user-1","personal-home","mail@example.test","x","y",1,now,now);
+  db.raw.prepare("INSERT INTO gmail_sync_runs (id,connection_id,user_id,days,message_limit,status,started_at) VALUES (?,?,?,?,?,'completed',?)").run("incomplete-run","incomplete-connection","user-1",7,3,now);
+  for(const [id,merchant,amount] of [["blank-merchant","   ",1000],["zero-amount","Shop",0],["null-amount","Shop",null]]){
+    db.raw.prepare("INSERT INTO gmail_messages (id,connection_id,gmail_message_id,sync_run_id,parse_status,created_at) VALUES (?,?,?,?,?,?)").run(`${id}-message`,"incomplete-connection",`${id}-gmail-message`,"incomplete-run","parse_error",now);
+    db.raw.prepare("INSERT INTO gmail_import_candidates (id,connection_id,gmail_message_row_id,user_id,status,merchant_name,amount,occurred_at,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)").run(id,"incomplete-connection",`${id}-message`,"user-1","needs_review",merchant,amount,now,now,now);
+    await assert.rejects(()=>importCandidate(db,{id:"user-1"},id), (error)=>error.status===409&&error.message==="candidate_incomplete");
+  }
+});
