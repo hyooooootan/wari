@@ -53,3 +53,12 @@ test("Gmail parse errors stay hidden and incomplete candidates cannot be importe
   assert.match(source, /金額と店名を入力してください/);
   assert.match(source, /data-gmail-import="\$\{esc\(row\.id\)\}" \$\{complete \? "" : "disabled"\}/);
 });
+
+test("Gmail sync displays internal run status without exposing provider data", () => {
+  assert.match(source, /function gmailSyncMessage\(run\)/);
+  assert.match(source, /同期完了: 新規候補\$\{candidates\}件、処理\$\{processed\}件、重複\$\{duplicates\}件/);
+  assert.match(source, /同期完了: 新しい候補はありません/);
+  assert.match(source, /reauthorization_required: /);
+  assert.match(source, /rate_limited: /);
+  assert.match(source, /finally \{\s*await refreshGmailImport\(\);/);
+});

@@ -169,6 +169,31 @@ function toast(message) {
   lastToastTimer = setTimeout(() => element.classList.remove("show"), 2200);
 }
 
+function gmailSyncMessage(run) {
+  const status = run?.status;
+  const candidates = Number(run?.candidate_count || 0);
+  const processed = Number(run?.processed_count || 0);
+  const duplicates = Number(run?.duplicate_count || 0);
+  if (status === "completed") {
+    return candidates > 0
+      ? `同期完了: 新規候補${candidates}件、処理${processed}件、重複${duplicates}件`
+      : "同期完了: 新しい候補はありません";
+  }
+  const messages = {
+    partial: "Gmail同期が一部完了しました。取得できないメールがあります",
+    failed: "Gmail同期に失敗しました",
+    rate_limited: "Gmailの利用制限に達しました。時間をおいて再試行してください",
+    reauthorization_required: "Gmailの再認証が必要です。接続を確認してください",
+  };
+  const codes = {
+    gmail_api_error: "Gmail APIとの通信に失敗しました",
+    gmail_rate_limited: "Gmailの利用制限に達しました",
+    gmail_reauthorization_required: "Gmailの再認証が必要です",
+    gmail_personal_household_lost: "本人の家計簿を確認できません",
+  };
+  return codes[run?.error_code] || messages[status] || "Gmail同期を完了できませんでした";
+}
+
 function statusText() {
   if (savingCount > 0) return "保存中";
   return isCloud ? "クラウド" : "この端末";
@@ -2076,8 +2101,14 @@ document.addEventListener("click", async (event) => {
     }
     if (button.dataset.gmailSync) {
       const days = Number(document.querySelector(`[data-gmail-days="${CSS.escape(button.dataset.gmailSync)}"]`)?.value || 30);
-      await Api.syncGmail(button.dataset.gmailSync, days, 100);
-      await refreshGmailImport();
+      try {
+        const result = await Api.syncGmail(button.dataset.gmailSync, days, 100);
+        toast(gmailSyncMessage(result?.run));
+      } catch (error) {
+        toast(error.message || "Gmail同期を実行できませんでした");
+      } finally {
+        await refreshGmailImport();
+      }
       return;
     }
     if (button.dataset.gmailDisconnect) {

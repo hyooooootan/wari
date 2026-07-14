@@ -181,7 +181,7 @@ export async function syncGmail(db, env, user, connectionId, input = {}) {
     const pending=[];
     for (const item of messages) {
       const exists=await db.prepare(`SELECT m.id,c.id AS candidate_id FROM gmail_messages m LEFT JOIN gmail_import_candidates c ON c.gmail_message_row_id=m.id WHERE m.connection_id=? AND m.gmail_message_id=?`).bind(connectionId,item.id).first();
-      if(exists){duplicates++;continue;}
+      if(exists?.candidate_id){duplicates++;continue;}
       try {
         const message=await googleJson(env,`https://gmail.googleapis.com/gmail/v1/users/me/messages/${encodeURIComponent(item.id)}?format=full`,token.access_token);
         const headers=Object.fromEntries((message.payload?.headers||[]).map(h=>[String(h.name).toLowerCase(),h.value]));
@@ -199,17 +199,25 @@ export async function syncGmail(db, env, user, connectionId, input = {}) {
       const syncWriteSql="SELECT 1 FROM gmail_connections c JOIN users u ON u.id=c.user_id WHERE c.id=? AND c.user_id=? AND c.status='active' AND u.deleted_at IS NULL AND u.deletion_started_at IS NULL";
       const syncWriteBindings=[connectionId,user.id];
       const statements=[db.prepare(`UPDATE gmail_sync_runs SET status=status WHERE id=? AND user_id=? AND EXISTS(${personalSql}) AND EXISTS(${syncWriteSql})`).bind(runId,user.id,...personalBindings,...syncWriteBindings)];
+      const candidateStatements=[];
       for(const record of pending){
-        if(!record.exists){statements.push(db.prepare(`INSERT INTO gmail_messages (id,connection_id,gmail_message_id,sync_run_id,parse_status,provider,received_at,created_at)
-          SELECT ?,?,?,?,?,?,?,? WHERE EXISTS(${personalSql}) AND EXISTS(${syncWriteSql})`).bind(record.messageRowId,connectionId,record.gmailMessageId,runId,record.parsed.parse_status,record.parsed.provider,record.receivedAt,record.now,...personalBindings,...syncWriteBindings));}
+        if(!record.exists){
+          statements.push(db.prepare(`INSERT INTO gmail_messages (id,connection_id,gmail_message_id,sync_run_id,parse_status,provider,received_at,created_at)
+            SELECT ?,?,?,?,?,?,?,? WHERE EXISTS(${personalSql}) AND EXISTS(${syncWriteSql})`).bind(record.messageRowId,connectionId,record.gmailMessageId,runId,record.parsed.parse_status,record.parsed.provider,record.receivedAt,record.now,...personalBindings,...syncWriteBindings));
+        } else {
+          statements.push(db.prepare(`UPDATE gmail_messages SET sync_run_id=?,parse_status=?,provider=?,received_at=? WHERE id=? AND connection_id=? AND EXISTS(${personalSql}) AND EXISTS(${syncWriteSql})`)
+            .bind(runId,record.parsed.parse_status,record.parsed.provider,record.receivedAt,record.messageRowId,connectionId,...personalBindings,...syncWriteBindings));
+        }
         if(record.candidateId){
+          const statementIndex=statements.length;
           statements.push(db.prepare(`INSERT INTO gmail_import_candidates (id,connection_id,gmail_message_row_id,user_id,status,provider,merchant_name,amount,occurred_at,payment_method,external_transaction_id,duplicate_warning,created_at,updated_at)
-            SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,? WHERE EXISTS(${personalSql}) AND EXISTS(${syncWriteSql})`).bind(record.candidateId,connectionId,record.messageRowId,user.id,record.parsed.parse_status === "parsed" ? "ready" : record.parsed.parse_status,record.parsed.provider,record.parsed.merchant_name,record.parsed.amount,record.parsed.occurred_at,record.parsed.payment_method,record.parsed.external_transaction_id,record.warning,record.now,record.now,...personalBindings,...syncWriteBindings));
+            SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,? WHERE NOT EXISTS(SELECT 1 FROM gmail_import_candidates WHERE gmail_message_row_id=?) AND EXISTS(${personalSql}) AND EXISTS(${syncWriteSql})`).bind(record.candidateId,connectionId,record.messageRowId,user.id,record.parsed.parse_status === "parsed" ? "ready" : record.parsed.parse_status,record.parsed.provider,record.parsed.merchant_name,record.parsed.amount,record.parsed.occurred_at,record.parsed.payment_method,record.parsed.external_transaction_id,record.warning,record.now,record.now,record.messageRowId,...personalBindings,...syncWriteBindings));
+          candidateStatements.push(statementIndex);
         }
       }
       const results=await db.batch(statements);
       if(!changedRows(results[0]))throw new ApiError(403,"gmail_personal_household_lost");
-      processed+=pending.length;candidates+=pending.filter((record)=>record.candidateId).length;
+      processed+=pending.length;candidates+=candidateStatements.filter((index)=>changedRows(results[index])).length;
     }
   } catch(error) {
     errors++; errorCode=safeErrorCode(error); status=error?.status===401?"reauthorization_required":error?.status===429?"rate_limited":"failed";
