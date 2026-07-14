@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import { decryptRefreshToken, disconnectGmail, encryptRefreshToken, finishGmailOAuth, importCandidate, retryGmailRevocations, startGmailOAuth, syncGmail, updateCandidate } from "../functions/lib/gmail.js";
+import { bulkCandidateAction, decryptRefreshToken, disconnectGmail, encryptRefreshToken, finishGmailOAuth, importCandidate, listCandidates, retryGmailRevocations, startGmailOAuth, syncGmail, updateCandidate } from "../functions/lib/gmail.js";
 import { extractGmailText } from "../functions/lib/gmail-mime.js";
 import { parsePaymentNotification } from "../functions/lib/gmail-parsers.js";
 
@@ -100,7 +100,7 @@ test("Gmail sync passes a stable query and page token across pages", async (t) =
   const encrypted = await encryptRefreshToken(env, "page-connection", "user-1", "refresh-secret");
   db.raw.prepare("INSERT INTO gmail_connections (id,user_id,household_project_id,gmail_email,refresh_token_ciphertext,refresh_token_iv,key_generation,aad_version,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,1,'active',?,?)").run("page-connection", "user-1", "personal-home", "mail@example.test", encrypted.ciphertext, encrypted.iv, 1, now, now);
   const first = await syncGmail(db, env, { id: "user-1" }, "page-connection", { days: 7, batch_size: 40 });
-  const second = await syncGmail(db, env, { id: "user-1" }, "page-connection", { days: 7, batch_size: 40, page_token: first.next_page_token, query_after: first.query_after });
+  const second = await syncGmail(db, env, { id: "user-1" }, "page-connection", { days: 7, batch_size: 40, page_token: first.next_page_token, query_after: first.query_after, query_before: first.query_before });
   assert.equal(requests.length, 2);
   assert.equal(requests[0].searchParams.get("maxResults"), "40");
   assert.equal(requests[1].searchParams.get("maxResults"), "40");
@@ -117,6 +117,42 @@ test("Gmail sync rejects a batch size above the external request budget", async 
   const fixture = await syncFixture({});
   t.after(() => fixture.db.close());
   await assert.rejects(() => syncGmail(fixture.db, fixture.env, { id: "user-1" }, "sync-fixture-connection", { days: 7, batch_size: 41 }), (error) => error.status === 400 && error.message === "invalid_field");
+});
+
+test("Gmail date ranges use JST boundaries and remain fixed across pages", async (t) => {
+  const requests = [];
+  const fixture = await syncFixture({ "date-message": "amount: 1200\nmerchant: Shop" }, [], { onList: (url) => requests.push(url), internalDate: "1783438800000" });
+  t.after(() => fixture.db.close());
+  const first = await syncGmail(fixture.db, fixture.env, { id: "user-1" }, "sync-fixture-connection", { from_date: "2026-07-01", to_date: "2026-07-31", batch_size: 40 });
+  await syncGmail(fixture.db, fixture.env, { id: "user-1" }, "sync-fixture-connection", { from_date: "2026-07-01", to_date: "2026-07-31", batch_size: 40, page_token: "next", query_after: first.query_after, query_before: first.query_before });
+  assert.match(requests[0].searchParams.get("q"), /^after:\d+ before:\d+ from:statement@vpass\.ne\.jp/);
+  assert.equal(requests[0].searchParams.get("q"), requests[1].searchParams.get("q"));
+  assert.equal(first.query_after, 1782831600);
+  await assert.rejects(() => syncGmail(fixture.db, fixture.env, { id: "user-1" }, "sync-fixture-connection", { from_date: "2026-08-01", to_date: "2026-07-01" }), (error) => error.status === 400);
+  await assert.rejects(() => syncGmail(fixture.db, fixture.env, { id: "user-1" }, "sync-fixture-connection", { from_date: "2026-01-01", to_date: "2026-04-01" }), (error) => error.status === 400);
+});
+
+test("Gmail candidates support range filtering and bulk actions without duplicate imports", async (t) => {
+  const fixture = await syncFixture({ first: "amount: 1200\nmerchant: Shop", second: "amount: 800\nmerchant: Cafe" }, [], { internalDate: "1783438800000" });
+  t.after(() => fixture.db.close());
+  await syncGmail(fixture.db, fixture.env, { id: "user-1" }, "sync-fixture-connection", { days: 7, batch_size: 40 });
+  const listed = await listCandidates(fixture.db, { id: "user-1" }, undefined, "2026-07-01", "2026-07-31");
+  assert.equal(listed.candidates.length, 2);
+  const ids = listed.candidates.map((row) => row.id);
+  const first = await bulkCandidateAction(fixture.db, { id: "user-1" }, { action: "import", candidate_ids: ids });
+  assert.equal(first.imported_count, 2);
+  const second = await bulkCandidateAction(fixture.db, { id: "user-1" }, { action: "import", candidate_ids: ids });
+  assert.equal(second.already_imported_count, 2);
+  const needsReview = await syncFixture({ review: "amount: 500" }, [], { internalDate: "1783438800000" });
+  t.after(() => needsReview.db.close());
+  await syncGmail(needsReview.db, needsReview.env, { id: "user-1" }, "sync-fixture-connection", { days: 7, batch_size: 40 });
+  const review = needsReview.db.raw.prepare("SELECT id FROM gmail_import_candidates").get();
+  needsReview.db.raw.prepare("UPDATE gmail_import_candidates SET status='needs_review' WHERE id=?").run(review.id);
+  const ignored = await bulkCandidateAction(needsReview.db, { id: "user-1" }, { action: "ignore", candidate_ids: [review.id, review.id] });
+  assert.equal(ignored.requested_count, 1);
+  assert.equal(needsReview.db.raw.prepare("SELECT status FROM gmail_import_candidates WHERE id=?").get(review.id).status, "ignored");
+  await assert.rejects(() => bulkCandidateAction(fixture.db, { id: "user-1" }, { action: "import", candidate_ids: [] }), (error) => error.status === 400);
+  await assert.rejects(() => bulkCandidateAction(fixture.db, { id: "user-1" }, { action: "import", candidate_ids: Array.from({ length: 51 }, (_, index) => `id-${index}`) }), (error) => error.status === 400);
 });
 
 test("AES-GCM token storage uses a 12-byte IV and binds connection, user, and generation through AAD", async () => {

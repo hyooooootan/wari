@@ -70,6 +70,7 @@ import { handleReceiptOcr } from "../lib/ocr.js";
 import {
   disconnectGmail,
   disconnectAllGmail,
+  bulkCandidateAction,
   finishGmailOAuth,
   importCandidate,
   listCandidates,
@@ -296,9 +297,12 @@ async function dispatchGmail(request, db, env, url, path, user) {
   }
   if (path.length === 2 && path[1] === "candidates") {
     return invoke(request, ["GET"], async () => {
-      assertQueryFields(url.searchParams, new Set(["status"]));
-      return json(await listCandidates(db, user, url.searchParams.get("status")));
+      assertQueryFields(url.searchParams, new Set(["status", "from_date", "to_date"]));
+      return json(await listCandidates(db, user, url.searchParams.get("status"), url.searchParams.get("from_date"), url.searchParams.get("to_date")));
     });
+  }
+  if (path.length === 3 && path[1] === "candidates" && path[2] === "bulk") {
+    return invoke(request, ["POST"], async () => json(await bulkCandidateAction(db, user, await readJson(request))));
   }
   if (path.length === 3 && path[1] === "candidates") {
     return invoke(request, ["PATCH"], async () => json(await updateCandidate(db, user, path[2], await readJson(request))));

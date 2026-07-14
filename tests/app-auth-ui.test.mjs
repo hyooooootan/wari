@@ -80,9 +80,10 @@ test("Gmail sync displays internal run status without exposing provider data", (
 test("Gmail sync paginates sequentially to 1000 items without exposing page tokens", () => {
   assert.match(source, /const gmailSyncing = new Set\(\)/);
   assert.match(source, /for \(let page = 0; page < 25 && totals\.listed_count < 1000; page \+= 1\)/);
-  assert.match(source, /const options = \{ batch_size: 40 \}/);
+  assert.match(source, /const options = \{ batch_size: 40, from_date: gmailUi\.from_date, to_date: gmailUi\.to_date \}/);
   assert.match(source, /options\.page_token = pageToken/);
   assert.match(source, /options\.query_after = queryAfter/);
+  assert.match(source, /options\.query_before = queryBefore/);
   assert.match(source, /Gmail同期中: \$\{Math\.min\(totals\.listed_count, 1000\)\} \/ 1000件/);
   assert.match(source, /上限1000件まで確認しました/);
   assert.match(source, /syncGmailImport\(button\.dataset\.gmailSync, days\)/);
@@ -98,4 +99,18 @@ test("Gmail sync refreshes candidates after every page and shows SMBC progress",
   assert.match(source, /除外: \$\{progress\.ignored_count\}件/);
   assert.match(source, /取込対象: 三井住友カード/);
   assert.match(source, /同期完了: 検索\$\{totals\.listed_count\}件、新規候補\$\{totals\.candidate_count\}件、重複\$\{totals\.duplicate_count\}件、除外\$\{totals\.ignored_count\}件/);
+});
+
+test("Gmail candidates expose date range selection and bulk actions", () => {
+  assert.match(source, /data-gmail-from-date/);
+  assert.match(source, /data-gmail-to-date/);
+  assert.match(source, /取引日時はメール受信時刻を使用します/);
+  assert.match(source, /const gmailSelected = new Set\(\)/);
+  assert.match(source, /data-gmail-select-all/);
+  assert.match(source, /data-gmail-bulk-import/);
+  assert.match(source, /data-gmail-bulk-ignore/);
+  assert.match(source, /bulkGmailCandidates\("import"\)/);
+  assert.match(source, /bulkGmailCandidates\("ignore"\)/);
+  assert.match(source, /gmailUi\.from_date/);
+  assert.match(source, /gmailUi\.to_date/);
 });

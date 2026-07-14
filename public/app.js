@@ -70,9 +70,10 @@ let savingCount = 0;
 let activeProjectId = null;
 let lastToastTimer = 0;
 let remoteSyncQueue = Promise.resolve();
-const gmailUi = { connections: [], candidates: [] };
+const gmailUi = { connections: [], candidates: [], total_count: 0, has_more: false, from_date: gmailDefaultFromDate(), to_date: gmailDefaultToDate() };
 const gmailSyncing = new Set();
 const gmailSyncProgress = new Map();
+const gmailSelected = new Set();
 const shareTokensByProject = new Map();
 const ui = {
   createMode: null,
@@ -205,7 +206,7 @@ function gmailSyncTotalsMessage(totals) {
 }
 
 function renderGmailProgress() {
-  const section = document.querySelector(".import-section");
+  const section = [...document.querySelectorAll(".import-section")].find((row) => row.querySelector("[data-gmail-sync],[data-gmail-candidate-form],[data-gmail-connect]"));
   if (!section) return;
   let element = section.querySelector("[data-gmail-progress]");
   if (!element) {
@@ -221,8 +222,63 @@ function renderGmailProgress() {
     : "Gmail取込対象: 三井住友カード";
 }
 
+function renderGmailCandidateControls() {
+  const section = [...document.querySelectorAll(".import-section")].find((row) => row.querySelector("[data-gmail-sync],[data-gmail-candidate-form],[data-gmail-connect]"));
+  if (!section) return;
+  let controls = section.querySelector("[data-gmail-period-controls]");
+  if (!controls) {
+    controls = document.createElement("div");
+    controls.dataset.gmailPeriodControls = "true";
+    controls.className = "form-panel form-stack";
+    controls.innerHTML = '<div class="field-grid"><label class="field">開始日<input class="input" type="date" data-gmail-from-date></label><label class="field">終了日<input class="input" type="date" data-gmail-to-date></label></div><p>取引日時はメール受信時刻を使用します</p><p>検索対象: 三井住友カード</p>';
+    section.prepend(controls);
+  }
+  controls.querySelector("[data-gmail-from-date]").value = gmailUi.from_date;
+  controls.querySelector("[data-gmail-to-date]").value = gmailUi.to_date;
+  let toolbar = section.querySelector("[data-gmail-candidate-toolbar]");
+  if (!toolbar) {
+    toolbar = document.createElement("div");
+    toolbar.dataset.gmailCandidateToolbar = "true";
+    toolbar.className = "review-actions";
+    section.insertBefore(toolbar, section.querySelector("[data-gmail-period-controls]").nextSibling);
+  }
+  const selected = gmailUi.candidates.filter((row) => gmailSelected.has(row.id));
+  const applicable = selected.filter((row) => row.status === "ready" && String(row.merchant_name || "").trim() && Number.isSafeInteger(row.amount) && row.amount !== 0 && row.occurred_at);
+  const needsReview = selected.length - applicable.length;
+  const amount = applicable.reduce((sum, row) => sum + Number(row.amount), 0);
+  toolbar.innerHTML = `<span>選択: ${selected.length}件 / ${yen(amount)}、適用可能: ${applicable.length}件、確認が必要: ${needsReview}件</span><button class="small-button" type="button" data-gmail-select-all>表示中をすべて選択</button><button class="small-button" type="button" data-gmail-clear-selection>選択解除</button><button class="small-button household-small" type="button" data-gmail-bulk-import ${applicable.length ? "" : "disabled"}>一括適用</button><button class="small-button" type="button" data-gmail-bulk-ignore ${selected.length ? "" : "disabled"}>一括破棄</button><span>表示: ${gmailUi.candidates.length} / ${gmailUi.total_count}${gmailUi.has_more ? "（続きあり）" : ""}</span>`;
+  for (const form of section.querySelectorAll("[data-gmail-candidate-form]")) {
+    const id = form.dataset.gmailCandidateForm;
+    let checkbox = form.querySelector("[data-gmail-select]");
+    if (!checkbox) {
+      checkbox = document.createElement("input");
+      checkbox.type = "checkbox";
+      checkbox.dataset.gmailSelect = id;
+      checkbox.setAttribute("aria-label", "候補を選択");
+      form.prepend(checkbox);
+    }
+    checkbox.checked = gmailSelected.has(id);
+  }
+}
+
+function gmailDefaultToDate() {
+  return new Date().toLocaleDateString("sv-SE", { timeZone: "Asia/Tokyo" });
+}
+
+function gmailDefaultFromDate() {
+  return `${gmailDefaultToDate().slice(0, 8)}01`;
+}
+
+function validGmailDateRange(fromDate, toDate) {
+  if (!/^\d{4}-\d{2}-\d{2}$/u.test(fromDate) || !/^\d{4}-\d{2}-\d{2}$/u.test(toDate)) return false;
+  const start = Date.parse(`${fromDate}T00:00:00+09:00`);
+  const end = Date.parse(`${toDate}T00:00:00+09:00`);
+  return Number.isFinite(start) && Number.isFinite(end) && end >= start && end - start <= 89 * 86400000;
+}
+
 async function syncGmailImport(connectionId, days) {
   if (gmailSyncing.has(connectionId)) return;
+  if (!validGmailDateRange(gmailUi.from_date, gmailUi.to_date)) { toast("Gmail同期期間は90日以内で、開始日を終了日以前にしてください"); return; }
   gmailSyncing.add(connectionId);
   render();
   const syncButton = document.querySelector(`[data-gmail-sync="${CSS.escape(connectionId)}"]`);
@@ -232,12 +288,14 @@ async function syncGmailImport(connectionId, days) {
   renderGmailProgress();
   let pageToken = null;
   let queryAfter = null;
+  let queryBefore = null;
   let lastRun = { status: "completed" };
   try {
     for (let page = 0; page < 25 && totals.listed_count < 1000; page += 1) {
-      const options = { batch_size: 40 };
+      const options = { batch_size: 40, from_date: gmailUi.from_date, to_date: gmailUi.to_date };
       if (pageToken) options.page_token = pageToken;
       if (queryAfter !== null) options.query_after = queryAfter;
+      if (queryBefore !== null) options.query_before = queryBefore;
       const result = await Api.syncGmail(connectionId, days, options);
       lastRun = result?.run || { status: "failed", error_code: "gmail_sync_error" };
       totals.listed_count += Number(result?.listed_count ?? lastRun.listed_count ?? 0);
@@ -248,6 +306,7 @@ async function syncGmailImport(connectionId, days) {
       totals.error_count += Number(result?.error_count ?? lastRun.error_count ?? 0);
       gmailSyncProgress.set(connectionId, { ...totals });
       if (queryAfter === null && result?.query_after !== undefined) queryAfter = result.query_after;
+      if (queryBefore === null && result?.query_before !== undefined) queryBefore = result.query_before;
       if (lastRun.status !== "completed") {
         toast(gmailSyncMessage(lastRun, totals));
         return;
@@ -267,6 +326,7 @@ async function syncGmailImport(connectionId, days) {
   } finally {
     gmailSyncing.delete(connectionId);
     gmailSyncProgress.delete(connectionId);
+    gmailSelected.clear();
     await refreshGmailImport();
     render();
     const refreshedButton = document.querySelector(`[data-gmail-sync="${CSS.escape(connectionId)}"]`);
@@ -1194,9 +1254,13 @@ function renderGmailImport(project) {
 async function refreshGmailImport(shouldRender = true) {
   if (!isCloud) return;
   try {
-    const [connections, candidates] = await Promise.all([Api.listGmailConnections(), Api.listGmailCandidates()]);
+    const [connections, candidates] = await Promise.all([Api.listGmailConnections(), Api.listGmailCandidates(undefined, { from_date: gmailUi.from_date, to_date: gmailUi.to_date })]);
     gmailUi.connections = connections.connections || [];
     gmailUi.candidates = candidates.candidates || [];
+    gmailUi.total_count = Number(candidates.total_count || gmailUi.candidates.length);
+    gmailUi.has_more = Boolean(candidates.has_more);
+    const visible = new Set(gmailUi.candidates.map((row) => row.id));
+    for (const id of gmailSelected) if (!visible.has(id)) gmailSelected.delete(id);
     if (shouldRender) render();
   } catch (error) {
     toast(`Gmail情報を読み込めませんでした: ${error.message || "取得に失敗しました"}`);
@@ -1913,6 +1977,37 @@ async function readReceiptFile(file, projectId) {
   return requestApi("/api/ocr-receipt", { method: "POST", json: payload });
 }
 
+async function bulkGmailCandidates(action) {
+  const selected = gmailUi.candidates.filter((row) => gmailSelected.has(row.id));
+  const applicable = action === "import" ? selected.filter((row) => row.status === "ready" && String(row.merchant_name || "").trim() && Number.isSafeInteger(row.amount) && row.amount !== 0 && row.occurred_at) : selected.filter((row) => ["ready", "needs_review"].includes(row.status));
+  if (!applicable.length) { toast(action === "import" ? "適用できる候補がありません" : "破棄する候補を選択してください"); return; }
+  const total = applicable.reduce((sum, row) => sum + Number(row.amount || 0), 0);
+  const message = action === "import" ? `${applicable.length}件、合計${yen(total)}を家計簿へ登録します` : `${applicable.length}件を取込候補から破棄します\n破棄したメールは次回同期でも再解析されません`;
+  if (!globalThis.confirm?.(message)) return;
+  const aggregate = { imported_count: 0, already_imported_count: 0, skipped_count: 0, failed_count: 0 };
+  let processed = 0;
+  try {
+    for (let index = 0; index < applicable.length; index += 50) {
+      const chunk = applicable.slice(index, index + 50);
+      const result = await Api.bulkGmailCandidates(action, chunk.map((row) => row.id));
+      for (const key of Object.keys(aggregate)) aggregate[key] += Number(result?.[key] || 0);
+      processed += chunk.length;
+      toast(`${action === "import" ? "一括適用" : "一括破棄"}中: ${processed} / ${applicable.length}件`);
+    }
+    await refreshGmailImport(false);
+    const project = primaryHouseholdProject();
+    if (project) await refreshCloudProject(project.id, false);
+    await refreshCloudCalendar(false);
+    gmailSelected.clear();
+    render();
+    toast(`${action === "import" ? "一括適用完了" : "一括破棄完了"}: 登録${aggregate.imported_count}件、確認が必要${aggregate.skipped_count}件、登録済み${aggregate.already_imported_count}件、失敗${aggregate.failed_count}件`);
+  } catch (error) {
+    gmailSelected.clear();
+    await refreshGmailImport();
+    toast(error.message || "一括処理に失敗しました");
+  }
+}
+
 async function handleSplitReceipt(input) {
   const target = input.dataset.receiptTarget;
   const receipt = ui.ocr[target];
@@ -1988,6 +2083,7 @@ function render() {
   const root = document.querySelector("#app");
   if (root) root.innerHTML = currentProject() ? renderProject() : renderHome();
   renderGmailProgress();
+  renderGmailCandidateControls();
 }
 
 function mergeProjectSummaries(rows) {
@@ -2178,6 +2274,24 @@ document.addEventListener("click", async (event) => {
       const result = await Api.startGmailConnection();
       if (!result?.url) throw new Error("Gmailの認可先を取得できませんでした");
       location.assign(result.url);
+      return;
+    }
+    if (button.dataset.gmailSelectAll !== undefined) {
+      gmailUi.candidates.forEach((row) => gmailSelected.add(row.id));
+      render();
+      return;
+    }
+    if (button.dataset.gmailClearSelection !== undefined) {
+      gmailSelected.clear();
+      render();
+      return;
+    }
+    if (button.dataset.gmailBulkImport !== undefined) {
+      await bulkGmailCandidates("import");
+      return;
+    }
+    if (button.dataset.gmailBulkIgnore !== undefined) {
+      await bulkGmailCandidates("ignore");
       return;
     }
     if (button.dataset.gmailSync) {
@@ -2411,6 +2525,22 @@ document.addEventListener("click", async (event) => {
 
 document.addEventListener("change", (event) => {
   const target = event.target;
+  if (target.dataset.gmailSelect) {
+    if (target.checked) gmailSelected.add(target.dataset.gmailSelect);
+    else gmailSelected.delete(target.dataset.gmailSelect);
+    renderGmailCandidateControls();
+    return;
+  }
+  if (target.dataset.gmailFromDate || target.dataset.gmailToDate) {
+    const fromDate = document.querySelector("[data-gmail-from-date]")?.value || gmailUi.from_date;
+    const toDate = document.querySelector("[data-gmail-to-date]")?.value || gmailUi.to_date;
+    if (!validGmailDateRange(fromDate, toDate)) { toast("Gmail同期期間は90日以内で、開始日を終了日以前にしてください"); return; }
+    gmailUi.from_date = fromDate;
+    gmailUi.to_date = toDate;
+    gmailSelected.clear();
+    void refreshGmailImport();
+    return;
+  }
   const scope = target.dataset.draftScope;
   const field = target.dataset.draftField;
   if (scope && field && ui.drafts[scope]) ui.drafts[scope][field] = target.value;
