@@ -52,6 +52,30 @@ function seed(db) {
   db.raw.prepare("INSERT INTO projects (id,name,project_type,owner_user_id,created_at,updated_at) VALUES (?,?,?,?,?,?)").run("personal-home","Personal","household","user-1",now,now);
 }
 
+async function syncFixture(messageBodies, existing = []) {
+  const db = new Database();
+  seed(db);
+  const now = "2026-07-12T00:00:00.000Z";
+  let detailCalls = 0;
+  const env = environment(async (url) => {
+    if (String(url).includes("oauth2.googleapis.com/token")) return Response.json({ access_token: "access-secret" });
+    if (String(url).includes("/messages?")) return Response.json({ messages: Object.keys(messageBodies).map((id) => ({ id })) });
+    const id = decodeURIComponent(String(url).split("/messages/")[1].split("?")[0]);
+    detailCalls += 1;
+    return Response.json({ payload: { mimeType: "text/plain", headers: [{ name: "From", value: "notice@example.test" }, { name: "Date", value: "Fri, 10 Jul 2026 12:30:00 +0900" }], body: { data: base64Url(messageBodies[id]) } } });
+  });
+  const encrypted = await encryptRefreshToken(env, "sync-fixture-connection", "user-1", "refresh-secret");
+  db.raw.prepare("INSERT INTO gmail_connections (id,user_id,household_project_id,gmail_email,refresh_token_ciphertext,refresh_token_iv,key_generation,aad_version,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,1,'active',?,?)").run("sync-fixture-connection", "user-1", "personal-home", "mail@example.test", encrypted.ciphertext, encrypted.iv, 1, now, now);
+  for (const [messageId, candidate] of existing) {
+    const runId = `existing-run-${messageId}`;
+    const messageRowId = `existing-row-${messageId}`;
+    db.raw.prepare("INSERT INTO gmail_sync_runs (id,connection_id,user_id,days,message_limit,status,started_at) VALUES (?,?,?,?,?,'completed',?)").run(runId, "sync-fixture-connection", "user-1", 7, 10, now);
+    db.raw.prepare("INSERT INTO gmail_messages (id,connection_id,gmail_message_id,sync_run_id,parse_status,created_at) VALUES (?,?,?,?,?,?)").run(messageRowId, "sync-fixture-connection", messageId, runId, "parsed", now);
+    if (candidate) db.raw.prepare("INSERT INTO gmail_import_candidates (id,connection_id,gmail_message_row_id,user_id,status,merchant_name,amount,occurred_at,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)").run(`existing-candidate-${messageId}`, "sync-fixture-connection", messageRowId, "user-1", "ready", "Shop", 1200, now, now, now);
+  }
+  return { db, env, detailCalls: () => detailCalls };
+}
+
 test("AES-GCM token storage uses a 12-byte IV and binds connection, user, and generation through AAD", async () => {
   const env = environment(() => {});
   const encrypted = await encryptRefreshToken(env, "connection-1", "user-1", "refresh-secret");
@@ -389,7 +413,7 @@ test("payment parsing requires a nonzero body amount and distinguishes review st
   assert.equal(parsePaymentNotification("amount: 0\nmerchant: Shop\ndate: 2026/07/10", {}).parse_status, "parse_error");
 });
 
-test("sync records non-payment messages without creating candidates and skips them on resync", async (t) => {
+test("sync records non-payment messages without creating candidates and does not count them as duplicates", async (t) => {
   const db=new Database();t.after(()=>db.close());seed(db);const now="2026-07-12T00:00:00.000Z";
   const env=environment(async(url)=>{
     if(String(url).includes("oauth2.googleapis.com/token"))return Response.json({access_token:"access-secret"});
@@ -401,7 +425,7 @@ test("sync records non-payment messages without creating candidates and skips th
   const first=await syncGmail(db,env,{id:"user-1"},"nonpayment-connection",{days:7,limit:1});
   const second=await syncGmail(db,env,{id:"user-1"},"nonpayment-connection",{days:7,limit:1});
   assert.equal(first.run.candidate_count,0);assert.equal(db.raw.prepare("SELECT count(*) AS n FROM gmail_import_candidates").get().n,0);
-  assert.equal(db.raw.prepare("SELECT parse_status FROM gmail_messages").get().parse_status,"parse_error");assert.equal(second.run.duplicate_count,1);
+  assert.equal(db.raw.prepare("SELECT parse_status FROM gmail_messages").get().parse_status,"parse_error");assert.equal(second.run.processed_count,1);assert.equal(second.run.candidate_count,0);assert.equal(second.run.duplicate_count,0);
 });
 
 test("candidate import rejects blank merchant names and zero or null amounts", async (t) => {
@@ -413,4 +437,35 @@ test("candidate import rejects blank merchant names and zero or null amounts", a
     db.raw.prepare("INSERT INTO gmail_import_candidates (id,connection_id,gmail_message_row_id,user_id,status,merchant_name,amount,occurred_at,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)").run(id,"incomplete-connection",`${id}-message`,"user-1","needs_review",merchant,amount,now,now,now);
     await assert.rejects(()=>importCandidate(db,{id:"user-1"},id), (error)=>error.status===409&&error.message==="candidate_incomplete");
   }
+});
+
+test("sync reparses existing messages without candidates and preserves all counts", async (t) => {
+  const parsed = await syncFixture({ "reparse-parsed": "amount: 1200\ndate: 2026/07/10\nmerchant: Shop" }, [["reparse-parsed", false]]);
+  t.after(() => parsed.db.close());
+  const parsedResult = await syncGmail(parsed.db, parsed.env, { id: "user-1" }, "sync-fixture-connection", { days: 7, limit: 10 });
+  assert.deepEqual({ status: parsedResult.run.status, processed: parsedResult.run.processed_count, candidates: parsedResult.run.candidate_count, duplicates: parsedResult.run.duplicate_count }, { status: "completed", processed: 1, candidates: 1, duplicates: 0 });
+  assert.equal(parsed.db.raw.prepare("SELECT parse_status FROM gmail_messages").get().parse_status, "parsed");
+
+  const review = await syncFixture({ "reparse-review": "amount: 1200\nmerchant: Shop" }, [["reparse-review", false]]);
+  t.after(() => review.db.close());
+  const reviewResult = await syncGmail(review.db, review.env, { id: "user-1" }, "sync-fixture-connection", { days: 7, limit: 10 });
+  assert.equal(reviewResult.run.candidate_count, 1);
+  assert.equal(review.db.raw.prepare("SELECT status FROM gmail_import_candidates").get().status, "needs_review");
+
+  const error = await syncFixture({ "reparse-error": "newsletter" }, [["reparse-error", false]]);
+  t.after(() => error.db.close());
+  const errorResult = await syncGmail(error.db, error.env, { id: "user-1" }, "sync-fixture-connection", { days: 7, limit: 10 });
+  assert.deepEqual({ status: errorResult.run.status, processed: errorResult.run.processed_count, candidates: errorResult.run.candidate_count, duplicates: errorResult.run.duplicate_count }, { status: "completed", processed: 1, candidates: 0, duplicates: 0 });
+  assert.equal(error.db.raw.prepare("SELECT parse_status FROM gmail_messages").get().parse_status, "parse_error");
+
+  const duplicate = await syncFixture({ "existing-candidate": "amount: 1200\ndate: 2026/07/10\nmerchant: Shop" }, [["existing-candidate", true]]);
+  t.after(() => duplicate.db.close());
+  const duplicateResult = await syncGmail(duplicate.db, duplicate.env, { id: "user-1" }, "sync-fixture-connection", { days: 7, limit: 10 });
+  assert.equal(duplicate.detailCalls(), 0);
+  assert.deepEqual({ processed: duplicateResult.run.processed_count, candidates: duplicateResult.run.candidate_count, duplicates: duplicateResult.run.duplicate_count }, { processed: 0, candidates: 0, duplicates: 1 });
+
+  const mixed = await syncFixture({ valid: "amount: 1200\ndate: 2026/07/10\nmerchant: Shop", normal: "newsletter" });
+  t.after(() => mixed.db.close());
+  const mixedResult = await syncGmail(mixed.db, mixed.env, { id: "user-1" }, "sync-fixture-connection", { days: 7, limit: 10 });
+  assert.deepEqual({ listed: mixedResult.run.listed_count, processed: mixedResult.run.processed_count, candidates: mixedResult.run.candidate_count, duplicates: mixedResult.run.duplicate_count }, { listed: 2, processed: 2, candidates: 1, duplicates: 0 });
 });
