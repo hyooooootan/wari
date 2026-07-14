@@ -48,13 +48,17 @@ TESSERACT_MAX_SIDE=1800
 TESSERACT_THRESHOLD=auto
 OLLAMA_BASE_URL=http://127.0.0.1:11434
 OLLAMA_MODEL=qwen2.5:3b
+OLLAMA_TIMEOUT=20
 ```
 
 Environment check:
 
 ```bash
 python -m services.receipt_ocr.check_env
+python -m services.receipt_ocr.check_env --json
 ```
+
+The command checks Python, Pillow, Tesseract, the configured `jpn` and `eng` languages, the local Ollama endpoint and model, temporary file cleanup, and the `/health` response shape. Exit status `0` means ready, `1` means one or more runtime requirements are unavailable, and `2` means the check itself could not run.
 
 Expected result:
 

@@ -17,6 +17,7 @@ from PIL import Image, ImageEnhance, ImageOps
 
 OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5:3b")
+OLLAMA_TIMEOUT = float(os.environ.get("OLLAMA_TIMEOUT", "20"))
 TESSERACT_CMD = os.environ.get("TESSERACT_CMD", "tesseract")
 TESSERACT_LANG = os.environ.get("TESSERACT_LANG", "jpn+eng")
 TESSERACT_TIMEOUT = int(os.environ.get("TESSERACT_TIMEOUT", "30"))
@@ -47,6 +48,12 @@ def read_receipt_from_path(path):
         ocr = run_tesseract(prepared_path)
         if not ocr["text"].strip():
             warnings.append("tesseract_empty_result")
+        if not ocr["text"].strip():
+            normalized = empty_receipt(["tesseract_empty_result"])
+            add_wari_compat_fields(normalized)
+            normalized["model"] = OLLAMA_MODEL
+            normalized["ocr_backend"] = "tesseract_ollama"
+            return normalized
         parsed = structure_with_ollama(ocr)
         normalized = normalize_receipt(parsed)
         normalized["warnings"] = merge_warnings(normalized.get("warnings", []), warnings)
@@ -55,7 +62,11 @@ def read_receipt_from_path(path):
         normalized["ocr_backend"] = "tesseract_ollama"
         return normalized
     except Exception as exc:
-        return empty_receipt([f"tesseract_ollama_failed: {exc}"])
+        failed = empty_receipt([f"tesseract_ollama_failed: {exc}"])
+        add_wari_compat_fields(failed)
+        failed["model"] = OLLAMA_MODEL
+        failed["ocr_backend"] = "tesseract_ollama"
+        return failed
     finally:
         safe_unlink(prepared_path)
 
@@ -201,7 +212,7 @@ def structure_with_ollama(ocr):
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=90) as response:
+        with urllib.request.urlopen(req, timeout=OLLAMA_TIMEOUT) as response:
             response_json = json.loads(response.read().decode("utf-8"))
     except urllib.error.URLError as exc:
         raise RuntimeError(f"ollama_unreachable: {exc}") from exc
@@ -304,7 +315,7 @@ def normalize_receipt(data):
     }
     if result["total_amount"] is not None:
         item_sum = sum(item["amount"] or 0 for item in result["items"])
-        if item_sum and item_sum != result["total_amount"]:
+        if result["items"] and item_sum != result["total_amount"]:
             result["warnings"] = merge_warnings(result["warnings"], ["明細合計と合計金額が一致しません"])
     return result
 
@@ -465,7 +476,9 @@ def health():
         "ollama": {
             "base_url": OLLAMA_BASE_URL,
             "model": OLLAMA_MODEL,
+            "timeout_seconds": OLLAMA_TIMEOUT,
             "available": ollama_available(),
+            "model_present": ollama_model_present(),
         },
     }
 
@@ -495,9 +508,25 @@ def configured_tesseract_langs_available(installed_langs):
 
 
 def ollama_available():
+    return ollama_status()["available"]
+
+
+def ollama_model_present():
+    return ollama_status()["model_present"]
+
+
+def ollama_status():
     try:
         req = urllib.request.Request(f"{OLLAMA_BASE_URL.rstrip('/')}/api/tags", method="GET")
         with urllib.request.urlopen(req, timeout=3) as response:
-            return response.status == 200
+            if response.status != 200:
+                return {"available": False, "model_present": False}
+            payload = json.loads(response.read().decode("utf-8"))
+            names = {
+                str(tag.get("name"))
+                for tag in payload.get("models", [])
+                if isinstance(tag, dict) and tag.get("name")
+            }
+            return {"available": True, "model_present": OLLAMA_MODEL in names}
     except Exception:
-        return False
+        return {"available": False, "model_present": False}
