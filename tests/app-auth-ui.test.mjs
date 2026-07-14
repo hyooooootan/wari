@@ -39,3 +39,11 @@ test("Gmail候補の登録先を画面から指定しない", () => {
   assert.doesNotMatch(source, /data-gmail-import="\$\{esc\(row\.id\)\}" data-project-id/);
   assert.match(source, /Api\.importGmailCandidate\(button\.dataset\.gmailImport\)/);
 });
+
+test("Gmail state refreshes on startup and import tab selection", () => {
+  assert.match(source, /async function refreshGmailImport\(shouldRender = true\)/);
+  assert.match(source, /if \(shouldRender\) render\(\);/);
+  assert.match(source, /catch \(error\) \{\s*toast\(`Gmail[^`]+/);
+  assert.match(source, /await bootCloud\(\);\s*if \(isCloud\) await refreshGmailImport\(false\);/);
+  assert.match(source, /button\.dataset\.projectTab === "imports"\) \{\s*await refreshGmailImport\(false\);/);
+});

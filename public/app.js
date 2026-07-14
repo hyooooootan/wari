@@ -1082,12 +1082,16 @@ function renderGmailImport(project) {
   return `<section class="import-section"><div class="inline-heading"><h3>Gmail支払い通知</h3><button class="button secondary-button" type="button" data-gmail-connect>Gmailを接続</button></div>${connections || `<div class="empty-state compact-empty">Gmail接続はありません</div>`}${candidates}</section>`;
 }
 
-async function refreshGmailImport() {
+async function refreshGmailImport(shouldRender = true) {
   if (!isCloud) return;
-  const [connections, candidates] = await Promise.all([Api.listGmailConnections(), Api.listGmailCandidates()]);
-  gmailUi.connections = connections.connections || [];
-  gmailUi.candidates = candidates.candidates || [];
-  render();
+  try {
+    const [connections, candidates] = await Promise.all([Api.listGmailConnections(), Api.listGmailCandidates()]);
+    gmailUi.connections = connections.connections || [];
+    gmailUi.candidates = candidates.candidates || [];
+    if (shouldRender) render();
+  } catch (error) {
+    toast(`Gmail情報を読み込めませんでした: ${error.message || "取得に失敗しました"}`);
+  }
 }
 
 async function createHouseholdProject(form) {
@@ -2193,11 +2197,7 @@ document.addEventListener("click", async (event) => {
     else ui.householdTab = button.dataset.projectTab;
     render();
     if (project?.project_type === "household" && primaryHouseholdProject()?.id === project.id && button.dataset.projectTab === "imports") {
-      try {
-        await refreshGmailImport();
-      } catch (error) {
-        toast(error.message || "Gmail取込を読み込めませんでした");
-      }
+      await refreshGmailImport(false);
     }
     if (project?.project_type !== "split" && button.dataset.projectTab === "summary") {
       try {
@@ -2337,6 +2337,7 @@ window.addEventListener("hashchange", () => void route());
 if (!location.hash) location.hash = "#/";
 render();
 await bootCloud();
+if (isCloud) await refreshGmailImport(false);
 render();
 await route();
 
