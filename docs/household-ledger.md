@@ -8,9 +8,9 @@
 
 ## 内部の家計簿保存
 
-画面上の一つのカレンダーは、内部の複数の `household` プロジェクトをまとめた表示です。`householdProjects()` が `project_type = household` の保存先を集め、各保存先の取引を結合してカレンダーへ表示します。対象は `purchase`、`split_expense`、`refund`、`adjustment` で、状態が `cancelled` または `refunded` の取引は除外します。月の日別合計では `provisional` の金額を合計に含めません。
+画面上の一つのカレンダーは、ログイン利用者が所有する一件の `household` プロジェクトを表示します。取得条件は `project_type = household` かつ `owner_user_id` が本人であることです。過去のローカル保存状態に複数の `household` 行が残る場合がありますが、現行画面でそれらを横断して表示・集計しません。対象は `purchase`、`split_expense`、`refund`、`adjustment` で、状態が `cancelled` または `refunded` の取引は除外します。月の日別合計では `provisional` の金額を合計に含めません。
 
-`household` プロジェクトは、取引、取込、共有、割り勘参加者との接続に使う内部境界です。各保存先には本人の `project_members` 行を持たせます。ホームからの新規支出は、既存の家計簿保存先を作成日時順に選んで保存します。家計簿が一つもない場合は、最初の支出追加を開いた時点で `Household.createHouseholdProject` を呼び、名前「家計簿」、記録者「自分」の `household` プロジェクトと本人行を作成してから入力した支出を保存します。家計簿作成用のプロジェクト一覧上の画面はありません。
+`household` プロジェクトは、取引、取込、割り勘参加者との接続に使う本人専用の内部境界です。所有者は `projects.owner_user_id` で管理し、`project_user_roles`、`project_shares`、共有リンク、editor、viewer は設定しません。各保存先には本人の `project_members` 行を持たせます。本人の家計簿がない場合は、最初の支出追加を開いた時点で `Household.createHouseholdProject` を呼び、名前「家計簿」の `household` プロジェクトを作成してから入力した支出を保存します。家計簿作成用のプロジェクト一覧上の画面はありません。
 
 家計簿の手入力取引は、取引本体、支払い、要約品目、本人への配分を一組で作成します。端末では七表分の配列を `localStorage` の `wari-data-v3` に保存します。旧 `wari-data-v2` がある場合は読み込み時に七表へ変換して `v3` を保存し、旧キーの内容は削除しません。D1 と端末保存は同じ表構成を使います。
 
@@ -26,7 +26,7 @@ projects
 └─ import_records
 ```
 
-`projects.project_type` は `split`、`household`、`shared_household` です。共有情報は `projects` に保存します。割り勘参加者と家計簿保存先の関係は `project_members.linked_household_project_id` と `linked_at` で表します。取込元と取引の関係は `import_records.transaction_id`、家計簿へ生成した派生取引と元の割り勘の関係は `transactions.origin_project_id`、`origin_transaction_id`、`origin_member_id` で表します。
+`projects.project_type` は `split` または `household` です。`household` の所有者は `projects.owner_user_id`、`split` の権限と共有は `project_user_roles` と `project_shares` で管理します。Gmail接続先は `gmail_connections.household_project_id` で本人の家計簿に固定します。割り勘参加者と家計簿保存先の関係は `project_members.linked_household_project_id` と `linked_at` で表します。取込元と取引の関係は `import_records.transaction_id`、家計簿へ生成した派生取引と元の割り勘の関係は `transactions.origin_project_id`、`origin_transaction_id`、`origin_member_id` で表します。旧移行前スキーマにあった `shared_household` は現行のプロジェクト種別ではありません。
 
 割り勘は家計簿へ変換せず、`split` 型のプロジェクトとして残ります。割り勘の実支払額と参加者の消費負担は別に保存し、立替額は `transaction_payments`、品目ごとの負担額は `item_allocations` から計算します。端数は参加者順に一円ずつ配分します。
 

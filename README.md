@@ -2,16 +2,24 @@
 
 スマートフォン向けの割り勘・家計簿アプリです。ホーム画面は個人家計簿の常設カレンダーで、日付ごとの支出を確認・追加できます。割り勘は独立したプロジェクトとして一覧と詳細画面で管理します。
 
-家計簿は画面上では一つのカレンダーに見えますが、内部では `household` 型のプロジェクトとして保存されます。複数の家計簿がある場合も、ホームのカレンダーはそれらの取引を横断して表示します。割り勘から反映された支出も同じカレンダーに表示されます。
+家計簿は `household` 型のプロジェクトとして保存され、ログイン利用者が所有する本人専用の一件を使用します。ホームのカレンダーは本人の家計簿を表示し、複数の家計簿を横断して集計しません。割り勘から反映された支出も本人の家計簿へ表示されます。
 
 ## 画面構成
 
-- ホーム: 複数の `household` プロジェクトを横断する月間カレンダー、日別支出一覧、支出追加
+- ホーム: 本人の `household` プロジェクト一件の月間カレンダー、日別支出一覧、支出追加
 - ホーム下部: `split` 型の割り勘プロジェクト一覧
 - 割り勘詳細: 参加者、お店、精算の各画面
 - 家計簿詳細: 取引、取込、集計の各画面。ホームの日別明細から取引詳細も開けます
 
-ホームで初めて「支出を追加」すると、内部に `household` プロジェクトと本人の `project_members` 行を作成してから支出を保存します。既存の家計簿がある場合は、作成日時が早い家計簿をカレンダーからの新規支出の保存先として使用します。家計簿はホームのプロジェクト一覧には表示せず、取引・取込・共有・割り勘参加者との接続を担う内部保存先として扱います。
+ホームで初めて「支出を追加」すると、ログイン利用者を `projects.owner_user_id` に設定した `household` プロジェクトを作成してから支出を保存します。すでに本人の家計簿がある場合は同じ家計簿を使用し、同時作成による一意制約の衝突が起きた場合も既存の一件を取得します。過去のローカル保存状態に複数の家計簿が残る場合がありますが、自動削除や統合はせず、現行画面では本人の家計簿一件を使用します。家計簿はホームのプロジェクト一覧には表示せず、取引・取込・割り勘参加者との接続を担う内部保存先として扱います。
+
+## プロジェクトと権限
+
+- `split`: 複数利用者で共有できる割り勘。`project_user_roles` と `project_shares` で owner・editor・viewer 権限と共有リンクを管理します。
+- `household`: 利用者本人専用の家計簿。所有者は `projects.owner_user_id` で管理し、共有リンク、editor、viewer、共同所有者は扱いません。
+- `Gmail`: `gmail_connections.household_project_id` で本人の `household` に固定します。接続時や候補登録時に `project_id` は選択せず、候補を確認・修正してから接続先家計簿へ登録します。
+
+現行の `projects.project_type` は `split` と `household` です。`shared_household` は現行仕様には存在しません。
 
 ## 主な機能
 
@@ -20,16 +28,20 @@
 - レシート、カードCSV、PayPay CSV、銀行CSV、解析済み通知の取込と照合
 - 割り勘プロジェクトの作成、参加者・支払い・品目・負担額の管理
 - 支払い合計、負担額、差額、精算結果の表示
-- 割り勘参加者と内部 `household` 保存先の接続
+- 割り勘参加者と本人の内部 `household` 保存先の接続
 - 割り勘確定時の `split_expense` の家計簿への反映
 - Cloudflare D1 と端末内保存
 - `wari-data-v2` から `wari-data-v3` への端末データ移行
-- 共有リンク作成
+- `split` の共有リンク作成
 
 ## データ構成
 
 ```text
 projects
+├─ users
+├─ project_user_roles       # splitの権限
+├─ project_shares           # splitの共有リンク
+├─ gmail_connections        # household_project_idで本人householdへ固定
 ├─ project_members
 ├─ transactions
 │  ├─ transaction_payments
@@ -38,7 +50,7 @@ projects
 └─ import_records
 ```
 
-`projects.project_type` は `split`、`household`、`shared_household` を取ります。割り勘は `split` 型のプロジェクトとして残り、家計簿へ移し替えません。割り勘参加者と家計簿の接続は `project_members.linked_household_project_id`、派生取引と元の割り勘の接続は `transactions.origin_*` で表します。
+`projects.project_type` は `split` または `household` です。`household` の所有者は `projects.owner_user_id` で管理し、利用者一人につき一件に制限します。`split` は `project_user_roles` と `project_shares` で権限と共有を管理します。割り勘は `split` 型のプロジェクトとして残り、家計簿へ移し替えません。割り勘参加者と家計簿の接続は `project_members.linked_household_project_id`、Gmail接続先は `gmail_connections.household_project_id`、派生取引と元の割り勘の接続は `transactions.origin_*` で表します。
 
 通常の家計簿表示に含める取引種別は `purchase`、`split_expense`、`refund`、`adjustment` です。取消・返金済みの取引、割り勘の立替額・精算送金・精算受取は通常支出の集計から除外します。割り勘を確定すると、接続された参加者ごとに家計簿へ `split_expense` を作成または更新します。再同期しても同じ派生取引が増えないよう、元プロジェクト・元取引・参加者・保存先を識別して管理します。
 
