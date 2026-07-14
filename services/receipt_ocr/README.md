@@ -23,11 +23,15 @@ Use this backend on Oracle Cloud A1 or another VM where Tesseract and Ollama can
 export OCR_BACKEND=tesseract_ollama
 export OLLAMA_BASE_URL=http://127.0.0.1:11434
 export OLLAMA_MODEL=qwen2.5:3b
+export OLLAMA_TIMEOUT=25
 export TESSERACT_LANG=jpn+eng
+export TESSERACT_TIMEOUT=20
+export RECEIPT_OCR_SHARED_SECRET='同じ秘密値をCloudflareにも登録'
 python -m services.receipt_ocr.api
 ```
 
 The API calls Ollama only through `127.0.0.1:11434`. Do not expose Ollama directly to the internet.
+`POST /ocr` and `POST /api/ocr-receipt` require `Authorization: Bearer <RECEIPT_OCR_SHARED_SECRET>`. Keep the value identical to the Cloudflare Secret and do not print or commit it.
 
 Required system packages:
 
@@ -41,20 +45,25 @@ Useful runtime settings:
 ```text
 TESSERACT_CMD=tesseract
 TESSERACT_LANG=jpn+eng
-TESSERACT_TIMEOUT=30
+TESSERACT_TIMEOUT=20
 TESSERACT_PSM=6
 TESSERACT_OEM=1
 TESSERACT_MAX_SIDE=1800
 TESSERACT_THRESHOLD=auto
 OLLAMA_BASE_URL=http://127.0.0.1:11434
 OLLAMA_MODEL=qwen2.5:3b
+OLLAMA_TIMEOUT=25
+RECEIPT_OCR_SHARED_SECRET=<Cloudflareと同じ秘密値>
 ```
 
 Environment check:
 
 ```bash
 python -m services.receipt_ocr.check_env
+python -m services.receipt_ocr.check_env --json
 ```
+
+The command checks Python, Pillow, Tesseract, the configured `jpn` and `eng` languages, the local Ollama endpoint and model, temporary file cleanup, and the `/health` response shape. Exit status `0` means ready, `1` means one or more runtime requirements are unavailable, and `2` means the check itself could not run.
 
 Expected result:
 

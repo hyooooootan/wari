@@ -2,7 +2,7 @@ import { ApiError, json, readJson } from "./responses.js";
 
 const IMAGE_TYPES = new Set(["image/jpeg", "image/png", "image/webp", "image/gif", "image/heic", "image/heif"]);
 const DEFAULT_MAX_IMAGE_BYTES = 10 * 1024 * 1024;
-const DEFAULT_TIMEOUT_MS = 25_000;
+const DEFAULT_TIMEOUT_MS = 60_000;
 
 export async function handleReceiptOcr(request, env, payload = null) {
   const maximumBytes = maxImageBytes(env);
@@ -47,6 +47,8 @@ export function parseImageDataUrl(value, maximumBytes = DEFAULT_MAX_IMAGE_BYTES)
 }
 
 async function readReceiptWithRemoteOcr(imageDataUrl, env) {
+  const sharedSecret = String(env.RECEIPT_OCR_SHARED_SECRET || "");
+  if (!sharedSecret) return json({ error: "missing_receipt_ocr_shared_secret" }, 503);
   const baseUrl = String(env.RECEIPT_OCR_API_URL || env.OCR_API_URL || "").replace(/\/+$/, "");
   if (!baseUrl) return json({ error: "missing_receipt_ocr_api_url" }, 503);
   let url;
@@ -60,11 +62,15 @@ async function readReceiptWithRemoteOcr(imageDataUrl, env) {
     url,
     {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${sharedSecret}`,
+      },
       body: JSON.stringify({ image_data_url: imageDataUrl }),
     },
     env,
   );
+  if (remoteRes.status === 401) return json({ error: "remote_ocr_unauthorized" }, 502);
   if (!remoteRes.ok) return json({ error: "remote_ocr_error" }, 502);
   if (!data || typeof data !== "object" || Array.isArray(data)) return json({ error: "invalid_remote_ocr_response" }, 502);
   return json(data);

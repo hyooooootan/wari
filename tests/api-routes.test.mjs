@@ -881,9 +881,10 @@ test("OCR upstream failures are restrained and time out", async (t) => {
   const upstreamFailure = await request(db, "POST", "/api/ocr-receipt", { project_id: "ocr-ledger", image_data_url: "data:image/png;base64,AA==" }, {
     OCR_BACKEND: "remote",
     RECEIPT_OCR_API_URL: "https://ocr.example.test",
+    RECEIPT_OCR_SHARED_SECRET: "shared-secret",
   });
   assert.equal(upstreamFailure.response.status, 502);
-  assert.deepEqual(upstreamFailure.body, { error: "remote_ocr_error" });
+  assert.deepEqual(upstreamFailure.body, { error: "remote_ocr_unauthorized" });
 
   globalThis.fetch = async (_url, options) => new Promise((_resolve, reject) => {
     options.signal.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")), { once: true });
@@ -891,8 +892,54 @@ test("OCR upstream failures are restrained and time out", async (t) => {
   const timedOut = await request(db, "POST", "/api/ocr-receipt", { project_id: "ocr-ledger", image_data_url: "data:image/png;base64,AA==" }, {
     OCR_BACKEND: "remote",
     RECEIPT_OCR_API_URL: "https://ocr.example.test",
+    RECEIPT_OCR_SHARED_SECRET: "shared-secret",
     OCR_TIMEOUT_MS: "100",
   });
   assert.equal(timedOut.response.status, 504);
   assert.deepEqual(timedOut.body, { error: "ocr_timeout" });
+});
+
+test("remote OCR requires shared authentication and forwards the bearer header", async (t) => {
+  const db = new D1Database();
+  const originalFetch = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+    db.close();
+  });
+  await createProject(db, { id: "ocr-auth", name: "OCR", project_type: "household" });
+
+  let forwardedHeaders;
+  globalThis.fetch = async (_url, options) => {
+    forwardedHeaders = options.headers;
+    return new Response(JSON.stringify({ store_name: "店", total_amount: 1200, items: [], warnings: [] }), { status: 200 });
+  };
+  const successful = await request(db, "POST", "/api/ocr-receipt", { project_id: "ocr-auth", image_data_url: "data:image/png;base64,AA==" }, {
+    OCR_BACKEND: "remote",
+    RECEIPT_OCR_API_URL: "https://ocr.example.test",
+    RECEIPT_OCR_SHARED_SECRET: "shared-secret",
+  });
+  assert.equal(successful.response.status, 200);
+  assert.equal(forwardedHeaders.authorization, "Bearer shared-secret");
+
+  let fetchCalls = 0;
+  globalThis.fetch = async () => {
+    fetchCalls += 1;
+    return new Response("unexpected", { status: 500 });
+  };
+  const missingSecret = await request(db, "POST", "/api/ocr-receipt", { project_id: "ocr-auth", image_data_url: "data:image/png;base64,AA==" }, {
+    OCR_BACKEND: "remote",
+    RECEIPT_OCR_API_URL: "https://ocr.example.test",
+  });
+  assert.equal(missingSecret.response.status, 503);
+  assert.deepEqual(missingSecret.body, { error: "missing_receipt_ocr_shared_secret" });
+  assert.equal(fetchCalls, 0);
+
+  globalThis.fetch = async () => new Response(JSON.stringify({ error: "unauthorized" }), { status: 401 });
+  const unauthorized = await request(db, "POST", "/api/ocr-receipt", { project_id: "ocr-auth", image_data_url: "data:image/png;base64,AA==" }, {
+    OCR_BACKEND: "remote",
+    RECEIPT_OCR_API_URL: "https://ocr.example.test",
+    RECEIPT_OCR_SHARED_SECRET: "shared-secret",
+  });
+  assert.equal(unauthorized.response.status, 502);
+  assert.deepEqual(unauthorized.body, { error: "remote_ocr_unauthorized" });
 });
