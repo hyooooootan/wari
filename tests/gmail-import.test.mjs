@@ -76,6 +76,45 @@ async function syncFixture(messageBodies, existing = []) {
   return { db, env, detailCalls: () => detailCalls };
 }
 
+test("Gmail sync passes a stable query and page token across pages", async (t) => {
+  const db = new Database();
+  t.after(() => db.close());
+  seed(db);
+  const now = "2026-07-12T00:00:00.000Z";
+  const requests = [];
+  const env = environment(async (url) => {
+    const value = String(url);
+    if (value.includes("oauth2.googleapis.com/token")) return Response.json({ access_token: "access-secret" });
+    const parsedUrl = new URL(value);
+    if (parsedUrl.pathname.endsWith("/messages")) {
+      requests.push(parsedUrl);
+      const pageToken = parsedUrl.searchParams.get("pageToken");
+      return Response.json(pageToken ? { messages: [{ id: "page-2" }] } : { messages: [{ id: "page-1" }], nextPageToken: "next-page" });
+    }
+    const id = decodeURIComponent(parsedUrl.pathname.split("/messages/")[1]);
+    return Response.json({ id, payload: { mimeType: "text/plain", headers: [{ name: "Date", value: "Fri, 10 Jul 2026 12:30:00 +0900" }], body: { data: base64Url("amount: 1200\ndate: 2026/07/10\nmerchant: Shop") } } });
+  });
+  const encrypted = await encryptRefreshToken(env, "page-connection", "user-1", "refresh-secret");
+  db.raw.prepare("INSERT INTO gmail_connections (id,user_id,household_project_id,gmail_email,refresh_token_ciphertext,refresh_token_iv,key_generation,aad_version,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,1,'active',?,?)").run("page-connection", "user-1", "personal-home", "mail@example.test", encrypted.ciphertext, encrypted.iv, 1, now, now);
+  const first = await syncGmail(db, env, { id: "user-1" }, "page-connection", { days: 7, batch_size: 40 });
+  const second = await syncGmail(db, env, { id: "user-1" }, "page-connection", { days: 7, batch_size: 40, page_token: first.next_page_token, query_after: first.query_after });
+  assert.equal(requests.length, 2);
+  assert.equal(requests[0].searchParams.get("maxResults"), "40");
+  assert.equal(requests[1].searchParams.get("maxResults"), "40");
+  assert.equal(requests[0].searchParams.get("q"), requests[1].searchParams.get("q"));
+  assert.equal(requests[1].searchParams.get("pageToken"), "next-page");
+  assert.equal(first.has_more, true);
+  assert.equal(second.has_more, false);
+  assert.equal(second.query_after, first.query_after);
+  assert.equal(second.candidate_count, 1);
+});
+
+test("Gmail sync rejects a batch size above the external request budget", async (t) => {
+  const fixture = await syncFixture({});
+  t.after(() => fixture.db.close());
+  await assert.rejects(() => syncGmail(fixture.db, fixture.env, { id: "user-1" }, "sync-fixture-connection", { days: 7, batch_size: 41 }), (error) => error.status === 400 && error.message === "invalid_field");
+});
+
 test("AES-GCM token storage uses a 12-byte IV and binds connection, user, and generation through AAD", async () => {
   const env = environment(() => {});
   const encrypted = await encryptRefreshToken(env, "connection-1", "user-1", "refresh-secret");

@@ -162,22 +162,31 @@ export async function retryGmailRevocations(db, env, input = {}) {
 }
 
 export async function syncGmail(db, env, user, connectionId, input = {}) {
-  const days = Number(input.days ?? 30); const limit = Number(input.limit ?? 100);
+  const days = Number(input.days ?? 30);
+  const batchSize = Number(input.batch_size ?? input.limit ?? 40);
   if (!DAYS.has(days)) throw new ApiError(400, "invalid_field", { field: "days" });
-  if (!Number.isInteger(limit) || limit < 1 || limit > 500) throw new ApiError(400, "invalid_field", { field: "limit" });
+  if (!Number.isInteger(batchSize) || batchSize < 1 || batchSize > 40) throw new ApiError(400, "invalid_field", { field: "batch_size" });
+  const pageToken = input.page_token == null ? null : bounded(input.page_token, "page_token", 4096);
+  const queryAfter = input.query_after == null ? Math.floor((Date.now() - days * 86400000) / 1000) : Number(input.query_after);
+  if (!Number.isSafeInteger(queryAfter) || queryAfter < 0) throw new ApiError(400, "invalid_field", { field: "query_after" });
   const syncProject = await requireAnyPersonalHousehold(db,user.id);
   const connection = await ownedActiveConnection(db, user, connectionId); const started = new Date().toISOString(); const runId = crypto.randomUUID();
   const runStarted = await db.prepare(`INSERT INTO gmail_sync_runs (id,connection_id,user_id,days,message_limit,status,started_at)
     SELECT ?,?,?,?,?, 'running',? WHERE EXISTS(SELECT 1 FROM gmail_connections c JOIN users u ON u.id=c.user_id WHERE c.id=? AND c.user_id=? AND c.status='active' AND u.deleted_at IS NULL AND u.deletion_started_at IS NULL)`)
-    .bind(runId,connectionId,user.id,days,limit,started,connectionId,user.id).run();
+    .bind(runId,connectionId,user.id,days,batchSize,started,connectionId,user.id).run();
   if (!changedRows(runStarted)) throw new ApiError(409,"gmail_connection_unavailable");
   let listed=0,processed=0,candidates=0,duplicates=0,errors=0,status="completed",errorCode=null;
+  let nextPageToken = null;
   try {
     const refresh = await decryptRefreshToken(env, connection);
     const token = await googleForm(env, "https://oauth2.googleapis.com/token", { client_id:env.GMAIL_CLIENT_ID,client_secret:env.GMAIL_CLIENT_SECRET,refresh_token:refresh,grant_type:"refresh_token" });
-    const after = Math.floor((Date.now()-days*86400000)/1000);
-    const listing = await googleJson(env, `https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults=${limit}&q=${encodeURIComponent(`after:${after}`)}`, token.access_token);
-    const messages=(listing.messages||[]).slice(0,limit); listed=messages.length;
+    const searchUrl = new URL("https://gmail.googleapis.com/gmail/v1/users/me/messages");
+    searchUrl.searchParams.set("maxResults", String(batchSize));
+    searchUrl.searchParams.set("q", `after:${queryAfter}`);
+    if (pageToken) searchUrl.searchParams.set("pageToken", pageToken);
+    const listing = await googleJson(env, searchUrl.toString(), token.access_token);
+    const messages=(listing.messages||[]).slice(0,batchSize); listed=messages.length;
+    nextPageToken = typeof listing.nextPageToken === "string" && listing.nextPageToken ? listing.nextPageToken : null;
     const pending=[];
     for (const item of messages) {
       const exists=await db.prepare(`SELECT m.id,c.id AS candidate_id FROM gmail_messages m LEFT JOIN gmail_import_candidates c ON c.gmail_message_row_id=m.id WHERE m.connection_id=? AND m.gmail_message_id=?`).bind(connectionId,item.id).first();
@@ -228,7 +237,9 @@ export async function syncGmail(db, env, user, connectionId, input = {}) {
   await db.prepare(`UPDATE gmail_sync_runs SET status=?,listed_count=?,processed_count=?,candidate_count=?,duplicate_count=?,error_count=?,error_code=?,finished_at=? WHERE id=?`)
     .bind(status,listed,processed,candidates,duplicates,errors,errorCode,finished,runId).run();
   await db.prepare("UPDATE gmail_connections SET last_synced_at=?,updated_at=? WHERE id=? AND status IN ('active','reauthorization_required')").bind(finished,finished,connectionId).run();
-  return { run: await db.prepare("SELECT * FROM gmail_sync_runs WHERE id=?").bind(runId).first() };
+  const run = await db.prepare("SELECT * FROM gmail_sync_runs WHERE id=?").bind(runId).first();
+  const hasMore = status === "completed" && Boolean(nextPageToken);
+  return { run, next_page_token: hasMore ? nextPageToken : null, query_after: queryAfter, has_more: hasMore, listed_count: listed, processed_count: processed, candidate_count: candidates, duplicate_count: duplicates, error_count: errors };
 }
 
 export async function listSyncRuns(db,user,connectionId){await ownedConnection(db,user,connectionId);const rows=await db.prepare("SELECT * FROM gmail_sync_runs WHERE connection_id=? AND user_id=? ORDER BY started_at DESC LIMIT 50").bind(connectionId,user.id).all();return{sync_runs:rows.results||[]};}

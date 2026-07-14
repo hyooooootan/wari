@@ -55,10 +55,23 @@ test("Gmail parse errors stay hidden and incomplete candidates cannot be importe
 });
 
 test("Gmail sync displays internal run status without exposing provider data", () => {
-  assert.match(source, /function gmailSyncMessage\(run\)/);
+  assert.match(source, /function gmailSyncMessage\(run, totals = null\)/);
   assert.match(source, /同期完了: 新規候補\$\{candidates\}件、処理\$\{processed\}件、重複\$\{duplicates\}件/);
   assert.match(source, /同期完了: 新しい候補はありません/);
   assert.match(source, /reauthorization_required: /);
   assert.match(source, /rate_limited: /);
   assert.match(source, /finally \{\s*await refreshGmailImport\(\);/);
+});
+
+test("Gmail sync paginates sequentially to 1000 items without exposing page tokens", () => {
+  assert.match(source, /const gmailSyncing = new Set\(\)/);
+  assert.match(source, /for \(let page = 0; page < 25 && totals\.listed_count < 1000; page \+= 1\)/);
+  assert.match(source, /const options = \{ batch_size: 40 \}/);
+  assert.match(source, /options\.page_token = pageToken/);
+  assert.match(source, /options\.query_after = queryAfter/);
+  assert.match(source, /Gmail同期中: \$\{Math\.min\(totals\.listed_count, 1000\)\} \/ 1000件/);
+  assert.match(source, /上限1000件まで確認しました/);
+  assert.match(source, /syncGmailImport\(button\.dataset\.gmailSync, days\)/);
+  assert.match(source, /if \(syncButton\) syncButton\.disabled = true/);
+  assert.doesNotMatch(source, /toast\([^\n]*pageToken/);
 });
