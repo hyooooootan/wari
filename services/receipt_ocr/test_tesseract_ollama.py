@@ -6,10 +6,44 @@ from unittest.mock import patch
 
 from PIL import Image
 
+from services.receipt_ocr import api
 from services.receipt_ocr import tesseract_ollama as ocr
 
 
 class TesseractOllamaTests(unittest.TestCase):
+    def test_shared_bearer_authorization(self):
+        class Handler:
+            def __init__(self, authorization):
+                self.headers = {"Authorization": authorization} if authorization is not None else {}
+                self.response = None
+
+            def send_json(self, status, payload):
+                self.response = (status, payload)
+
+        with patch.object(api, "RECEIPT_OCR_SHARED_SECRET", "shared-secret"):
+            self.assertTrue(api.authorize_ocr_request(Handler("Bearer shared-secret")))
+            missing = Handler(None)
+            self.assertFalse(api.authorize_ocr_request(missing))
+            self.assertEqual(missing.response, (401, {"error": "unauthorized"}))
+            malformed = Handler("Basic shared-secret")
+            self.assertFalse(api.authorize_ocr_request(malformed))
+            self.assertEqual(malformed.response[0], 401)
+            mismatch = Handler("Bearer other-secret")
+            self.assertFalse(api.authorize_ocr_request(mismatch))
+            self.assertEqual(mismatch.response[0], 401)
+
+        unavailable = Handler("Bearer shared-secret")
+        with patch.object(api, "RECEIPT_OCR_SHARED_SECRET", ""):
+            self.assertFalse(api.authorize_ocr_request(unavailable))
+        self.assertEqual(unavailable.response, (503, {"error": "ocr_auth_unavailable"}))
+
+    def test_public_health_does_not_expose_secret_or_configuration(self):
+        with patch.object(api, "OCR_BACKEND", "gemini"), patch.object(api, "RECEIPT_OCR_SHARED_SECRET", "secret-value"):
+            payload = api.public_health_payload()
+        serialized = str(payload)
+        self.assertNotIn("secret-value", serialized)
+        self.assertNotIn("127.0.0.1", serialized)
+
     def test_decode_rejects_broken_base64(self):
         with self.assertRaises(ValueError):
             ocr.decode_data_url("data:image/png;base64,***")

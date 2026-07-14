@@ -1,4 +1,5 @@
 import base64
+import hmac
 import json
 import os
 import re
@@ -17,6 +18,7 @@ MAX_BODY_SIZE = int(os.environ.get("OCR_MAX_BODY_SIZE", str(10 * 1024 * 1024)))
 OCR_BACKEND = os.environ.get("OCR_BACKEND", "gemini").lower()
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 GEMINI_OCR_MODEL = os.environ.get("GEMINI_OCR_MODEL", "gemini-2.5-flash")
+RECEIPT_OCR_SHARED_SECRET = os.environ.get("RECEIPT_OCR_SHARED_SECRET", "")
 
 
 class ReceiptOcrHandler(BaseHTTPRequestHandler):
@@ -33,14 +35,7 @@ class ReceiptOcrHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = urlparse(self.path).path
         if path == "/health":
-            payload = {"ok": True, "service": "receipt-ocr", "backend": OCR_BACKEND}
-            if use_tesseract_ollama_backend():
-                try:
-                    from services.receipt_ocr.tesseract_ollama import health as tesseract_ollama_health
-                except ImportError:
-                    from tesseract_ollama import health as tesseract_ollama_health
-                payload["tesseract_ollama"] = tesseract_ollama_health()
-            self.send_json(200, payload)
+            self.send_json(200, public_health_payload())
             return
         if path == "/":
             self.send_json(
@@ -61,6 +56,8 @@ class ReceiptOcrHandler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if path not in ("/ocr", "/api/ocr-receipt"):
             self.send_json(404, {"error": "not_found"})
+            return
+        if not authorize_ocr_request(self):
             return
 
         try:
@@ -112,6 +109,40 @@ class ReceiptOcrHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
+
+
+def authorize_ocr_request(handler):
+    if not RECEIPT_OCR_SHARED_SECRET:
+        handler.send_json(503, {"error": "ocr_auth_unavailable"})
+        return False
+    parts = (handler.headers.get("Authorization", "")).split(" ", 1)
+    if len(parts) != 2 or parts[0].lower() != "bearer" or not parts[1]:
+        handler.send_json(401, {"error": "unauthorized"})
+        return False
+    if not hmac.compare_digest(parts[1], RECEIPT_OCR_SHARED_SECRET):
+        handler.send_json(401, {"error": "unauthorized"})
+        return False
+    return True
+
+
+def public_health_payload():
+    payload = {"ok": True, "service": "receipt-ocr"}
+    if use_tesseract_ollama_backend():
+        try:
+            from services.receipt_ocr.tesseract_ollama import health as tesseract_ollama_health
+        except ImportError:
+            from tesseract_ollama import health as tesseract_ollama_health
+        details = tesseract_ollama_health()
+        tesseract = details.get("tesseract", {})
+        ollama = details.get("ollama", {})
+        payload["tesseract_ollama"] = {
+            "ready": bool(tesseract.get("available") and tesseract.get("configured_langs_available") and ollama.get("available") and ollama.get("model_present")),
+            "tesseract_available": bool(tesseract.get("available")),
+            "languages_available": bool(tesseract.get("configured_langs_available")),
+            "ollama_available": bool(ollama.get("available")),
+            "model_available": bool(ollama.get("model_present")),
+        }
+    return payload
 
 
 def parse_multipart_image(body, content_type):

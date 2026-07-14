@@ -126,6 +126,8 @@ Cloudflare Pages側で以下を設定すると、Wari画面からOracle A1上の
 ```text
 OCR_BACKEND=tesseract_ollama
 RECEIPT_OCR_API_URL=https://<Oracle OCR APIの公開URL>
+RECEIPT_OCR_SHARED_SECRET=<CloudflareとOracleへ同じ秘密値を登録>
+OCR_TIMEOUT_MS=60000
 ```
 
 `RECEIPT_OCR_API_URL` には `/api/ocr-receipt` を含めない。
@@ -237,11 +239,22 @@ curl -fsS -X POST -F "image=@/path/to/receipt.jpg;type=image/jpeg" http://127.0.
 ```text
 OCR_BACKEND=tesseract_ollama
 RECEIPT_OCR_API_URL=https://<Oracle OCR APIの公開URL>
-OCR_TIMEOUT_MS=25000以下の実値
+RECEIPT_OCR_SHARED_SECRET=<Cloudflareと同じ秘密値>
+OCR_TIMEOUT_MS=60000
 OCR_MAX_IMAGE_BYTES=実機とCloudflareの許容量に合わせた値
 ```
 
-Oracle OCR APIは現在、Cloudflareからの共有認証情報を検査していない。公開URLへ直接到達できる構成では、Cloudflare側とOracle側に共有認証情報を追加し、Oracle側で認証されていない要求を拒否してから実機配備へ進める必要がある。Ollamaは引き続き`127.0.0.1:11434`へ限定し、公開しない。
+Cloudflare Pagesでは`RECEIPT_OCR_SHARED_SECRET`をSecretとして登録し、Oracleではサービスの環境ファイルまたはsystemdの環境設定へ同じ値を登録する。値はログ、Git、文書へ保存しない。Oracle側は`POST /ocr`と`POST /api/ocr-receipt`のBearer認証を検査し、秘密値未設定は503、不正な要求は401で拒否する。Ollamaは引き続き`127.0.0.1:11434`へ限定し、公開しない。
+
+Cloudflareの設定例:
+
+```bash
+npx wrangler pages secret put RECEIPT_OCR_SHARED_SECRET --project-name wari
+```
+
+Oracle側では秘密値を対話入力または保護された環境ファイルから設定し、`systemctl restart wari-receipt-ocr`後に認証付き`POST`を確認する。秘密値をコマンド引数へ直接書かない。
+
+時間制限は、Tesseract 20秒、Ollama 25秒、CloudflareからOracleまでの総時間60秒を初期値とする。実機で画像前処理・Tesseract・Ollama・通信を測定し、60秒以内に収まらない場合は配備を止めて値を再調整する。
 
 ## 残作業
 
@@ -256,7 +269,6 @@ Cloudflare Pages環境変数の設定
 Wari画面から読み取り確認
 OCR誤字補正表の追加
 実レシートで前処理とOllama指示の調整
-CloudflareとOracle間の共有認証情報を設定
 ```
 
 ## A1作成後の自動導入

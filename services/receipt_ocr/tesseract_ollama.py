@@ -17,10 +17,10 @@ from PIL import Image, ImageEnhance, ImageOps
 
 OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5:3b")
-OLLAMA_TIMEOUT = float(os.environ.get("OLLAMA_TIMEOUT", "20"))
+OLLAMA_TIMEOUT = float(os.environ.get("OLLAMA_TIMEOUT", "25"))
 TESSERACT_CMD = os.environ.get("TESSERACT_CMD", "tesseract")
 TESSERACT_LANG = os.environ.get("TESSERACT_LANG", "jpn+eng")
-TESSERACT_TIMEOUT = int(os.environ.get("TESSERACT_TIMEOUT", "30"))
+TESSERACT_TIMEOUT = int(os.environ.get("TESSERACT_TIMEOUT", "20"))
 TESSERACT_PSM = os.environ.get("TESSERACT_PSM", "6")
 TESSERACT_OEM = os.environ.get("TESSERACT_OEM", "1")
 TESSERACT_MAX_SIDE = int(os.environ.get("TESSERACT_MAX_SIDE", "1800"))
