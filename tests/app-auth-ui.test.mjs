@@ -1,8 +1,22 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 const source = readFileSync(new URL("../public/app.js", import.meta.url), "utf8");
+
+test("public app script passes the JavaScript syntax check", () => {
+  execFileSync(process.execPath, ["--check", fileURLToPath(new URL("../public/app.js", import.meta.url))], { stdio: "pipe" });
+});
+
+test("public app click handler keeps the Gmail branch and other actions reachable", () => {
+  assert.match(source, /if \(button\.dataset\.gmailSync\) \{[\s\S]*?await syncGmailImport\(button\.dataset\.gmailSync, days\);[\s\S]*?return;/);
+  assert.doesNotMatch(source, /if \(false\)/);
+  assert.doesNotMatch(source, /Api\.syncGmail\(button\.dataset\.gmailSync, days, 100\)/);
+  assert.match(source, /if \(button\.dataset\.gmailDisconnect\)/);
+  assert.match(source, /if \(button\.dataset\.gmailImport\)/);
+});
 
 test("認証状態に応じたGoogleログイン操作を表示する", () => {
   assert.match(source, /cloudSession\.status === "authenticated"/);
@@ -60,7 +74,7 @@ test("Gmail sync displays internal run status without exposing provider data", (
   assert.match(source, /同期完了: 新しい候補はありません/);
   assert.match(source, /reauthorization_required: /);
   assert.match(source, /rate_limited: /);
-  assert.match(source, /finally \{\s*await refreshGmailImport\(\);/);
+  assert.match(source, /finally \{[\s\S]*await refreshGmailImport\(\);/);
 });
 
 test("Gmail sync paginates sequentially to 1000 items without exposing page tokens", () => {
