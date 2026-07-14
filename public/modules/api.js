@@ -491,7 +491,10 @@ function createApiClient(options = {}) {
   }
   const listGmailConnections = () => request("/gmail/connections");
   const disconnectGmail = (connectionId) => request(`/gmail/connections/${encoded(connectionId)}`, { method: "DELETE" });
-  const syncGmail = (connectionId, days = 30, limit = 100) => request(`/gmail/connections/${encoded(connectionId)}/sync`, { method: "POST", json: { days, limit } });
+  const syncGmail = (connectionId, days = 30, limitOrOptions = 40) => {
+    const options = limitOrOptions && typeof limitOrOptions === "object" ? limitOrOptions : { limit: limitOrOptions };
+    return request(`/gmail/connections/${encoded(connectionId)}/sync`, { method: "POST", json: { days, ...options } });
+  };
   const listGmailCandidates = (status) => request("/gmail/candidates", { query: status ? { status } : undefined });
   const updateGmailCandidate = (candidateId, values) => request(`/gmail/candidates/${encoded(candidateId)}`, { method: "PATCH", json: values });
   const importGmailCandidate = (candidateId) => request(`/gmail/candidates/${encoded(candidateId)}/import`, { method: "POST", json: {} });

@@ -71,6 +71,7 @@ let activeProjectId = null;
 let lastToastTimer = 0;
 let remoteSyncQueue = Promise.resolve();
 const gmailUi = { connections: [], candidates: [] };
+const gmailSyncing = new Set();
 const shareTokensByProject = new Map();
 const ui = {
   createMode: null,
@@ -169,12 +170,16 @@ function toast(message) {
   lastToastTimer = setTimeout(() => element.classList.remove("show"), 2200);
 }
 
-function gmailSyncMessage(run) {
+function gmailSyncMessage(run, totals = null) {
   const status = run?.status;
-  const candidates = Number(run?.candidate_count || 0);
-  const processed = Number(run?.processed_count || 0);
-  const duplicates = Number(run?.duplicate_count || 0);
+  const summary = totals || run || {};
+  const candidates = Number(summary.candidate_count || 0);
+  const processed = Number(summary.processed_count || 0);
+  const duplicates = Number(summary.duplicate_count || 0);
   if (status === "completed") {
+    if (totals) return candidates > 0
+      ? `同期完了: 検索${Number(summary.listed_count || 0)}件、新規候補${candidates}件、処理${processed}件、重複${duplicates}件`
+      : `同期完了: 検索${Number(summary.listed_count || 0)}件、新しい候補はありません`;
     return candidates > 0
       ? `同期完了: 新規候補${candidates}件、処理${processed}件、重複${duplicates}件`
       : "同期完了: 新しい候補はありません";
@@ -192,6 +197,51 @@ function gmailSyncMessage(run) {
     gmail_personal_household_lost: "本人の家計簿を確認できません",
   };
   return codes[run?.error_code] || messages[status] || "Gmail同期を完了できませんでした";
+}
+
+async function syncGmailImport(connectionId, days) {
+  if (gmailSyncing.has(connectionId)) return;
+  gmailSyncing.add(connectionId);
+  render();
+  const syncButton = document.querySelector(`[data-gmail-sync="${CSS.escape(connectionId)}"]`);
+  if (syncButton) syncButton.disabled = true;
+  const totals = { listed_count: 0, processed_count: 0, candidate_count: 0, duplicate_count: 0, error_count: 0 };
+  let pageToken = null;
+  let queryAfter = null;
+  let lastRun = { status: "completed" };
+  try {
+    for (let page = 0; page < 25 && totals.listed_count < 1000; page += 1) {
+      const options = { batch_size: 40 };
+      if (pageToken) options.page_token = pageToken;
+      if (queryAfter !== null) options.query_after = queryAfter;
+      const result = await Api.syncGmail(connectionId, days, options);
+      lastRun = result?.run || { status: "failed", error_code: "gmail_sync_error" };
+      totals.listed_count += Number(result?.listed_count ?? lastRun.listed_count ?? 0);
+      totals.processed_count += Number(result?.processed_count ?? lastRun.processed_count ?? 0);
+      totals.candidate_count += Number(result?.candidate_count ?? lastRun.candidate_count ?? 0);
+      totals.duplicate_count += Number(result?.duplicate_count ?? lastRun.duplicate_count ?? 0);
+      totals.error_count += Number(result?.error_count ?? lastRun.error_count ?? 0);
+      if (queryAfter === null && result?.query_after !== undefined) queryAfter = result.query_after;
+      if (lastRun.status !== "completed") {
+        toast(gmailSyncMessage(lastRun, totals));
+        return;
+      }
+      pageToken = result?.next_page_token || null;
+      if (totals.listed_count < 1000 && result?.has_more && pageToken) toast(`Gmail同期中: ${Math.min(totals.listed_count, 1000)} / 1000件`);
+      if (!result?.has_more || !pageToken) break;
+    }
+    if (totals.listed_count >= 1000 && pageToken) toast("同期完了: 上限1000件まで確認しました");
+    else if (pageToken && totals.listed_count < 1000) toast("同期完了: 25ページを確認しました。続きがあります");
+    else toast(gmailSyncMessage(lastRun, totals));
+  } catch (error) {
+    toast(error.message || "Gmail同期を実行できませんでした");
+  } finally {
+    gmailSyncing.delete(connectionId);
+    await refreshGmailImport();
+    render();
+    const refreshedButton = document.querySelector(`[data-gmail-sync="${CSS.escape(connectionId)}"]`);
+    if (refreshedButton) refreshedButton.disabled = false;
+  }
 }
 
 function statusText() {
@@ -2101,13 +2151,18 @@ document.addEventListener("click", async (event) => {
     }
     if (button.dataset.gmailSync) {
       const days = Number(document.querySelector(`[data-gmail-days="${CSS.escape(button.dataset.gmailSync)}"]`)?.value || 30);
-      try {
+      await syncGmailImport(button.dataset.gmailSync, days);
+      return;
+      if (false) {
+        try {
         const result = await Api.syncGmail(button.dataset.gmailSync, days, 100);
         toast(gmailSyncMessage(result?.run));
       } catch (error) {
         toast(error.message || "Gmail同期を実行できませんでした");
       } finally {
         await refreshGmailImport();
+      }
+        }
       }
       return;
     }
