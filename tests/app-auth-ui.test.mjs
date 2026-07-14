@@ -47,3 +47,9 @@ test("Gmail state refreshes on startup and import tab selection", () => {
   assert.match(source, /await bootCloud\(\);\s*if \(isCloud\) await refreshGmailImport\(false\);/);
   assert.match(source, /button\.dataset\.projectTab === "imports"\) \{\s*await refreshGmailImport\(false\);/);
 });
+
+test("Gmail parse errors stay hidden and incomplete candidates cannot be imported", () => {
+  assert.match(source, /\["ignored", "imported", "parse_error"\]\.includes\(row\.status\)/);
+  assert.match(source, /金額と店名を入力してください/);
+  assert.match(source, /data-gmail-import="\$\{esc\(row\.id\)\}" \$\{complete \? "" : "disabled"\}/);
+});

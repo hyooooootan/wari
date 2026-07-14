@@ -3,11 +3,12 @@ export function parsePaymentNotification(text, headers = {}) {
   const sender = String(headers.from || "").toLowerCase();
   const provider = providerName(sender, source);
   const amount = parseAmount(source);
-  const occurredAt = parseDateTime(source, headers.date);
+  const occurredAt = parseDateTime(source);
   const merchant = parseMerchant(source);
   const externalId = match(source, /(?:利用番号|取引番号|決済番号|受付番号|transaction\s*(?:id|number))\s*[:：]?\s*([A-Z0-9_-]{4,64})/i);
   const paymentMethod = /paypay/i.test(provider) ? "paypay" : /銀行|bank/i.test(source) ? "bank" : "credit_card";
-  const status = amount !== null && occurredAt && merchant ? "parsed" : (amount !== null || occurredAt || merchant) ? "needs_review" : "parse_error";
+  const paymentEvidence = amount !== null && amount !== 0;
+  const status = !paymentEvidence ? "parse_error" : amount !== null && occurredAt && merchant ? "parsed" : "needs_review";
   return { provider, amount, occurred_at: occurredAt, merchant_name: merchant, external_transaction_id: externalId, payment_method: paymentMethod, parse_status: status };
 }
 

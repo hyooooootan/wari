@@ -46,3 +46,13 @@ test("calendar entry keeps the selected local day and month in sync", () => {
   assert.match(entrySource, /ui\.calendarDay = String\(data\.get\("occurred_at"\) \|\| ui\.calendarDay\)/);
   assert.match(entrySource, /ui\.calendarMonth = ui\.calendarDay\.slice\(0, 7\)/);
 });
+
+test("calendar totals include provisional transactions and retain status tags", () => {
+  const calendarSource = functionSource("renderHouseholdCalendar");
+  assert.doesNotMatch(calendarSource, /filter\(\(transaction\) => transaction\.status !== "provisional"\)/);
+  assert.match(calendarSource, /const total = rows\.reduce\(/);
+  assert.match(calendarSource, /const monthTotal = monthTransactions\.reduce\(/);
+  assert.match(appSource, /function statusTag\(status\)/);
+  assert.match(appSource, /provisional: /);
+  assert.match(appSource, /statusTag\(transaction\.status\)/);
+});
