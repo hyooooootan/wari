@@ -1,13 +1,13 @@
 {
   "name": "Wari",
   "short_name": "Wari",
-  "description": "お店ごとの支払いを入力して精算する割り勘アプリ",
+  "description": "割り勘と家計簿を一つにまとめる記録アプリ",
   "id": "/",
   "start_url": "/",
   "scope": "/",
   "display": "standalone",
   "orientation": "portrait",
-  "background_color": "#f7f5ef",
+  "background_color": "#f4f5f1",
   "theme_color": "#2f6f4e",
   "icons": [
     {

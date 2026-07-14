@@ -1,199 +1,118 @@
 # Wari
 
-スマホ向けの軽い割り勘管理アプリです。
+スマートフォン向けの割り勘・家計簿アプリです。ホーム画面は個人家計簿の常設カレンダーで、日付ごとの支出を確認・追加できます。割り勘は独立したプロジェクトとして一覧と詳細画面で管理します。
 
-現在は、手入力でプロジェクト・参加者・お店・支払いを管理できます。Cloudflare Pages + Pages Functions + D1 へ移行できる土台と、別サーバーで動かすローカルOCR実験用コードを分離してあります。
+家計簿は `household` 型のプロジェクトとして保存され、ログイン利用者が所有する本人専用の一件を使用します。ホームのカレンダーは本人の家計簿を表示し、複数の家計簿を横断して集計しません。割り勘から反映された支出も本人の家計簿へ表示されます。
 
-## できること
+## 画面構成
 
-- プロジェクト作成
-- 参加者追加
-- お店ごとの合計金額登録
-- お店ごとの複数支払者登録
+- ホーム: 本人の `household` プロジェクト一件の月間カレンダー、日別支出一覧、支出追加
+- ホーム下部: `split` 型の割り勘プロジェクト一覧
+- 割り勘詳細: 参加者、お店、精算の各画面
+- 家計簿詳細: 取引、取込、集計の各画面。ホームの日別明細から取引詳細も開けます
+
+ホームで初めて「支出を追加」すると、ログイン利用者を `projects.owner_user_id` に設定した `household` プロジェクトを作成してから支出を保存します。すでに本人の家計簿がある場合は同じ家計簿を使用し、同時作成による一意制約の衝突が起きた場合も既存の一件を取得します。過去のローカル保存状態に複数の家計簿が残る場合がありますが、自動削除や統合はせず、現行画面では本人の家計簿一件を使用します。家計簿はホームのプロジェクト一覧には表示せず、取引・取込・割り勘参加者との接続を担う内部保存先として扱います。
+
+## プロジェクトと権限
+
+- `split`: 複数利用者で共有できる割り勘。`project_user_roles` と `project_shares` で owner・editor・viewer 権限と共有リンクを管理します。
+- `household`: 利用者本人専用の家計簿。所有者は `projects.owner_user_id` で管理し、共有リンク、editor、viewer、共同所有者は扱いません。
+- `Gmail`: `gmail_connections.household_project_id` で本人の `household` に固定します。接続時や候補登録時に `project_id` は選択せず、候補を確認・修正してから接続先家計簿へ登録します。
+
+現行の `projects.project_type` は `split` と `household` です。`shared_household` は現行仕様には存在しません。
+
+## 主な機能
+
+- 常設カレンダーでの日別支出表示と支出追加
+- 家計簿の月別・費目別・支払方法別集計
+- レシート、カードCSV、PayPay CSV、銀行CSV、解析済み通知の取込と照合
+- 割り勘プロジェクトの作成、参加者・支払い・品目・負担額の管理
 - 支払い合計、負担額、差額、精算結果の表示
-- Cloudflare D1 への保存
-- 共有リンク作成
-- レシートOCR用に `receipt_image_url` を保持
-
-## ディレクトリ構成
-
-```text
-.
-├─ public/                    # Cloudflare Pagesで配信するフロント
-│  ├─ index.html
-│  ├─ app.js
-│  └─ styles.css
-├─ functions/api/[[path]].js   # Cloudflare Pages Functions API
-├─ db/schema.sql               # Cloudflare D1 / SQLite schema
-├─ services/receipt_ocr/       # Render Free向けGemini OCR中継
-│  ├─ api.py                   # HTTP API: /ocr, /api/ocr-receipt
-│  ├─ core.py                  # ローカル実験用PaddleOCR読み取り・レシート解析
-│  ├─ probe.py                 # 画像がレシートっぽいか確認する実験CLI
-│  ├─ .python-version
-│  ├─ requirements.txt         # Render Free向けGemini中継
-│  └─ requirements-local.txt   # ローカル実験用PaddleOCR
-├─ server.py                   # ローカル確認用の静的サーバー + OCRプロキシ
-├─ render.yaml                 # Render Free向けOCRサービスBlueprint
-├─ wrangler.toml               # Cloudflare Pages / D1 設定
-└─ package.json
-```
-
-OCR本体は `services/receipt_ocr/` に寄せています。ルート直下には、アプリ本体の設定・ローカル起動・Cloudflare設定を置く方針です。
-
-## 三段方式
-
-公開前の基本構成は以下です。
-
-```text
-public/                      # フロントエンド
-functions/api/[[path]].js     # バックエンド
-db/schema.sql                 # DB
-```
-
-詳しくは [docs/three-tier.md](docs/three-tier.md) にまとめています。
-
-## ローカル起動
-
-軽い確認には、Pythonのローカルサーバーで起動できます。
-
-```powershell
-python server.py
-```
-
-ブラウザで `http://127.0.0.1:4181` を開きます。Cloudflare D1 が使えない環境では `localStorage` に保存します。
-
-Cloudflare Pages Functions と D1 をローカル確認する場合は Wrangler を使います。
-
-```powershell
-npm install
-npm run db:local
-npm run dev:cloudflare
-```
-
-## Cloudflare設定
-
-1. Cloudflare にログインします。
-
-```powershell
-npx wrangler login
-```
-
-2. D1 database を作成します。
-
-```powershell
-npm run d1:create
-```
-
-3. 表示された `database_id` を `wrangler.toml` に入れます。
-
-```toml
-database_id = "ここにdatabase_id"
-```
-
-4. D1 にテーブルを作ります。
-
-```powershell
-npm run d1:migrate:remote
-```
-
-5. Cloudflare Pages で GitHub リポジトリ `hyooooootan/wari` を接続します。
-
-6. Pages の D1 binding を設定します。
-
-```text
-Binding name: DB
-D1 database: wari-db
-```
-
-## OCRについて
-
-OCRは3系統を切り替えられる構成です。
-
-### 1. Cloudflare上のAI OCR
-
-Cloudflare Pages Functions の `/api/ocr-receipt` は、環境変数で OpenAI API と Gemini API を切り替えられます。
-
-```text
-OCR_BACKEND=auto
-OPENAI_API_KEY=sk-...
-OPENAI_OCR_MODEL=gpt-5.4-mini
-GEMINI_API_KEY=...
-GEMINI_OCR_MODEL=gemini-2.5-flash
-```
-
-`OCR_BACKEND` は `auto`、`openai`、`gemini` を指定できます。`auto` は OpenAI API の鍵があれば OpenAI、なければ Gemini を使います。
-
-### 2. ローカル確認用の切り替え
-
-ルートの `server.py` も `/api/ocr-receipt` を持っています。ローカルでは以下を選べます。
-
-```text
-OCR_BACKEND=local
-OCR_BACKEND=openai
-OCR_BACKEND=gemini
-OCR_BACKEND=auto
-```
-
-`local` は `services/receipt_ocr/` の PaddleOCR を使います。`openai` は `OPENAI_API_KEY`、`gemini` は `GEMINI_API_KEY` が必要です。
-
-### 3. Render Free向けのGemini中継
-
-Render Free では `services/receipt_ocr/` を Gemini API へ画像を渡す中継サーバーとして使います。Render 側でPaddleOCRのモデル読み込みは行いません。
-
-```powershell
-python -m venv .venv
-.\\.venv\\Scripts\\Activate.ps1
-pip install -r services/receipt_ocr/requirements.txt
-$env:OCR_BACKEND="gemini"
-$env:GEMINI_API_KEY="..."
-python -m services.receipt_ocr.api
-```
-
-起動後は以下にPOSTできます。
-
-```text
-POST http://127.0.0.1:4190/ocr
-POST http://127.0.0.1:4190/api/ocr-receipt
-```
-
-OpenAI APIやGemini APIを使わない検証用に、PaddleOCR版も同じ入口から起動できます。その場合は `services/receipt_ocr/requirements-local.txt` を使います。
-
-```powershell
-pip install -r services/receipt_ocr/requirements-local.txt
-$env:OCR_BACKEND="local"
-python -m services.receipt_ocr.api
-```
-
-Render Free に載せる場合は、この `services/receipt_ocr` をサービス単位として扱います。
-
-Render Blueprintを使う場合は、ルートの `render.yaml` を選べば `wari-receipt-ocr` というWeb Serviceが作られます。手動作成する場合は以下です。
-
-```text
-Root Directory: services/receipt_ocr
-Build Command: pip install -r requirements.txt
-Start Command: python api.py
-Health Check Path: /health
-Plan: Free
-```
-
-Render の環境変数には以下を設定します。
-
-```text
-OCR_BACKEND=gemini
-GEMINI_API_KEY=...
-GEMINI_OCR_MODEL=gemini-2.5-flash
-```
+- 割り勘参加者と本人の内部 `household` 保存先の接続
+- 割り勘確定時の `split_expense` の家計簿への反映
+- Cloudflare D1 と端末内保存
+- `wari-data-v2` から `wari-data-v3` への端末データ移行
+- `split` の共有リンク作成
 
 ## データ構成
 
 ```text
 projects
-members
-expenses          # お店での1回の会計
-expense_payments  # 実際に払った人と金額
-items             # 将来の内訳/品目用
-item_members      # 将来の品目ごとの負担者用
-project_shares    # 共有リンク
+├─ users
+├─ project_user_roles       # splitの権限
+├─ project_shares           # splitの共有リンク
+├─ gmail_connections        # household_project_idで本人householdへ固定
+├─ project_members
+├─ transactions
+│  ├─ transaction_payments
+│  └─ transaction_items
+│     └─ item_allocations
+└─ import_records
 ```
 
-現在の精算は、お店の合計金額を参加者全員で均等割りし、`expense_payments` の立替額との差額から「誰が誰にいくら払うか」を計算します。
+`projects.project_type` は `split` または `household` です。`household` の所有者は `projects.owner_user_id` で管理し、利用者一人につき一件に制限します。`split` は `project_user_roles` と `project_shares` で権限と共有を管理します。割り勘は `split` 型のプロジェクトとして残り、家計簿へ移し替えません。割り勘参加者と家計簿の接続は `project_members.linked_household_project_id`、Gmail接続先は `gmail_connections.household_project_id`、派生取引と元の割り勘の接続は `transactions.origin_*` で表します。
+
+通常の家計簿表示に含める取引種別は `purchase`、`split_expense`、`refund`、`adjustment` です。取消・返金済みの取引、割り勘の立替額・精算送金・精算受取は通常支出の集計から除外します。割り勘を確定すると、接続された参加者ごとに家計簿へ `split_expense` を作成または更新します。再同期しても同じ派生取引が増えないよう、元プロジェクト・元取引・参加者・保存先を識別して管理します。
+
+端末では七表分の配列を `localStorage` の `wari-data-v3` に保存します。旧 `wari-data-v2` がある場合は読み込み時に変換して `v3` を作成し、旧保存内容も残します。D1 でも同じ七表を使います。
+
+## ディレクトリ構成
+
+```text
+.
+├─ public/                    # Cloudflare Pages で配信するフロントエンド
+│  ├─ index.html
+│  ├─ app.js
+│  ├─ styles.css
+│  └─ modules/                # 端末保存、計算、取込、API 通信
+├─ functions/api/[[path]].js  # Cloudflare Pages Functions API
+├─ functions/lib/             # 取引、照合、CSV、同期、OCR 共通処理
+├─ db/
+│  ├─ schema.sql              # 空の D1 向け七表定義
+│  ├─ migrations/             # 番号付き D1 移行
+│  └─ verify_household_ledger.sql
+├─ tests/                     # Node 標準試験
+├─ services/receipt_ocr/      # OCR 中継・ローカル実験
+├─ server.py                  # 静的画面確認用サーバーと OCR プロキシ
+├─ render.yaml
+├─ wrangler.toml
+└─ package.json
+```
+
+## ローカル確認
+
+静的画面を確認する場合は次を実行します。
+
+```powershell
+python server.py
+```
+
+ブラウザで `http://127.0.0.1:4181` を開きます。D1 が使えない場合も、データは `localStorage` に保存されます。
+
+自動試験と、Pages Functions・D1 を含む確認には次を実行します。
+
+```powershell
+npm install
+npm run db:migrate:local
+npm test
+npm run dev:cloudflare
+```
+
+`npm run db:migrate:local` はローカル D1 に番号付き移行を適用します。`npm run db:local` は `db/schema.sql` から新しい七表を直接作る命令です。同じローカル D1 保存先へ両方を続けて実行しないでください。`npm run dev:cloudflare` の確認先は通常 `http://localhost:8788` です。ポートが使用中の場合は Wrangler の表示を確認してください。
+
+D1 移行後の確認には次を使います。
+
+```powershell
+npx wrangler d1 execute wari-db --local --file=./db/verify_household_ledger.sql
+```
+
+## Cloudflare 設定
+
+```powershell
+npx wrangler login
+npm run d1:create
+```
+
+`npm run d1:create` の出力にある `database_id` を `wrangler.toml` に設定し、空の D1 には `npm run d1:migrate:remote`、既存の旧七表を移行する D1 には書出しを取得したうえで `npm run db:migrate:remote` を実行します。移行後は `db/verify_household_ledger.sql` を実行し、失敗件数が0であること、移行前後の件数と金額を確認します。Pages の D1 binding は `DB`、接続先は `wari-db` です。
+
+OCR の構成と D1 移行の詳細は [docs/household-ledger.md](docs/household-ledger.md) を参照してください。
