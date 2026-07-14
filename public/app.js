@@ -72,6 +72,7 @@ let lastToastTimer = 0;
 let remoteSyncQueue = Promise.resolve();
 const gmailUi = { connections: [], candidates: [] };
 const gmailSyncing = new Set();
+const gmailSyncProgress = new Map();
 const shareTokensByProject = new Map();
 const ui = {
   createMode: null,
@@ -199,13 +200,36 @@ function gmailSyncMessage(run, totals = null) {
   return codes[run?.error_code] || messages[status] || "Gmail同期を完了できませんでした";
 }
 
+function gmailSyncTotalsMessage(totals) {
+  return `同期完了: 検索${totals.listed_count}件、新規候補${totals.candidate_count}件、重複${totals.duplicate_count}件、除外${totals.ignored_count}件`;
+}
+
+function renderGmailProgress() {
+  const section = document.querySelector(".import-section");
+  if (!section) return;
+  let element = section.querySelector("[data-gmail-progress]");
+  if (!element) {
+    element = document.createElement("div");
+    element.dataset.gmailProgress = "true";
+    element.className = "review-row-value";
+    element.style.whiteSpace = "pre-line";
+    section.prepend(element);
+  }
+  const progress = [...gmailSyncProgress.values()][0];
+  element.textContent = progress
+    ? `Gmail同期中\n確認済み: ${progress.listed_count} / 1000件\n新規候補: ${progress.candidate_count}件\n重複: ${progress.duplicate_count}件\n除外: ${progress.ignored_count}件\n取込対象: 三井住友カード`
+    : "Gmail取込対象: 三井住友カード";
+}
+
 async function syncGmailImport(connectionId, days) {
   if (gmailSyncing.has(connectionId)) return;
   gmailSyncing.add(connectionId);
   render();
   const syncButton = document.querySelector(`[data-gmail-sync="${CSS.escape(connectionId)}"]`);
   if (syncButton) syncButton.disabled = true;
-  const totals = { listed_count: 0, processed_count: 0, candidate_count: 0, duplicate_count: 0, error_count: 0 };
+  const totals = { listed_count: 0, processed_count: 0, candidate_count: 0, duplicate_count: 0, ignored_count: 0, error_count: 0 };
+  gmailSyncProgress.set(connectionId, totals);
+  renderGmailProgress();
   let pageToken = null;
   let queryAfter = null;
   let lastRun = { status: "completed" };
@@ -220,23 +244,29 @@ async function syncGmailImport(connectionId, days) {
       totals.processed_count += Number(result?.processed_count ?? lastRun.processed_count ?? 0);
       totals.candidate_count += Number(result?.candidate_count ?? lastRun.candidate_count ?? 0);
       totals.duplicate_count += Number(result?.duplicate_count ?? lastRun.duplicate_count ?? 0);
+      totals.ignored_count += Number(result?.ignored_count ?? lastRun.ignored_count ?? 0);
       totals.error_count += Number(result?.error_count ?? lastRun.error_count ?? 0);
+      gmailSyncProgress.set(connectionId, { ...totals });
       if (queryAfter === null && result?.query_after !== undefined) queryAfter = result.query_after;
       if (lastRun.status !== "completed") {
         toast(gmailSyncMessage(lastRun, totals));
         return;
       }
+      await refreshGmailImport(false);
+      render();
+      renderGmailProgress();
       pageToken = result?.next_page_token || null;
       if (totals.listed_count < 1000 && result?.has_more && pageToken) toast(`Gmail同期中: ${Math.min(totals.listed_count, 1000)} / 1000件`);
       if (!result?.has_more || !pageToken) break;
     }
     if (totals.listed_count >= 1000 && pageToken) toast("同期完了: 上限1000件まで確認しました");
     else if (pageToken && totals.listed_count < 1000) toast("同期完了: 25ページを確認しました。続きがあります");
-    else toast(gmailSyncMessage(lastRun, totals));
+    else toast(gmailSyncTotalsMessage(totals));
   } catch (error) {
     toast(error.message || "Gmail同期を実行できませんでした");
   } finally {
     gmailSyncing.delete(connectionId);
+    gmailSyncProgress.delete(connectionId);
     await refreshGmailImport();
     render();
     const refreshedButton = document.querySelector(`[data-gmail-sync="${CSS.escape(connectionId)}"]`);
@@ -1957,6 +1987,7 @@ function addDraftName() {
 function render() {
   const root = document.querySelector("#app");
   if (root) root.innerHTML = currentProject() ? renderProject() : renderHome();
+  renderGmailProgress();
 }
 
 function mergeProjectSummaries(rows) {

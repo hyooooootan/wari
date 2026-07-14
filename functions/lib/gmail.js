@@ -175,14 +175,14 @@ export async function syncGmail(db, env, user, connectionId, input = {}) {
     SELECT ?,?,?,?,?, 'running',? WHERE EXISTS(SELECT 1 FROM gmail_connections c JOIN users u ON u.id=c.user_id WHERE c.id=? AND c.user_id=? AND c.status='active' AND u.deleted_at IS NULL AND u.deletion_started_at IS NULL)`)
     .bind(runId,connectionId,user.id,days,batchSize,started,connectionId,user.id).run();
   if (!changedRows(runStarted)) throw new ApiError(409,"gmail_connection_unavailable");
-  let listed=0,processed=0,candidates=0,duplicates=0,errors=0,status="completed",errorCode=null;
+  let listed=0,processed=0,candidates=0,duplicates=0,ignored=0,errors=0,status="completed",errorCode=null;
   let nextPageToken = null;
   try {
     const refresh = await decryptRefreshToken(env, connection);
     const token = await googleForm(env, "https://oauth2.googleapis.com/token", { client_id:env.GMAIL_CLIENT_ID,client_secret:env.GMAIL_CLIENT_SECRET,refresh_token:refresh,grant_type:"refresh_token" });
     const searchUrl = new URL("https://gmail.googleapis.com/gmail/v1/users/me/messages");
     searchUrl.searchParams.set("maxResults", String(batchSize));
-    searchUrl.searchParams.set("q", `after:${queryAfter}`);
+    searchUrl.searchParams.set("q", `after:${queryAfter} from:statement@vpass.ne.jp -subject:"一定金額到達のお知らせ"`);
     if (pageToken) searchUrl.searchParams.set("pageToken", pageToken);
     const listing = await googleJson(env, searchUrl.toString(), token.access_token);
     const messages=(listing.messages||[]).slice(0,batchSize); listed=messages.length;
@@ -194,11 +194,12 @@ export async function syncGmail(db, env, user, connectionId, input = {}) {
       try {
         const message=await googleJson(env,`https://gmail.googleapis.com/gmail/v1/users/me/messages/${encodeURIComponent(item.id)}?format=full`,token.access_token);
         const headers=Object.fromEntries((message.payload?.headers||[]).map(h=>[String(h.name).toLowerCase(),h.value]));
-        const parsed=parsePaymentNotification(extractGmailText(message.payload),headers); const messageRowId=exists?.id||crypto.randomUUID(); const candidateId=parsed.parse_status === "parse_error" ? null : crypto.randomUUID();
+        const receivedAt=parseInternalDate(message.internalDate)||parseHeaderDate(headers.date);
+        const parsed=parsePaymentNotification(extractGmailText(message.payload),{...headers,received_at:receivedAt}); const messageRowId=exists?.id||crypto.randomUUID(); const candidateId=parsed.parse_status === "parse_error" ? null : crypto.randomUUID();
         const warning=parsed.amount!==null&&parsed.occurred_at?await duplicateWarning(db,user.id,parsed.amount,parsed.occurred_at):0;
         const now=new Date().toISOString();
         pending.push({ exists: Boolean(exists), messageRowId, candidateId, gmailMessageId:item.id, parsed,
-          receivedAt:headers.date&&Number.isFinite(Date.parse(headers.date))?new Date(headers.date).toISOString():null, warning, now });
+          receivedAt, warning, now });
       } catch(error){errors++;status=error?.status===401?"reauthorization_required":error?.status===429?"rate_limited":"partial";errorCode=safeErrorCode(error);if(status!=="partial")break;}
     }
     if(pending.length){
@@ -212,21 +213,26 @@ export async function syncGmail(db, env, user, connectionId, input = {}) {
       for(const record of pending){
         if(!record.exists){
           statements.push(db.prepare(`INSERT INTO gmail_messages (id,connection_id,gmail_message_id,sync_run_id,parse_status,provider,received_at,created_at)
-            SELECT ?,?,?,?,?,?,?,? WHERE EXISTS(${personalSql}) AND EXISTS(${syncWriteSql})`).bind(record.messageRowId,connectionId,record.gmailMessageId,runId,record.parsed.parse_status,record.parsed.provider,record.receivedAt,record.now,...personalBindings,...syncWriteBindings));
+            SELECT ?,?,?,?,?,?,?,? WHERE EXISTS(${personalSql}) AND EXISTS(${syncWriteSql})`).bind(record.messageRowId,connectionId,record.gmailMessageId,runId,record.parsed.parse_status === "ignored" ? "parse_error" : record.parsed.parse_status,record.parsed.provider,record.receivedAt,record.now,...personalBindings,...syncWriteBindings));
         } else {
           statements.push(db.prepare(`UPDATE gmail_messages SET sync_run_id=?,parse_status=?,provider=?,received_at=? WHERE id=? AND connection_id=? AND EXISTS(${personalSql}) AND EXISTS(${syncWriteSql})`)
-            .bind(runId,record.parsed.parse_status,record.parsed.provider,record.receivedAt,record.messageRowId,connectionId,...personalBindings,...syncWriteBindings));
+            .bind(runId,record.parsed.parse_status === "ignored" ? "parse_error" : record.parsed.parse_status,record.parsed.provider,record.receivedAt,record.messageRowId,connectionId,...personalBindings,...syncWriteBindings));
         }
         if(record.candidateId){
           const statementIndex=statements.length;
           statements.push(db.prepare(`INSERT INTO gmail_import_candidates (id,connection_id,gmail_message_row_id,user_id,status,provider,merchant_name,amount,occurred_at,payment_method,external_transaction_id,duplicate_warning,created_at,updated_at)
             SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,? WHERE NOT EXISTS(SELECT 1 FROM gmail_import_candidates WHERE gmail_message_row_id=?) AND EXISTS(${personalSql}) AND EXISTS(${syncWriteSql})`).bind(record.candidateId,connectionId,record.messageRowId,user.id,record.parsed.parse_status === "parsed" ? "ready" : record.parsed.parse_status,record.parsed.provider,record.parsed.merchant_name,record.parsed.amount,record.parsed.occurred_at,record.parsed.payment_method,record.parsed.external_transaction_id,record.warning,record.now,record.now,record.messageRowId,...personalBindings,...syncWriteBindings));
-          candidateStatements.push(statementIndex);
+          candidateStatements.push({ index: statementIndex, ignored: record.parsed.parse_status === "ignored" });
         }
       }
       const results=await db.batch(statements);
       if(!changedRows(results[0]))throw new ApiError(403,"gmail_personal_household_lost");
-      processed+=pending.length;candidates+=candidateStatements.filter((index)=>changedRows(results[index])).length;
+      processed+=pending.length;
+      for (const candidateStatement of candidateStatements) {
+        if (!changedRows(results[candidateStatement.index])) continue;
+        if (candidateStatement.ignored) ignored++;
+        else candidates++;
+      }
     }
   } catch(error) {
     errors++; errorCode=safeErrorCode(error); status=error?.status===401?"reauthorization_required":error?.status===429?"rate_limited":"failed";
@@ -239,7 +245,20 @@ export async function syncGmail(db, env, user, connectionId, input = {}) {
   await db.prepare("UPDATE gmail_connections SET last_synced_at=?,updated_at=? WHERE id=? AND status IN ('active','reauthorization_required')").bind(finished,finished,connectionId).run();
   const run = await db.prepare("SELECT * FROM gmail_sync_runs WHERE id=?").bind(runId).first();
   const hasMore = status === "completed" && Boolean(nextPageToken);
-  return { run, next_page_token: hasMore ? nextPageToken : null, query_after: queryAfter, has_more: hasMore, listed_count: listed, processed_count: processed, candidate_count: candidates, duplicate_count: duplicates, error_count: errors };
+  return { run, next_page_token: hasMore ? nextPageToken : null, query_after: queryAfter, has_more: hasMore, listed_count: listed, processed_count: processed, candidate_count: candidates, duplicate_count: duplicates, ignored_count: ignored, error_count: errors };
+}
+
+function parseInternalDate(value) {
+  if (value === null || value === undefined || !/^\d+$/.test(String(value))) return null;
+  const milliseconds = Number(value);
+  if (!Number.isSafeInteger(milliseconds) || milliseconds < 0) return null;
+  const date = new Date(milliseconds);
+  return Number.isFinite(date.getTime()) ? date.toISOString() : null;
+}
+
+function parseHeaderDate(value) {
+  if (typeof value !== "string" || !Number.isFinite(Date.parse(value))) return null;
+  return new Date(value).toISOString();
 }
 
 export async function listSyncRuns(db,user,connectionId){await ownedConnection(db,user,connectionId);const rows=await db.prepare("SELECT * FROM gmail_sync_runs WHERE connection_id=? AND user_id=? ORDER BY started_at DESC LIMIT 50").bind(connectionId,user.id).all();return{sync_runs:rows.results||[]};}
