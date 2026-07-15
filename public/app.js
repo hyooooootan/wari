@@ -1,6 +1,6 @@
-import * as ApiModule from "./modules/api.js?v=20260715-guest-shell";
-import * as ImportsModule from "./modules/imports.js?v=20260715-guest-shell";
-import * as HouseholdModule from "./modules/household.js?v=20260715-guest-shell";
+import * as ApiModule from "./modules/api.js?v=20260715-no-csv";
+import * as ImportsModule from "./modules/imports.js?v=20260715-no-csv";
+import * as HouseholdModule from "./modules/household.js?v=20260715-no-csv";
 
 const Storage = globalThis.WariStorage;
 const Split = globalThis.WariSplit;
@@ -90,8 +90,6 @@ const ui = {
   calendarEntryOpen: false,
   calendarTransactionId: null,
   householdSummaries: {},
-  csvPreview: null,
-  csvSourceType: "",
   drafts: {
     createSplit: { name: "", participant: "", store: "", amount: "", payer: "", occurred_at: today() },
     createHousehold: { name: "", owner_name: "自分" },
@@ -849,13 +847,6 @@ function renderHouseholdTransactions(project) {
   return `<section aria-labelledby="household-transactions-title"><div class="section-heading filter-heading"><div><h2 id="household-transactions-title">取引</h2><span>${transactions.length}件</span></div><label class="month-filter"><span>月</span><input type="month" value="${esc(selectedMonth)}" data-household-month></label></div>${form}<div class="transaction-list">${transactions.length ? transactions.map(renderTransactionRow).join("") : `<div class="empty-state">取引はありません</div>`}</div></section>`;
 }
 
-function renderCsvPreview() {
-  if (!ui.csvPreview?.rows?.length) return "";
-  const rows = ui.csvPreview.rows.slice(0, 8);
-  const width = Math.max(...rows.map((row) => row.length), 0);
-  return `<div class="csv-preview"><div class="inline-heading"><strong>${esc(ui.csvPreview.name)}</strong><span>${ui.csvPreview.totalRows}行</span></div><div class="table-scroll"><table><tbody>${rows.map((row, rowIndex) => `<tr>${Array.from({ length: width }, (_, index) => `<${rowIndex === 0 ? "th" : "td"}>${esc(row[index] || "")}</${rowIndex === 0 ? "th" : "td"}>`).join("")}</tr>`).join("")}</tbody></table></div><button class="button household-button full-width" type="button" data-import-csv>確認へ追加</button></div>`;
-}
-
 function renderImportReview(project, projectIds = new Set([project.id]), includeGmail = true) {
   const records = state.import_records
     .filter((row) => projectIds.has(row.project_id) && ["received", "parsed", "review"].includes(row.source_status))
@@ -871,7 +862,7 @@ function renderImportReview(project, projectIds = new Set([project.id]), include
 function renderHouseholdImports(project, projectIds = new Set([project.id])) {
   const includeGmail = !primaryHouseholdProject() || primaryHouseholdProject()?.id === project.id;
   const receiptDisabled = cloudSession.status === "authenticated" ? "" : "disabled";
-  return `<section aria-labelledby="imports-title"><div class="section-heading"><div><h2 id="imports-title">取込</h2><span>${state.import_records.filter((row) => projectIds.has(row.project_id)).length}件</span></div></div><div class="import-tools"><section class="import-section"><div class="inline-heading"><h3>レシート</h3>${cloudSession.status === "authenticated" ? "" : `<button class="small-button" type="button" data-google-login>ログイン</button>`}</div><div class="file-actions"><label class="file-button household-file"><input type="file" accept="image/jpeg,image/png,image/webp,image/heic,image/heif" data-household-receipt="${esc(project.id)}" ${receiptDisabled}><span>画像を選ぶ</span></label><label class="file-button secondary-button"><input type="file" accept="image/*" capture="environment" data-household-receipt="${esc(project.id)}" ${receiptDisabled}><span>撮影する</span></label></div></section><section class="import-section"><div class="inline-heading"><h3>CSV</h3></div><div class="csv-controls"><select data-csv-source aria-label="CSVの種類"><option value="">自動判定</option><option value="card_csv" ${ui.csvSourceType === "card_csv" ? "selected" : ""}>カード</option><option value="paypay_csv" ${ui.csvSourceType === "paypay_csv" ? "selected" : ""}>PayPay</option><option value="bank_csv" ${ui.csvSourceType === "bank_csv" ? "selected" : ""}>銀行</option><option value="manual" ${ui.csvSourceType === "manual" ? "selected" : ""}>その他</option></select><label class="file-button household-file"><input type="file" accept=".csv,text/csv" data-csv-file="${esc(project.id)}"><span>CSVを選ぶ</span></label></div>${renderCsvPreview()}</section><section class="import-section"><div class="inline-heading"><h3>通知</h3></div><form id="notification-import-form" class="form-stack"><textarea class="textarea" name="raw_text" rows="4" placeholder="通知本文" required></textarea><button class="button secondary-button" type="submit">確認へ追加</button></form></section></div><section class="review-section" aria-labelledby="review-title"><div class="inline-heading"><h3 id="review-title">確認待ち</h3></div><div class="review-list">${renderImportReview(project, projectIds, includeGmail)}</div></section></section>`;
+  return `<section aria-labelledby="imports-title"><div class="section-heading"><div><h2 id="imports-title">取込</h2><span>${state.import_records.filter((row) => projectIds.has(row.project_id)).length}件</span></div></div><div class="import-tools"><section class="import-section"><div class="inline-heading"><h3>レシート</h3>${cloudSession.status === "authenticated" ? "" : `<button class="small-button" type="button" data-google-login>ログイン</button>`}</div><div class="file-actions"><label class="file-button household-file"><input type="file" accept="image/jpeg,image/png,image/webp,image/heic,image/heif" data-household-receipt="${esc(project.id)}" ${receiptDisabled}><span>画像を選ぶ</span></label><label class="file-button secondary-button"><input type="file" accept="image/*" capture="environment" data-household-receipt="${esc(project.id)}" ${receiptDisabled}><span>撮影する</span></label></div></section><section class="import-section"><div class="inline-heading"><h3>通知</h3></div><form id="notification-import-form" class="form-stack"><textarea class="textarea" name="raw_text" rows="4" placeholder="通知本文" required></textarea><button class="button secondary-button" type="submit">確認へ追加</button></form></section></div><section class="review-section" aria-labelledby="review-title"><div class="inline-heading"><h3 id="review-title">確認待ち</h3></div><div class="review-list">${renderImportReview(project, projectIds, includeGmail)}</div></section></section>`;
 }
 
 function renderCalendarImports() {
@@ -1655,79 +1646,6 @@ function normalizeImportedDate(value) {
   return `${match[1]}-${match[2].padStart(2, "0")}-${match[3].padStart(2, "0")}`;
 }
 
-function findHeaderIndex(headers, candidates) {
-  const normalized = headers.map((value) => String(value || "").normalize("NFKC").trim().toLowerCase().replace(/\s/gu, ""));
-  return normalized.findIndex((value) => candidates.some((candidate) => value === candidate || value.includes(candidate)));
-}
-
-function csvRecords(projectId, preview) {
-  const [headers = [], ...rows] = preview.rows;
-  const merchantIndex = findHeaderIndex(headers, ["利用店名", "加盟店", "店舗", "店名", "摘要", "内容", "merchant", "description"]);
-  const amountIndex = findHeaderIndex(headers, ["利用金額", "支払金額", "金額", "amount"]);
-  const dateIndex = findHeaderIndex(headers, ["利用日", "取引日", "日付", "date"]);
-  const externalIndex = findHeaderIndex(headers, ["取引番号", "利用番号", "transactionid", "id"]);
-  const timestamp = now();
-  return rows.filter((row) => row.some((value) => String(value).trim())).map((row, index) => {
-    const rawIdentity = `${preview.name}:${index + 1}:${JSON.stringify(row)}`;
-    const merchant = String(row[merchantIndex >= 0 ? merchantIndex : 0] || "").trim() || "CSV取引";
-    const amount = parseMoney(row[amountIndex >= 0 ? amountIndex : Math.max(row.length - 1, 0)]);
-    return {
-      id: makeId("imp"),
-      project_id: projectId,
-      transaction_id: null,
-      source_type: preview.sourceType,
-      source_record_id: `csv:${stableHash(rawIdentity)}`,
-      source_status: "review",
-      merchant_raw: merchant,
-      merchant_normalized: normalizeMerchant(merchant),
-      gross_amount_raw: amount,
-      paid_amount_raw: amount,
-      occurred_at_raw: normalizeImportedDate(row[dateIndex >= 0 ? dateIndex : 0]),
-      settled_at_raw: null,
-      payment_method_raw: preview.sourceType === "card_csv" ? "credit_card" : preview.sourceType === "paypay_csv" ? "paypay" : preview.sourceType === "bank_csv" ? "bank" : "other",
-      external_transaction_id: externalIndex >= 0 ? String(row[externalIndex] || "").trim() || null : null,
-      image_url: null,
-      raw_text: null,
-      raw_payload: JSON.stringify({ headers, row }),
-      parse_confidence: amount && merchant ? 0.8 : 0.4,
-      parser_version: "wari-ui-csv-1",
-      match_score: null,
-      match_reason_json: null,
-      created_at: timestamp,
-      updated_at: timestamp,
-    };
-  });
-}
-
-function sourceProfile(sourceType) {
-  if (sourceType === "card_csv") return "card";
-  if (sourceType === "paypay_csv") return "paypay";
-  if (sourceType === "bank_csv") return "bank";
-  return "generic";
-}
-
-function addCsvImports(project) {
-  const preview = ui.csvPreview;
-  if (!preview) return;
-  const next = cloneState();
-  const existing = new Set(next.import_records.filter((row) => row.project_id === project.id).map((row) => row.source_record_id).filter(Boolean));
-  const records = csvRecords(project.id, preview).filter((row) => !existing.has(row.source_record_id));
-  next.import_records.push(...records);
-  touchProject(next, project.id);
-  ui.csvPreview = null;
-  commitState(next, records.length ? `${records.length}件を確認へ追加しました` : "同じ取引は追加しませんでした", {
-    remoteFilter: (operation) => operation.table !== "import_records",
-    remoteAction: async () => {
-      await Api.importCsv(project.id, {
-        csv_text: preview.text,
-        profile: sourceProfile(preview.sourceType),
-        options: { source_type: preview.sourceType },
-      });
-      await refreshCloudProject(project.id);
-    },
-  });
-}
-
 function importRecordFromReceipt(projectId, result) {
   const timestamp = now();
   return {
@@ -1963,24 +1881,6 @@ async function handleHouseholdReceipt(input) {
     addReceiptImport(project, result);
   } catch (error) {
     toast(error.message || "レシートを読み取れませんでした");
-  }
-}
-
-async function handleCsvFile(input) {
-  const file = input.files?.[0];
-  if (!file) return;
-  try {
-    const text = Imports.decodeCsvArrayBuffer(await file.arrayBuffer());
-    const rows = Imports.parseCsvRows(text, { maxRows: 5001 });
-    if (rows.length < 2) throw new Error("CSVに取引行がありません");
-    const sourceType = Imports.selectCsvSourceType(ui.csvSourceType, file.name, rows.slice(0, 6));
-    ui.csvSourceType = sourceType;
-    ui.csvPreview = { name: file.name, text, rows, totalRows: rows.length - 1, sourceType };
-    render();
-  } catch (error) {
-    ui.csvPreview = null;
-    render();
-    toast(error.message || "CSVを読み込めませんでした");
   }
 }
 
@@ -2406,10 +2306,6 @@ document.addEventListener("click", async (event) => {
     deleteProject(project);
     return;
   }
-  if (button.dataset.importCsv !== undefined) {
-    addCsvImports(project || await ensureHouseholdCalendar());
-    return;
-  }
   if (button.dataset.createFromImport && project) {
     const record = state.import_records.find((row) => row.id === button.dataset.createFromImport);
     if (record) createFromImport(projectById(record.project_id) || project, record);
@@ -2434,14 +2330,6 @@ document.addEventListener("change", (event) => {
   if (scope && field && ui.drafts[scope]) ui.drafts[scope][field] = target.value;
   if (target.dataset.receiptTarget) void handleSplitReceipt(target);
   if (target.dataset.householdReceipt) void handleHouseholdReceipt(target);
-  if (target.dataset.csvFile) void handleCsvFile(target);
-  if (target.dataset.csvSource !== undefined) {
-    ui.csvSourceType = target.value;
-    if (ui.csvPreview) {
-      ui.csvPreview.sourceType = Imports.selectCsvSourceType(target.value, ui.csvPreview.name, ui.csvPreview.rows.slice(0, 6));
-      render();
-    }
-  }
   if (target.dataset.householdMonth !== undefined) {
     ui.householdMonth = target.value;
     render();

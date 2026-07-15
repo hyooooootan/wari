@@ -28,9 +28,14 @@ test("認証状態に応じたGoogleログイン操作を表示する", () => {
 test("未認証で家計簿が空でも同じ取込画面を表示する", () => {
   assert.match(source, /const project = savedProject \|\| PREVIEW_HOUSEHOLD/);
   assert.match(source, /<h3>レシート<\/h3>/);
-  assert.match(source, /<h3>CSV<\/h3>/);
   assert.match(source, /<h3>通知<\/h3>/);
   assert.match(source, /<h3>Gmail支払い通知<\/h3>/);
+  assert.doesNotMatch(source, /<h3>CSV<\/h3>|data-csv-file|data-csv-source|data-import-csv/);
+  assert.doesNotMatch(source, /function renderCsvPreview|function addCsvImports|function handleCsvFile|Api\.importCsv\(/);
+  assert.match(source, /card_csv: "カードCSV"/);
+  assert.match(source, /paypay_csv: "PayPay CSV"/);
+  assert.match(source, /bank_csv: "銀行CSV"/);
+  assert.match(source, /record\.source_type === "card_csv" \? "credit_card"/);
   assert.doesNotMatch(source, /if \(!project\) return[^;]+取込記録はありません/);
 });
 
