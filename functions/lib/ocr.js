@@ -4,7 +4,7 @@ const IMAGE_TYPES = new Set(["image/jpeg", "image/png", "image/webp", "image/gif
 const DEFAULT_MAX_IMAGE_BYTES = 10 * 1024 * 1024;
 const DEFAULT_TIMEOUT_MS = 60_000;
 
-export async function handleReceiptOcr(request, env, payload = null) {
+export async function handleReceiptOcr(request, env, payload = null, feedback = null) {
   const maximumBytes = maxImageBytes(env);
   const declaredLength = Number(request.headers.get("content-length"));
   if (Number.isFinite(declaredLength) && declaredLength > Math.ceil(maximumBytes * 4 / 3) + 4_096) {
@@ -13,7 +13,7 @@ export async function handleReceiptOcr(request, env, payload = null) {
   payload = payload || await readJson(request);
   const image = parseImageDataUrl(payload.image_data_url, maximumBytes);
   const backend = String(env.OCR_BACKEND || "auto").toLowerCase();
-  if (backend === "remote" || backend === "tesseract_ollama") return readReceiptWithRemoteOcr(image.dataUrl, env);
+  if (backend === "remote" || backend === "tesseract_ollama") return readReceiptWithRemoteOcr(image.dataUrl, env, feedback);
   if (backend === "openai") return readReceiptWithOpenAI(image.dataUrl, env);
   if (backend === "gemini") return readReceiptWithGemini(image, env);
   if (backend === "auto") {
@@ -46,7 +46,7 @@ export function parseImageDataUrl(value, maximumBytes = DEFAULT_MAX_IMAGE_BYTES)
   return { dataUrl: value, mimeType, base64Data, decodedBytes };
 }
 
-async function readReceiptWithRemoteOcr(imageDataUrl, env) {
+async function readReceiptWithRemoteOcr(imageDataUrl, env, feedback) {
   const sharedSecret = String(env.RECEIPT_OCR_SHARED_SECRET || "");
   if (!sharedSecret) return json({ error: "missing_receipt_ocr_shared_secret" }, 503);
   const baseUrl = String(env.RECEIPT_OCR_API_URL || env.OCR_API_URL || "").replace(/\/+$/, "");
@@ -57,16 +57,20 @@ async function readReceiptWithRemoteOcr(imageDataUrl, env) {
   } catch {
     return json({ error: "invalid_receipt_ocr_api_url" }, 503);
   }
-  if (url.protocol !== "https:" && url.protocol !== "http:") return json({ error: "invalid_receipt_ocr_api_url" }, 503);
+  const loopbackHost = url.hostname === "localhost" || url.hostname === "127.0.0.1" || url.hostname === "[::1]";
+  if (url.protocol !== "https:" && !(url.protocol === "http:" && loopbackHost)) {
+    return json({ error: "invalid_receipt_ocr_api_url" }, 503);
+  }
   const { response: remoteRes, data } = await timedJsonFetch(
     url,
     {
       method: "POST",
+      redirect: "error",
       headers: {
         "content-type": "application/json",
         authorization: `Bearer ${sharedSecret}`,
       },
-      body: JSON.stringify({ image_data_url: imageDataUrl }),
+      body: JSON.stringify({ image_data_url: imageDataUrl, ...(feedback ? { feedback } : {}) }),
     },
     env,
   );

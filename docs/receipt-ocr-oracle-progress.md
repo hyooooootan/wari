@@ -1,5 +1,35 @@
 # Wari Receipt OCR Oracle A1 Progress
 
+## 2026-07-15 訂正学習版
+
+現在の運用対象は`OCR_BACKEND=local`のPP-OCR経路です。TesseractとOllamaで全文を整形する構成は過去の検討経路として残っています。新しい構成ではPP-OCRと規則処理を通常経路にし、D1の利用者別訂正候補、`qwen2.5:1.5b-instruct`による文字訂正、`qwen3-vl:2b`による局所再読取を停止可能な補助処理として追加しました。
+
+実装済み:
+
+- D1移行`0010_receipt_ocr_feedback.sql`
+- D1移行`0011_receipt_ocr_feedback_pending.sql`と未送信訂正の再処理
+- D1移行`0012_receipt_ocr_feedback_conflicts.sql`と異なる再送内容の競合拒否
+- HMAC署名付き訂正登録、本人件数取得、本人全削除
+- 新規取引作成と既存取引紐付けの成功後に訂正を登録
+- 店名候補の保守的採用、競合時の確認維持
+- 前処理方式とOCRモデルごとの成績集計
+- 数字と日時を過去訂正や文字訂正LLMで直接置換しない検査
+- ポイント、残高、単価、電話番号、期限日付を優先項目から除外する検査
+- Ollama接続先をA1内部のループバックアドレスへ制限する検査
+- 最大1回の文字訂正LLM、最大3領域・1並列の局所VLM
+- OCRサービス全体55秒の処理予算
+- A・B・C・D比較用の個人情報を出力しない評価器
+
+未実施:
+
+- 本番D1への0010から0012適用
+- 同時要求数2の測定
+- 本番Pagesの機能設定変更
+
+コミット`08836b4`をA1へ反映し、反映前のコード、systemd設定、環境設定を退避しました。A1は2 OCPU、約11 GiBのメモリーです。Ollama 0.32.0を導入し、`qwen2.5:1.5b-instruct`と`qwen3-vl:2b`を取得しました。Python試験55件、構文検査、読込み検査、サービス再起動、`/health`、認証なし401、認証付きOCRを確認済みです。
+
+配備、D1、環境変数、停止、復旧の現行手順は`docs/receipt-ocr-feedback.md`を正とします。
+
 ## 目的
 
 Wariのレシート読み取りを、Oracle Cloud A1上で動く `Tesseract + Ollama` 構成へ移す。
@@ -175,16 +205,19 @@ curl -X POST \
 
 ## 検査済み
 
-手元環境で以下を確認した。
+手元環境とOracle A1で以下を確認した。
 
 ```text
 Python構文検査: 成功
 Cloudflare Functions JavaScript構文検査: 成功
-Tesseract + Ollama模擬試験: 7件成功
-外部サービスなしの入力・失敗経路検査: 成功
+JavaScript試験: 138件成功
+A1上のPython試験: 55件成功
+OCRモジュール読込み: 成功
+外部サービス停止、不正JSON、時間切れ、呼出回数、一時画像削除の検査: 成功
+合計、日付、時刻をLLM出力単独で確定しない検査: 成功
 ```
 
-手元のWindows環境にはTesseractとOllamaが入っていないため、実OCRはOracle A1配置後に確認する。
+A1上では`/health`が200、認証なしOCRが401、認証付きOCRが200でした。OCRサービスとOllamaはループバックアドレスで稼働し、外部待受、Oracle受信規則、OS防火壁は変更していません。
 
 ## 今回の配備前検査
 
@@ -220,7 +253,7 @@ Python版、Pillow、Tesseract実行ファイル、`jpn`・`eng`言語、Ollama�
 
 ## Oracle A1で残る実機確認
 
-Oracle A1上では次を確認する。
+Oracle A1上の配備、稼働、認証確認、AからDの実画像集計は完了しました。AからDは非公開画像12枚を各3回処理し、全条件で誤った自動確定0件、`needs_review`36/36でした。Bは店名正答を3/36から9/36へ改善しました。CとDは正答数を増やさず、Dの平均処理時間は54.4秒でした。残る確認は同時要求測定です。
 
 ```bash
 python --version
@@ -259,16 +292,11 @@ Oracle側では秘密値を対話入力または保護された環境ファイ�
 ## 残作業
 
 ```text
-Oracle A1へリポジトリ配置
-Oracle A1でセットアップ実行
-systemd登録
-/health確認
-実レシート画像で/ocr確認
+A1で同時要求数2の測定
 Oracle OCR APIのHTTPS公開
 Cloudflare Pages環境変数の設定
 Wari画面から読み取り確認
-OCR誤字補正表の追加
-実レシートで前処理とOllama指示の調整
+本番D1移行の実施判断
 ```
 
 ## A1作成後の自動導入
@@ -311,4 +339,4 @@ curl http://127.0.0.1:4190/health
 
 ## 判断
 
-Oracle A1へ追加するコードと配備手順は用意できている。次の作業は、Oracle A1へ実際に置いて実行結果を見る段階。
+Oracle A1への反映、Python試験、サービス疎通、認証確認、補助モデルの導入、実画像評価まで完了した。本番統合と本番D1移行は行っていない。実画像評価ではBが店名精度を改善し、CとDは精度を増やさなかったため、現在はCとDを無効の状態で維持する。

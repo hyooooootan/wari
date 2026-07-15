@@ -68,6 +68,17 @@ import {
 } from "../lib/imports.js";
 import { handleReceiptOcr } from "../lib/ocr.js";
 import {
+  assertConfirmedOcrTransaction,
+  assertOcrFeedbackSubmission,
+  buildReceiptFeedback,
+  countOcrCorrections,
+  deleteOcrCorrections,
+  registerOcrCorrections,
+  serializeConfirmedOcrValues,
+  validateConfirmedOcrValues,
+} from "../lib/ocr-feedback.js";
+import { createOcrFeedbackToken, verifyOcrFeedbackToken } from "../lib/ocr-feedback-token.js";
+import {
   disconnectGmail,
   disconnectAllGmail,
   finishGmailOAuth,
@@ -144,7 +155,16 @@ async function dispatchReceiptOcr(request, db, env, url) {
       assertCsrf(request, user);
       try {
         await requireProjectRole(db, user, projectId, "editor");
-        return handleReceiptOcr(request, env, body);
+        let feedback = null;
+        if (feedbackReadEnabled(env)) {
+          try {
+            feedback = await buildReceiptFeedback(db, user.id);
+          } catch {
+            feedback = null;
+          }
+        }
+        const response = await handleReceiptOcr(request, env, body, feedback);
+        return addOcrFeedbackToken(response, env, user.id, projectId);
       } catch (error) {
         if (!(error instanceof ApiError) || error.code !== "not_found") throw error;
       }
@@ -168,6 +188,7 @@ async function dispatch(request, db, env, url, path) {
   const user = await requireUser(db, request);
   assertCsrf(request, user);
   if (path[0] === "gmail") return dispatchGmail(request, db, env, url, path, user);
+  if (path[0] === "ocr-corrections" && path.length === 1) return dispatchOcrCorrections(request, db, env, user);
   if (path[0] === "household-sync-jobs" && path.length === 3 && path[2] === "retry") {
     return invoke(request, ["POST"], async () => {
       assertOrigin(request, env, { requireOrigin: true, requireJson: true });
@@ -192,7 +213,7 @@ async function dispatch(request, db, env, url, path) {
   if (path[0] === "imports" && path.length === 3 && path[2] === "reconcile") {
     return invoke(request, ["POST"], async () => {
       await requireProjectRole(db, user, await projectIdForImport(db, path[1]), "editor");
-      return handleReconcile(request, db, path[1], user);
+      return handleReconcile(request, db, env, path[1], user);
     });
   }
   return json({ error: "not_found" }, 404);
@@ -244,6 +265,9 @@ async function dispatchAccount(request, db, env) {
   return invoke(request, ["DELETE"], async () => {
     const user = await requireAccountDeletionUser(db, request);
     assertCsrf(request, user);
+    const migration = await db.prepare(`SELECT COUNT(*) AS table_count FROM sqlite_master
+      WHERE type = 'table' AND name IN ('receipt_ocr_correction_events', 'receipt_ocr_field_outcomes', 'receipt_ocr_feedback_pending', 'receipt_ocr_feedback_submissions')`).first();
+    if (Number(migration?.table_count || 0) !== 4) throw new ApiError(503, "database_migration_required");
     const startedAt = user.deletion_started_at || new Date().toISOString();
     const started = await db.prepare(`UPDATE users SET deletion_started_at = COALESCE(deletion_started_at, ?), updated_at = ?
       WHERE id = ? AND deleted_at IS NULL`).bind(startedAt, startedAt, user.id).run();
@@ -254,12 +278,70 @@ async function dispatchAccount(request, db, env) {
       db.prepare("UPDATE users SET deleted_at = ?, updated_at = ? WHERE id = ?").bind(timestamp, timestamp, user.id),
       db.prepare("UPDATE sessions SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL").bind(timestamp, user.id),
       db.prepare("UPDATE project_user_roles SET revoked_at = ?, updated_at = ? WHERE user_id = ? AND revoked_at IS NULL").bind(timestamp, timestamp, user.id),
+      db.prepare("DELETE FROM receipt_ocr_feedback_pending WHERE user_id = ?").bind(user.id),
+      db.prepare("DELETE FROM receipt_ocr_feedback_submissions WHERE user_id = ?").bind(user.id),
+      db.prepare("DELETE FROM receipt_ocr_correction_events WHERE user_id = ?").bind(user.id),
+      db.prepare("DELETE FROM receipt_ocr_field_outcomes WHERE user_id = ?").bind(user.id),
     ]);
     const headers = new Headers();
     headers.append("set-cookie", clearCookieHeader("wari_session"));
     headers.append("set-cookie", clearCookieHeader(CSRF_COOKIE));
     return json({ ok: true }, 200, headers);
   });
+}
+
+async function dispatchOcrCorrections(request, db, env, user) {
+  if (request.method === "GET") return json(await countOcrCorrections(db, user));
+  if (request.method === "POST") {
+    if (!feedbackWriteEnabled(env)) throw new ApiError(503, "ocr_feedback_unavailable");
+    const input = await readJson(request);
+    if (input.retry_pending === true) return json(await retryPendingOcrFeedback(db, user, input.import_id), 201);
+    const claims = await verifyOcrFeedbackToken(env, input.feedback_token, user.id);
+    await requireProjectRole(db, user, claims.project_id, "editor");
+    const importId = typeof input.import_id === "string" ? input.import_id : "";
+    const importRecord = await db.prepare("SELECT id, project_id, transaction_id, source_type, raw_payload FROM import_records WHERE id = ?").bind(importId).first();
+    if (!importRecord || importRecord.project_id !== claims.project_id || importRecord.source_type !== "receipt" || importRecord.transaction_id !== input.transaction_id || !matchesReceiptOcrResult(importRecord, claims.ocr_result_id)) {
+      throw new ApiError(403, "ocr_feedback_token_mismatch");
+    }
+    const confirmed = validateConfirmedOcrValues(input.confirmed);
+    await assertOcrFeedbackSubmission(db, user, {
+      import_id: importId,
+      transaction_id: input.transaction_id,
+      confirmed,
+    }, claims);
+    await assertConfirmedOcrTransaction(db, input.transaction_id, confirmed);
+    const saved = await registerOcrCorrections(db, user, {
+      import_id: importId,
+      transaction_id: input.transaction_id,
+      feedback_token: input.feedback_token,
+      confirmed,
+    }, claims);
+    await deletePendingOcrFeedback(db, user.id, importId);
+    return json(saved, 201);
+  }
+  if (request.method === "DELETE") return json(await deleteOcrCorrections(db, user));
+  return methodNotAllowed(["GET", "POST", "DELETE"]);
+}
+
+async function addOcrFeedbackToken(response, env, userId, projectId) {
+  if (!response.ok) return response;
+  let data;
+  try {
+    data = await response.clone().json();
+  } catch {
+    return response;
+  }
+  if (!data || typeof data !== "object" || Array.isArray(data) || !data.ocr_result_id) return response;
+  const token = await createOcrFeedbackToken(env, userId, projectId, data);
+  return token ? json({ ...data, feedback_token: token, feedback_write_enabled: feedbackWriteEnabled(env) }, response.status) : response;
+}
+
+function feedbackReadEnabled(env) {
+  return String(env.RECEIPT_OCR_ENABLE_FEEDBACK_READ || "").toLowerCase() === "true";
+}
+
+function feedbackWriteEnabled(env) {
+  return String(env.RECEIPT_OCR_ENABLE_FEEDBACK_WRITE || "").toLowerCase() === "true";
 }
 
 async function dispatchGmail(request, db, env, url, path, user) {
@@ -628,30 +710,130 @@ function publicUser(user) {
   return { id: user.id, email: user.email, name: user.name };
 }
 
-async function handleReconcile(request, db, importId, user) {
+async function handleReconcile(request, db, env, importId, user) {
   const body = await readJson(request);
   validateReconcileInput(body);
   const record = await db.prepare("SELECT * FROM import_records WHERE id = ?").bind(importId).first();
   if (!record) throw new ApiError(404, "not_found");
   await requireOpenProject(db, record.project_id);
+  const hasOcrConfirmation = body.feedback_token !== undefined || body.confirmed !== undefined;
+  let ocrClaims = null;
+  if (hasOcrConfirmation) {
+    if (body.action !== "create" && body.action !== "link") throw new ApiError(400, "invalid_ocr_confirmation");
+    if (record.source_type !== "receipt" || typeof body.feedback_token !== "string" || body.confirmed === undefined) {
+      throw new ApiError(400, "invalid_ocr_confirmation");
+    }
+    ocrClaims = await verifyOcrFeedbackToken(env, body.feedback_token, user.id);
+    if (ocrClaims.project_id !== record.project_id || !matchesReceiptOcrResult(record, ocrClaims.ocr_result_id)) {
+      throw new ApiError(403, "ocr_feedback_token_mismatch");
+    }
+    body.confirmed_ocr = validateConfirmedOcrValues(body.confirmed);
+    body.confirmed_ocr_json = serializeConfirmedOcrValues(body.confirmed_ocr);
+    if (feedbackWriteEnabled(env)) {
+      body.pending_ocr_feedback = {
+        user_id: user.id,
+        ocr_result_id: ocrClaims.ocr_result_id,
+        claims: ocrClaims,
+        confirmed: body.confirmed_ocr,
+        confirmed_json: body.confirmed_ocr_json,
+      };
+    }
+  }
   if (body.action === "link") {
     const transactionId = requiredBodyString(body, "transaction_id", 128);
     await assertTransactionProject(db, transactionId, record.project_id);
   }
   if (body.action === "create") {
-    if (!Number.isSafeInteger(record.paid_amount_raw) || !record.occurred_at_raw || !Number.isFinite(Date.parse(record.occurred_at_raw))) {
+    const reconciledAmount = body.confirmed_ocr?.total_amount ?? record.paid_amount_raw;
+    const reconciledDate = body.confirmed_ocr?.paid_at ?? record.occurred_at_raw;
+    if (!Number.isSafeInteger(reconciledAmount) || !reconciledDate || !Number.isFinite(Date.parse(reconciledDate))) {
       throw new ApiError(422, "import_not_reconcilable");
     }
     if (body.new_transaction_id) {
       const existing = await db.prepare("SELECT id FROM transactions WHERE id = ?").bind(body.new_transaction_id).first();
-      if (existing) throw new ApiError(409, "id_conflict", { field: "new_transaction_id" });
+      if (existing && record.transaction_id !== existing.id) throw new ApiError(409, "id_conflict", { field: "new_transaction_id" });
     }
   }
-  const result = await reconcileImport(db, record.project_id, importId, body);
+  if (ocrClaims) {
+    const transactionId = body.action === "link"
+      ? body.transaction_id
+      : record.transaction_id || body.new_transaction_id || null;
+    await assertOcrFeedbackSubmission(db, user, {
+      import_id: importId,
+      transaction_id: transactionId,
+      confirmed: body.confirmed_ocr,
+    }, ocrClaims);
+  }
+  let result;
+  try {
+    result = await reconcileImport(db, record.project_id, importId, body);
+  } catch (error) {
+    if (String(error?.message || error).includes("ocr_feedback_content_conflict")) {
+      throw new ApiError(409, "ocr_feedback_conflict");
+    }
+    throw error;
+  }
   const synchronization = await synchronizeHouseholdMutation(db, {
     sourceProjectId: record.project_id, syncScope: "project", reason: "import_reconciled", user,
   });
-  return json({ ...result, synchronization });
+  const ocrFeedback = ocrClaims
+    ? await saveReconciledOcrFeedback(db, env, user, body, ocrClaims, result.transaction?.id, importId)
+    : null;
+  return json({ ...result, synchronization, ...(ocrFeedback ? { ocr_feedback: ocrFeedback } : {}) });
+}
+
+async function saveReconciledOcrFeedback(db, env, user, body, claims, transactionId, importId) {
+  if (!feedbackWriteEnabled(env)) return { status: "disabled" };
+  await assertConfirmedOcrTransaction(db, transactionId || body.transaction_id || body.new_transaction_id, body.confirmed_ocr, importId);
+  const input = {
+    import_id: importId,
+    transaction_id: transactionId || body.transaction_id || body.new_transaction_id,
+    feedback_token: body.feedback_token,
+    confirmed: body.confirmed_ocr,
+  };
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const saved = await registerOcrCorrections(db, user, input, claims);
+      await deletePendingOcrFeedback(db, user.id, importId);
+      return { status: "saved", ...saved };
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 409) throw error;
+      if (attempt === 1) return { status: "failed" };
+    }
+  }
+  return { status: "failed" };
+}
+
+async function retryPendingOcrFeedback(db, user, importIdValue) {
+  const importId = typeof importIdValue === "string" && /^[A-Za-z0-9_.:-]{1,128}$/u.test(importIdValue) ? importIdValue : "";
+  if (!importId) throw new ApiError(400, "invalid_import_id");
+  const pending = await db.prepare("SELECT * FROM receipt_ocr_feedback_pending WHERE import_id = ? AND user_id = ?").bind(importId, user.id).first();
+  if (!pending) throw new ApiError(404, "not_found");
+  await requireProjectRole(db, user, pending.project_id, "editor");
+  let claims;
+  let confirmed;
+  try {
+    claims = JSON.parse(pending.claims_json);
+    confirmed = JSON.parse(pending.confirmed_json);
+  } catch {
+    throw new ApiError(409, "invalid_pending_ocr_feedback");
+  }
+  if (claims?.user_id !== user.id || claims?.project_id !== pending.project_id || claims?.ocr_result_id !== pending.ocr_result_id) {
+    throw new ApiError(409, "invalid_pending_ocr_feedback");
+  }
+  await assertOcrFeedbackSubmission(db, user, {
+    import_id: importId,
+    transaction_id: pending.transaction_id,
+    confirmed,
+  }, claims);
+  await assertConfirmedOcrTransaction(db, pending.transaction_id, confirmed, importId);
+  const saved = await registerOcrCorrections(db, user, { import_id: importId, transaction_id: pending.transaction_id, confirmed }, claims);
+  await deletePendingOcrFeedback(db, user.id, importId);
+  return { status: "saved", ...saved };
+}
+
+async function deletePendingOcrFeedback(db, userId, importId) {
+  await db.prepare("DELETE FROM receipt_ocr_feedback_pending WHERE user_id = ? AND import_id = ?").bind(userId, importId).run();
 }
 
 async function finalizeProject(db, projectId, user) {
@@ -832,7 +1014,7 @@ function validateImportInput(body, kind) {
 }
 
 function validateReconcileInput(body) {
-  assertAllowedBody(body, new Set(["action", "transaction_id", "new_transaction_id", "match_score", "match_reason_json"]));
+  assertAllowedBody(body, new Set(["action", "transaction_id", "new_transaction_id", "match_score", "match_reason_json", "feedback_token", "confirmed"]));
   if (typeof body.action !== "string" || !RECONCILE_ACTIONS.has(body.action)) throw new ApiError(400, "invalid_field", { field: "action" });
   if (body.transaction_id !== undefined) bodyString(body.transaction_id, "transaction_id", 128);
   if (body.new_transaction_id !== undefined) bodyString(body.new_transaction_id, "new_transaction_id", 128);
@@ -842,6 +1024,15 @@ function validateReconcileInput(body) {
     if (value.length > 20_000) throw new ApiError(400, "invalid_field", { field: "match_reason_json" });
   }
   if (body.action === "link" && body.transaction_id === undefined) throw new ApiError(400, "missing_field", { field: "transaction_id" });
+}
+
+function matchesReceiptOcrResult(record, resultId) {
+  try {
+    const payload = JSON.parse(record.raw_payload || "{}");
+    return payload?.ocr?.ocr_result_id === resultId;
+  } catch {
+    return false;
+  }
 }
 
 async function importCall(callback) {
