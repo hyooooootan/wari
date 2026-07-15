@@ -206,6 +206,10 @@ function gmailSyncTotalsMessage(totals) {
 }
 
 function renderGmailProgress() {
+  if (cloudSession.status !== "authenticated") {
+    document.querySelector("[data-gmail-progress]")?.remove();
+    return;
+  }
   const section = document.querySelector(".import-section");
   if (!section) return;
   let element = section.querySelector("[data-gmail-progress]");

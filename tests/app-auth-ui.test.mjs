@@ -36,6 +36,7 @@ test("未認証で家計簿が空でも同じ取込画面を表示する", () =>
 
 test("未認証のクラウド取込操作はログインへつなぐ", () => {
   assert.match(source, /const receiptDisabled = cloudSession\.status === "authenticated" \? "" : "disabled"/);
+  assert.match(source, /function renderGmailProgress\(\) \{\s*if \(cloudSession\.status !== "authenticated"\)/);
   assert.match(source, /if \(cloudSession\.status !== "authenticated"\) \{[\s\S]*?data-google-login>Googleでログイン/);
   assert.match(source, /if \(button\.dataset\.gmailConnect !== undefined\) \{\s*if \(cloudSession\.status !== "authenticated"\) \{\s*await startGoogleLogin\(\)/);
 });
