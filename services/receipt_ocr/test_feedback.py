@@ -127,8 +127,8 @@ class FeedbackTests(unittest.TestCase):
     def test_text_model_correction_never_clears_review(self):
         output = {"source_id": "store:0", "original": "たまた 浜見平店", "corrected": "たまや 浜見平店"}
         feedback = {"store_corrections": [{"original": "たまた 浜見平店", "corrected": "たまや 浜見平店", "count": 1}]}
-        with mock.patch.dict(os.environ, {"OCR_TEXT_LLM_ENABLED": "true"}), mock.patch("services.receipt_ocr.ollama_fallback.ollama_generate", return_value=output):
-            result = apply_text_correction(base_result(), feedback)
+        with mock.patch.dict(os.environ, {"RECEIPT_OCR_ENABLE_FEEDBACK": "true", "RECEIPT_OCR_ENABLE_TEXT_CORRECTION": "true"}), mock.patch("services.receipt_ocr.ollama_fallback.ollama_generate", return_value=output):
+            result = apply_text_correction(apply_feedback(base_result(), feedback), feedback)
         self.assertEqual(result["store_name"], "たまや 浜見平店")
         self.assertTrue(result["needs_review"])
         self.assertTrue(result["fallbacks"]["text_llm_used"])
@@ -185,7 +185,9 @@ class FeedbackTests(unittest.TestCase):
     def test_missing_datetime_precedes_history_triggered_total_reread(self):
         result = base_result(store="", store_confidence=0.0)
         result["paid_at"] = None
-        feedback = {"character_confusions": [{"field_name": "total_amount", "observed": "8", "confirmed": "3", "count": 2}]}
+        result["field_confidence"]["total_amount"] = 0.8
+        result["field_evidence"]["total_amount"] = {"source_text": "合計 5,382", "confidence": 0.8, "preprocessing": "contrast"}
+        feedback = {"character_confusions": [{"field_name": "total_amount", "observed": "8", "confirmed": "3", "count": 2, "character_type": "digit", "preprocessing": "contrast", "confidence_band": "high", "left_context": "3", "right_context": "2"}]}
         self.assertEqual(required_regions(result, feedback), ["store_region", "datetime_region", "total_region"])
 
     def test_region_crop_is_local_and_temporary_file_is_removed(self):
