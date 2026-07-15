@@ -252,14 +252,6 @@ export async function applyResolvedTransactionFields(db, transactionId, options 
   requireDb(db);
   const resolvedTransactionId = requiredString(transactionId?.transaction_id ?? transactionId, "transactionId");
   const resolvedOptions = transactionId && typeof transactionId === "object" ? transactionId : options;
-  const plan = await resolvedTransactionPlan(db, resolvedTransactionId, resolvedOptions);
-  if (plan.statements.length) await runBatch(db, plan.statements);
-  return plan.statements.length
-    ? firstRow(db, "SELECT * FROM transactions WHERE id = ?", [resolvedTransactionId])
-    : plan.transaction;
-}
-
-async function resolvedTransactionPlan(db, resolvedTransactionId, resolvedOptions, changes = {}) {
   const transaction = await firstRow(db, "SELECT * FROM transactions WHERE id = ?", [resolvedTransactionId]);
   if (!transaction) throw new Error("Transaction not found");
   if (resolvedOptions.project_id && transaction.project_id !== resolvedOptions.project_id) {
@@ -274,17 +266,8 @@ async function resolvedTransactionPlan(db, resolvedTransactionId, resolvedOption
      ORDER BY created_at, id`,
     [resolvedTransactionId],
   );
-  const filteredRows = changes.exclude_import_id
-    ? importRows.filter((row) => row.id !== changes.exclude_import_id)
-    : importRows;
-  if (changes.include_import) {
-    const index = filteredRows.findIndex((row) => row.id === changes.include_import.id);
-    if (index === -1) filteredRows.push(changes.include_import);
-    else filteredRows[index] = changes.include_import;
-    filteredRows.sort((left, right) => String(left.created_at).localeCompare(String(right.created_at)) || String(left.id).localeCompare(String(right.id)));
-  }
-  if (!filteredRows.length) return { transaction, statements: [] };
-  const sources = filteredRows.map(resolutionSource);
+  if (!importRows.length) return transaction;
+  const sources = importRows.map(resolutionSource);
   const resolution = resolveTransactionFields(transaction, sources);
   const fields = transactionFields(transaction, resolution.fields);
   protectConfirmedValues(transaction, fields, resolution.field_sources);
@@ -354,7 +337,8 @@ async function resolvedTransactionPlan(db, resolvedTransactionId, resolvedOption
   }
   const paymentPlan = await resolvedPaymentPlan(db, transaction, fields, sources, resolution.field_sources, resolvedOptions, now);
   statements.push(...paymentPlan);
-  return { transaction, statements };
+  await runBatch(db, statements);
+  return firstRow(db, "SELECT * FROM transactions WHERE id = ?", [resolvedTransactionId]);
 }
 
 async function persistAndClassify(db, record, options) {
@@ -468,43 +452,29 @@ async function insertImport(db, record) {
 }
 
 async function linkImport(db, importRecord, details) {
-  importRecord = confirmedOcrImportRecord(importRecord, details);
   const transactionId = requiredString(details.transaction_id ?? details.transactionId, "transactionId");
   const transaction = await firstRow(db, "SELECT * FROM transactions WHERE id = ?", [transactionId]);
   if (!transaction) throw new Error("Transaction not found");
   if (transaction.project_id !== importRecord.project_id) throw new Error("Transaction does not belong to the import project");
   const oldTransactionId = importRecord.transaction_id;
   const reason = jsonValue(details.match_reason_json ?? details.matchReason, importRecord.match_reason_json);
-  const now = currentTime(details);
-  const importStatement = boundStatement(
+  await runStatement(
     db,
     `UPDATE import_records
-     SET transaction_id = ?, source_status = 'linked', merchant_raw = ?, merchant_normalized = ?,
-         gross_amount_raw = ?, paid_amount_raw = ?, occurred_at_raw = ?, raw_payload = ?,
-         match_score = ?, match_reason_json = ?, updated_at = ?
+     SET transaction_id = ?, source_status = 'linked', match_score = ?, match_reason_json = ?, updated_at = ?
      WHERE id = ?`,
     [
       transactionId,
-      importRecord.merchant_raw,
-      importRecord.merchant_normalized,
-      importRecord.gross_amount_raw,
-      importRecord.paid_amount_raw,
-      importRecord.occurred_at_raw,
-      importRecord.raw_payload,
       integerValue(details.match_score ?? details.matchScore, importRecord.match_score),
       reason,
-      now,
+      currentTime(details),
       importRecord.id,
     ],
   );
-  const linkedImport = { ...importRecord, transaction_id: transactionId, source_status: "linked", updated_at: now };
-  const targetPlan = await resolvedTransactionPlan(db, transactionId, details, { include_import: linkedImport });
-  const oldPlan = oldTransactionId && oldTransactionId !== transactionId
-    ? await resolvedTransactionPlan(db, oldTransactionId, details, { exclude_import_id: importRecord.id })
-    : { statements: [] };
-  const feedbackStatements = pendingOcrFeedbackStatements(db, importRecord, transactionId, details, now);
-  await runBatch(db, [...feedbackStatements, importStatement, ...oldPlan.statements, ...targetPlan.statements]);
-  const resolvedTransaction = await firstRow(db, "SELECT * FROM transactions WHERE id = ?", [transactionId]);
+  if (oldTransactionId && oldTransactionId !== transactionId) {
+    await applyResolvedTransactionFields(db, oldTransactionId, details);
+  }
+  const resolvedTransaction = await applyResolvedTransactionFields(db, transactionId, details);
   const updatedImport = await firstRow(db, "SELECT * FROM import_records WHERE id = ?", [importRecord.id]);
   return importResult(updatedImport, {
     duplicate: false,
@@ -516,7 +486,6 @@ async function linkImport(db, importRecord, details) {
 }
 
 async function createTransactionForImport(db, importRecord, details) {
-  importRecord = confirmedOcrImportRecord(importRecord, details);
   if (importRecord.transaction_id) {
     const transaction = await firstRow(db, "SELECT * FROM transactions WHERE id = ?", [importRecord.transaction_id]);
     return importResult(importRecord, {
@@ -618,23 +587,14 @@ async function createTransactionForImport(db, importRecord, details) {
       ),
     );
   }
-  statements.push(...pendingOcrFeedbackStatements(db, importRecord, transactionId, details, now));
   statements.push(
     boundStatement(
       db,
       `UPDATE import_records
-       SET transaction_id = ?, source_status = 'linked', merchant_raw = ?, merchant_normalized = ?,
-           gross_amount_raw = ?, paid_amount_raw = ?, occurred_at_raw = ?, raw_payload = ?,
-           match_score = ?, match_reason_json = ?, updated_at = ?
+       SET transaction_id = ?, source_status = 'linked', match_score = ?, match_reason_json = ?, updated_at = ?
        WHERE id = ?`,
       [
         transactionId,
-        importRecord.merchant_raw,
-        importRecord.merchant_normalized,
-        importRecord.gross_amount_raw,
-        importRecord.paid_amount_raw,
-        importRecord.occurred_at_raw,
-        importRecord.raw_payload,
         integerValue(details.match_score, null),
         jsonValue(details.match_reason_json, null),
         now,
@@ -652,66 +612,6 @@ async function createTransactionForImport(db, importRecord, details) {
     candidates: details.candidates || [],
     transaction: createdTransaction,
   });
-}
-
-function pendingOcrFeedbackStatements(db, importRecord, transactionId, details, timestampValue) {
-  const pending = details?.pending_ocr_feedback;
-  if (!pending || importRecord.source_type !== "receipt") return [];
-  const userId = requiredString(pending.user_id, "pendingOcrUserId");
-  const ocrResultId = requiredString(pending.ocr_result_id, "pendingOcrResultId");
-  const confirmedJson = typeof pending.confirmed_json === "string"
-    ? pending.confirmed_json
-    : JSON.stringify(pending.confirmed);
-  return [
-    boundStatement(
-      db,
-      `INSERT INTO receipt_ocr_feedback_submissions (
-         import_id, user_id, project_id, transaction_id, ocr_result_id, confirmed_json, created_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?)
-       ON CONFLICT(import_id) DO NOTHING`,
-      [importRecord.id, userId, importRecord.project_id, transactionId, ocrResultId, confirmedJson, timestampValue],
-    ),
-    boundStatement(
-      db,
-      `INSERT INTO receipt_ocr_feedback_pending (
-       import_id, user_id, project_id, transaction_id, ocr_result_id,
-       claims_json, confirmed_json, created_at, updated_at
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-     ON CONFLICT(import_id) DO NOTHING`,
-      [
-        importRecord.id,
-        userId,
-        importRecord.project_id,
-        transactionId,
-        ocrResultId,
-        JSON.stringify(pending.claims),
-        confirmedJson,
-        timestampValue,
-        timestampValue,
-      ],
-    ),
-  ];
-}
-
-function confirmedOcrImportRecord(importRecord, details) {
-  const confirmed = details?.confirmed_ocr;
-  if (!confirmed || importRecord.source_type !== "receipt") return importRecord;
-  const merchantRaw = optionalString(confirmed.store_name) || importRecord.merchant_raw;
-  const paidAmount = integerAmount(confirmed.total_amount) ?? importRecord.paid_amount_raw;
-  const occurredAt = normalizeDate(confirmed.paid_at) || importRecord.occurred_at_raw;
-  const payload = payloadObject(importRecord.raw_payload);
-  const ocr = payload.ocr && typeof payload.ocr === "object" && !Array.isArray(payload.ocr) ? { ...payload.ocr } : {};
-  if (confirmed.paid_time) ocr.confirmed_paid_time = confirmed.paid_time;
-  if (Array.isArray(confirmed.items)) ocr.confirmed_items = confirmed.items;
-  return {
-    ...importRecord,
-    merchant_raw: merchantRaw,
-    merchant_normalized: normalizeMerchantName(merchantRaw),
-    gross_amount_raw: paidAmount,
-    paid_amount_raw: paidAmount,
-    occurred_at_raw: occurredAt,
-    raw_payload: JSON.stringify({ ...payload, ocr }),
-  };
 }
 
 async function detachImport(db, importRecord, sourceStatus, details) {

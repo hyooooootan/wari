@@ -54,9 +54,10 @@ function transactionStatus(row) {
   return String(row?.status ?? "").toLowerCase();
 }
 
-function activePayment(row) {
+function activePayment(row, transaction) {
   const status = String(row?.payment_status ?? "confirmed").toLowerCase();
-  return status !== "cancelled" && status !== "refunded";
+  if (status === "cancelled") return false;
+  return status !== "refunded" || transactionType(transaction) === "refund";
 }
 
 function resolveProjectId(state, requestedProjectId) {
@@ -109,11 +110,13 @@ function calculateSplit(state, requestedProjectId) {
   const projectId = resolveProjectId(state, requestedProjectId);
   const members = asArray(state?.project_members).filter((row) => projectId === null || row.project_id === projectId);
   const transactions = asArray(state?.transactions).filter((row) => projectId === null || row.project_id === projectId);
+  const transactionsById = new Map(transactions.map((row) => [row.id, row]));
   const transactionIds = new Set(transactions.map((row) => row.id));
   const items = rowsForProject(state?.transaction_items, projectId, transactionIds, transactionId);
   const itemIds = new Set(items.map((row) => row.id));
   const itemTransactions = new Map(items.map((row) => [row.id, transactionId(row)]));
-  const payments = rowsForProject(state?.transaction_payments, projectId, transactionIds, transactionId).filter(activePayment);
+  const payments = rowsForProject(state?.transaction_payments, projectId, transactionIds, transactionId)
+    .filter((row) => activePayment(row, transactionsById.get(transactionId(row))));
   const allocations = asArray(state?.item_allocations).filter((row) => {
     if (projectId === null) return true;
     if (row?.project_id !== undefined && row.project_id !== projectId) return false;
@@ -218,7 +221,7 @@ function validateProjectTransactions(state, requestedProjectId) {
     }
     const amount = isSafeIntegerValue(amountValue) ? amountValue : 0;
     const payments = allPayments.filter((row) => transactionId(row) === transaction.id);
-    const countedPayments = payments.filter(activePayment);
+    const countedPayments = payments.filter((row) => activePayment(row, transaction));
     const items = allItems.filter((row) => transactionId(row) === transaction.id);
     const itemIds = new Set(items.map((row) => row.id));
     const allocations = allAllocations.filter((row) => {
@@ -331,9 +334,11 @@ function aggregateHousehold(state, requestedProjectId) {
   const seenIds = new Set();
   for (const transaction of asArray(state?.transactions)) {
     if (projectId !== null && transaction.project_id !== projectId) continue;
-    if (transactionStatus(transaction) !== "confirmed") continue;
+    const status = transactionStatus(transaction);
     const type = transactionType(transaction);
-    if (type !== "purchase" && type !== "split_expense") continue;
+    const includedStatus = status === "confirmed" || status === "corrected" || status === "refunded" && type === "refund";
+    if (!includedStatus) continue;
+    if (!["purchase", "split_expense", "refund", "adjustment"].includes(type)) continue;
     const identity = transaction.id ?? transaction;
     if (seenIds.has(identity)) continue;
     seenIds.add(identity);

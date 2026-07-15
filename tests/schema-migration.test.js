@@ -15,9 +15,6 @@ const accountDeletionMigrationSql = readFileSync(path.join(repositoryRoot, 'db',
 const householdSyncMigrationSql = readFileSync(path.join(repositoryRoot, 'db', 'migrations', '0007_household_sync_jobs.sql'), 'utf8');
 const gmailRevocationGuardsMigrationSql = readFileSync(path.join(repositoryRoot, 'db', 'migrations', '0008_gmail_revocation_guards.sql'), 'utf8');
 const personalHouseholdsMigrationSql = readFileSync(path.join(repositoryRoot, 'db', 'migrations', '0009_personal_households.sql'), 'utf8');
-const receiptOcrFeedbackMigrationSql = readFileSync(path.join(repositoryRoot, 'db', 'migrations', '0010_receipt_ocr_feedback.sql'), 'utf8');
-const receiptOcrFeedbackPendingMigrationSql = readFileSync(path.join(repositoryRoot, 'db', 'migrations', '0011_receipt_ocr_feedback_pending.sql'), 'utf8');
-const receiptOcrFeedbackConflictMigrationSql = readFileSync(path.join(repositoryRoot, 'db', 'migrations', '0012_receipt_ocr_feedback_conflicts.sql'), 'utf8');
 const verificationSql = readFileSync(path.join(repositoryRoot, 'db', 'verify_household_ledger.sql'), 'utf8');
 
 const runtimeTables = [
@@ -36,10 +33,6 @@ const runtimeTables = [
   'project_shares',
   'project_user_roles',
   'projects',
-  'receipt_ocr_correction_events',
-  'receipt_ocr_feedback_pending',
-  'receipt_ocr_feedback_submissions',
-  'receipt_ocr_field_outcomes',
   'sessions',
   'transaction_items',
   'transaction_payments',
@@ -69,11 +62,6 @@ const requestedIndexes = [
   'idx_project_user_roles_user',
   'idx_projects_household_owner',
   'idx_projects_share_token',
-  'idx_receipt_ocr_corrections_lookup',
-  'idx_receipt_ocr_corrections_user_created',
-  'idx_receipt_ocr_feedback_pending_user',
-  'idx_receipt_ocr_feedback_submissions_user',
-  'idx_receipt_ocr_outcomes_stats',
   'idx_sessions_user',
   'idx_transaction_items_transaction',
   'idx_transaction_payments_external_payment',
@@ -298,86 +286,11 @@ test('fresh schema creates the runtime tables and requested indexes', (t) => {
 });
 
 test('numbered migrations create the runtime tables from an empty database', (t) => {
-  const database = openDatabase(`${baselineSql}\n${migrationSql}\n${authMigrationSql}\n${gmailMigrationSql}\n${gmailOauthProjectMigrationSql}\n${accountDeletionMigrationSql}\n${householdSyncMigrationSql}\n${gmailRevocationGuardsMigrationSql}\n${personalHouseholdsMigrationSql}\n${receiptOcrFeedbackMigrationSql}\n${receiptOcrFeedbackPendingMigrationSql}\n${receiptOcrFeedbackConflictMigrationSql}`);
+  const database = openDatabase(`${baselineSql}\n${migrationSql}\n${authMigrationSql}\n${gmailMigrationSql}\n${gmailOauthProjectMigrationSql}\n${accountDeletionMigrationSql}\n${householdSyncMigrationSql}\n${gmailRevocationGuardsMigrationSql}\n${personalHouseholdsMigrationSql}`);
   t.after(() => database.close());
 
   assert.deepEqual(tableNames(database), runtimeTables);
   assert.deepEqual(indexNames(database), requestedIndexes);
-  assert.deepEqual(database.prepare('PRAGMA foreign_key_check').all(), []);
-});
-
-test('0012 preserves identical OCR retries and rejects conflicting retry content', (t) => {
-  const database = openDatabase(`${baselineSql}\n${migrationSql}\n${authMigrationSql}\n${gmailMigrationSql}\n${gmailOauthProjectMigrationSql}\n${accountDeletionMigrationSql}\n${householdSyncMigrationSql}\n${gmailRevocationGuardsMigrationSql}\n${personalHouseholdsMigrationSql}\n${receiptOcrFeedbackMigrationSql}\n${receiptOcrFeedbackPendingMigrationSql}`);
-  t.after(() => database.close());
-  const now = '2026-07-15T00:00:00.000Z';
-
-  database.prepare('INSERT INTO users (id, google_sub, email, created_at, updated_at) VALUES (?, ?, ?, ?, ?)').run('ocr-user', 'ocr-sub', 'ocr@example.invalid', now, now);
-  database.prepare('INSERT INTO users (id, google_sub, email, created_at, updated_at) VALUES (?, ?, ?, ?, ?)').run('ocr-other', 'ocr-other-sub', 'other@example.invalid', now, now);
-  insertProject(database, ['ocr-project', 'OCR project', 'split', 'JPY', null, 'editor', now, now]);
-  database.prepare(`
-    INSERT INTO transactions (id, project_id, merchant_name, gross_amount, paid_amount, occurred_at, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-  `).run('ocr-transaction', 'ocr-project', 'Store', 100, 100, now, now, now);
-  database.prepare(`
-    INSERT INTO import_records (id, project_id, transaction_id, source_type, source_status, created_at, updated_at)
-    VALUES (?, ?, ?, 'receipt', 'linked', ?, ?)
-  `).run('ocr-import', 'ocr-project', 'ocr-transaction', now, now);
-  const insertOutcome = database.prepare(`
-    INSERT INTO receipt_ocr_field_outcomes (
-      id, user_id, transaction_id, ocr_result_id, field_name, source_id, ocr_model,
-      preprocessing, confidence, was_corrected, created_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(user_id, ocr_result_id, field_name, source_id) DO NOTHING
-  `);
-  const insertCorrection = database.prepare(`
-    INSERT INTO receipt_ocr_correction_events (
-      id, user_id, transaction_id, ocr_result_id, field_name, source_id, original_value,
-      corrected_value, normalized_original_value, normalized_corrected_value, ocr_model,
-      preprocessing, confidence, bounding_box_json, source_text, created_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(user_id, ocr_result_id, field_name, source_id) DO NOTHING
-  `);
-
-  insertOutcome.run('outcome-original', 'ocr-user', 'ocr-transaction', 'ocr_result_0012', 'store_name', 'root', 'ocr-model', 'default', 0.8, 1, now);
-  insertCorrection.run('correction-original', 'ocr-user', 'ocr-transaction', 'ocr_result_0012', 'store_name', 'root', 'St0re', 'Store', 'st0re', 'store', 'ocr-model', 'default', 0.8, null, 'St0re', now);
-  database.exec(receiptOcrFeedbackConflictMigrationSql);
-
-  const insertSubmission = database.prepare(`
-    INSERT INTO receipt_ocr_feedback_submissions (
-      import_id, user_id, project_id, transaction_id, ocr_result_id, confirmed_json, created_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(import_id) DO NOTHING
-  `);
-  const confirmedJson = '{"store_name":"Ａ店","total_amount":100,"paid_at":"2026-07-15","paid_time":"13:16","items":[{"source_id":"item:0","name":"牛乳","amount":100}]}';
-  assert.equal(insertSubmission.run('ocr-import', 'ocr-user', 'ocr-project', 'ocr-transaction', 'ocr_result_0012', confirmedJson, now).changes, 1);
-  assert.equal(insertSubmission.run('ocr-import', 'ocr-user', 'ocr-project', 'ocr-transaction', 'ocr_result_0012', confirmedJson, now).changes, 0);
-  for (const conflictingJson of [
-    '{"store_name":"A店","total_amount":100,"paid_at":"2026-07-15","paid_time":"13:16","items":[{"source_id":"item:0","name":"牛乳","amount":100}]}',
-    '{"store_name":"Ａ店","total_amount":100,"paid_at":"2026-07-15","paid_time":null,"items":[{"source_id":"item:0","name":"牛乳","amount":100}]}',
-    '{"store_name":"Ａ店","total_amount":100,"paid_at":"2026-07-15","paid_time":"13:16","items":[]}',
-  ]) {
-    assert.throws(
-      () => insertSubmission.run('ocr-import', 'ocr-user', 'ocr-project', 'ocr-transaction', 'ocr_result_0012', conflictingJson, now),
-      /ocr_feedback_content_conflict/,
-    );
-  }
-  assert.throws(
-    () => insertSubmission.run('ocr-import', 'ocr-other', 'ocr-project', 'ocr-transaction', 'ocr_result_0012', confirmedJson, now),
-    /ocr_feedback_content_conflict/,
-  );
-
-  assert.equal(insertOutcome.run('outcome-retry', 'ocr-user', 'ocr-transaction', 'ocr_result_0012', 'store_name', 'root', 'ocr-model', 'default', 0.8, 1, '2026-07-15T01:00:00.000Z').changes, 0);
-  assert.equal(insertCorrection.run('correction-retry', 'ocr-user', 'ocr-transaction', 'ocr_result_0012', 'store_name', 'root', 'St0re', 'Store', 'st0re', 'store', 'ocr-model', 'default', 0.8, null, 'St0re', '2026-07-15T01:00:00.000Z').changes, 0);
-  assert.throws(
-    () => insertOutcome.run('outcome-conflict', 'ocr-user', 'ocr-transaction', 'ocr_result_0012', 'store_name', 'root', 'ocr-model', 'default', 0.8, 0, now),
-    /ocr_feedback_content_conflict/,
-  );
-  assert.throws(
-    () => insertCorrection.run('correction-conflict', 'ocr-user', 'ocr-transaction', 'ocr_result_0012', 'store_name', 'root', 'St0re', 'Other', 'st0re', 'other', 'ocr-model', 'default', 0.8, null, 'St0re', now),
-    /ocr_feedback_content_conflict/,
-  );
-  assert.equal(database.prepare('SELECT COUNT(*) AS count FROM receipt_ocr_field_outcomes').get().count, 1);
-  assert.equal(database.prepare('SELECT COUNT(*) AS count FROM receipt_ocr_correction_events').get().count, 1);
   assert.deepEqual(database.prepare('PRAGMA foreign_key_check').all(), []);
 });
 
@@ -398,7 +311,7 @@ test('legacy migration preserves data and creates deterministic ledger rows', (t
   t.after(() => database.close());
   seedLegacyDatabase(database);
 
-  database.exec(`BEGIN IMMEDIATE;\n${migrationSql}\n${authMigrationSql}\n${gmailMigrationSql}\n${gmailOauthProjectMigrationSql}\n${accountDeletionMigrationSql}\n${householdSyncMigrationSql}\n${gmailRevocationGuardsMigrationSql}\n${personalHouseholdsMigrationSql}\n${receiptOcrFeedbackMigrationSql}\n${receiptOcrFeedbackPendingMigrationSql}\n${receiptOcrFeedbackConflictMigrationSql}\nCOMMIT;`);
+  database.exec(`BEGIN IMMEDIATE;\n${migrationSql}\n${authMigrationSql}\n${gmailMigrationSql}\n${gmailOauthProjectMigrationSql}\n${accountDeletionMigrationSql}\n${householdSyncMigrationSql}\n${gmailRevocationGuardsMigrationSql}\n${personalHouseholdsMigrationSql}\nCOMMIT;`);
 
   const freshDatabase = openDatabase(schemaSql);
   t.after(() => freshDatabase.close());
