@@ -56,11 +56,13 @@ class D1Database {
 
   async batch(statements) {
     const isHouseholdBatch=statements.some((statement)=>statement.sql.includes("household_sync_guards"));
+    const isOcrFeedbackBatch=statements.some((statement)=>statement.sql.includes("receipt_ocr_field_outcomes"));
     this.database.exec("BEGIN IMMEDIATE");
     try {
       const results = [];
       for (let index=0;index<statements.length;index++) {
         if(this.failHouseholdBatchAt===index&&isHouseholdBatch)throw new Error("injected_household_sync_failure");
+        if(this.failOcrFeedbackBatches>0&&isOcrFeedbackBatch){this.failOcrFeedbackBatches-=1;throw new Error("injected_ocr_feedback_failure");}
         if(this.failBatchAt===index)throw new Error("injected_batch_failure");
         results.push(await statements[index].run());
       }
@@ -1034,6 +1036,7 @@ test("OCR correction routes sign originals, isolate users, and send bounded feed
     items: [],
   };
   const correctedImportId = receiptImport.body.import.id;
+  db.failOcrFeedbackBatches = 1;
   const correctedReconcile = await request(db, "POST", `/api/imports/${correctedImportId}/reconcile`, {
     action: "create",
     new_transaction_id: "ocr-corrected-transaction",
@@ -1041,6 +1044,8 @@ test("OCR correction routes sign originals, isolate users, and send bounded feed
     confirmed: correctedConfirmation,
   }, feedbackEnv);
   assert.equal(correctedReconcile.response.status, 200);
+  assert.equal(correctedReconcile.body.ocr_feedback.status, "saved");
+  assert.equal(correctedReconcile.body.ocr_feedback.accepted_events, 4);
   const correctedTransaction = await db.prepare("SELECT merchant_name, paid_amount, occurred_at FROM transactions WHERE id = ?").bind("ocr-corrected-transaction").first();
   assert.equal(correctedTransaction.merchant_name, "たまや 浜見平店");
   assert.equal(correctedTransaction.paid_amount, 5400);
@@ -1071,14 +1076,34 @@ test("OCR correction routes sign originals, isolate users, and send bounded feed
     confirmed: linkedConfirmation,
   }, feedbackEnv);
   assert.equal(linkedReconcile.response.status, 200);
+  assert.equal(linkedReconcile.body.ocr_feedback.status, "saved");
   const linkedTransaction = await db.prepare("SELECT merchant_name, paid_amount, occurred_at FROM transactions WHERE id = ?").bind("ocr-linked-transaction").first();
   assert.equal(linkedTransaction.merchant_name, linkedConfirmation.store_name);
   assert.equal(linkedTransaction.paid_amount, linkedConfirmation.total_amount);
   assert.equal(linkedTransaction.occurred_at, linkedConfirmation.paid_at);
 
+  const missingValueImport = await request(db, "POST", "/api/projects/ocr-feedback/imports/receipt", {
+    source_record_id: `receipt:missing-values:${ocr.body.ocr_result_id}`,
+    merchant_raw: ocr.body.store_name,
+    raw_payload: { ocr: { ocr_result_id: ocr.body.ocr_result_id } },
+  });
+  const filledMissingValues = await request(db, "POST", `/api/imports/${missingValueImport.body.import.id}/reconcile`, {
+    action: "create",
+    new_transaction_id: "ocr-filled-missing-transaction",
+    feedback_token: ocr.body.feedback_token,
+    confirmed: correctedConfirmation,
+  }, feedbackEnv);
+  assert.equal(filledMissingValues.response.status, 200);
+  assert.equal(filledMissingValues.body.transaction.paid_amount, correctedConfirmation.total_amount);
+  assert.equal(filledMissingValues.body.transaction.occurred_at, correctedConfirmation.paid_at);
+
+  const secondOcr = await request(db, "POST", "/api/ocr-receipt", { project_id: "ocr-feedback", image_data_url: "data:image/png;base64,AA==" }, feedbackEnv);
+  assert.equal(upstreamBodies[1].feedback.store_corrections[0].corrected, "たまや 浜見平店");
+  assert.equal(new TextEncoder().encode(JSON.stringify(upstreamBodies[1].feedback)).byteLength <= 32 * 1024, true);
+
   const saved = await request(db, "POST", "/api/ocr-corrections", {
     transaction_id: "ocr-feedback-transaction",
-    feedback_token: ocr.body.feedback_token,
+    feedback_token: secondOcr.body.feedback_token,
     confirmed: { store_name: "たまや 浜見平店", total_amount: 5382, paid_at: "2026-07-11", paid_time: "13:16", items: [] },
   }, feedbackEnv);
   assert.equal(saved.response.status, 201);
@@ -1086,21 +1111,57 @@ test("OCR correction routes sign originals, isolate users, and send bounded feed
 
   const duplicate = await request(db, "POST", "/api/ocr-corrections", {
     transaction_id: "ocr-feedback-transaction",
-    feedback_token: ocr.body.feedback_token,
+    feedback_token: secondOcr.body.feedback_token,
     confirmed: { store_name: "たまや 浜見平店", total_amount: 5382, paid_at: "2026-07-11", paid_time: "13:16", items: [] },
   }, feedbackEnv);
   assert.deepEqual(duplicate.body, { accepted_outcomes: 0, accepted_events: 0 });
 
+  const failedTransactionOcr = await request(db, "POST", "/api/ocr-receipt", { project_id: "ocr-feedback", image_data_url: "data:image/png;base64,AA==" }, feedbackEnv);
+  const failedTransactionImport = await request(db, "POST", "/api/projects/ocr-feedback/imports/receipt", {
+    source_record_id: `receipt:failed-transaction:${failedTransactionOcr.body.ocr_result_id}`,
+    merchant_raw: failedTransactionOcr.body.store_name,
+    paid_amount_raw: failedTransactionOcr.body.total_amount,
+    occurred_at_raw: failedTransactionOcr.body.paid_at,
+    raw_payload: { ocr: { ocr_result_id: failedTransactionOcr.body.ocr_result_id } },
+  });
+  db.failBatchAt = 0;
+  const failedTransaction = await request(db, "POST", `/api/imports/${failedTransactionImport.body.import.id}/reconcile`, {
+    action: "create",
+    new_transaction_id: "ocr-transaction-must-not-exist",
+    feedback_token: failedTransactionOcr.body.feedback_token,
+    confirmed: correctedConfirmation,
+  }, feedbackEnv);
+  assert.equal(failedTransaction.response.status, 500);
+  assert.equal(db.database.prepare("SELECT COUNT(*) AS count FROM transactions WHERE id = ?").get("ocr-transaction-must-not-exist").count, 0);
+  assert.equal(db.database.prepare("SELECT COUNT(*) AS count FROM receipt_ocr_correction_events WHERE ocr_result_id = ?").get(failedTransactionOcr.body.ocr_result_id).count, 0);
+
+  const failedFeedbackOcr = await request(db, "POST", "/api/ocr-receipt", { project_id: "ocr-feedback", image_data_url: "data:image/png;base64,AA==" }, feedbackEnv);
+  const failedFeedbackImport = await request(db, "POST", "/api/projects/ocr-feedback/imports/receipt", {
+    source_record_id: `receipt:failed-feedback:${failedFeedbackOcr.body.ocr_result_id}`,
+    merchant_raw: failedFeedbackOcr.body.store_name,
+    paid_amount_raw: failedFeedbackOcr.body.total_amount,
+    occurred_at_raw: failedFeedbackOcr.body.paid_at,
+    raw_payload: { ocr: { ocr_result_id: failedFeedbackOcr.body.ocr_result_id } },
+  });
+  db.failOcrFeedbackBatches = 2;
+  const failedFeedback = await request(db, "POST", `/api/imports/${failedFeedbackImport.body.import.id}/reconcile`, {
+    action: "create",
+    new_transaction_id: "ocr-feedback-failure-transaction",
+    feedback_token: failedFeedbackOcr.body.feedback_token,
+    confirmed: correctedConfirmation,
+  }, feedbackEnv);
+  assert.equal(failedFeedback.response.status, 200);
+  assert.equal(failedFeedback.body.ocr_feedback.status, "failed");
+  assert.equal(db.database.prepare("SELECT COUNT(*) AS count FROM transactions WHERE id = ?").get("ocr-feedback-failure-transaction").count, 1);
+  assert.equal(db.database.prepare("SELECT COUNT(*) AS count FROM receipt_ocr_correction_events WHERE ocr_result_id = ?").get(failedFeedbackOcr.body.ocr_result_id).count, 0);
+
   const count = await request(db, "GET", "/api/ocr-corrections", undefined, feedbackEnv);
-  assert.equal(count.body.correction_count, 1);
-  await request(db, "POST", "/api/ocr-receipt", { project_id: "ocr-feedback", image_data_url: "data:image/png;base64,AA==" }, feedbackEnv);
-  assert.equal(upstreamBodies[1].feedback.store_corrections[0].corrected, "たまや 浜見平店");
-  assert.equal(new TextEncoder().encode(JSON.stringify(upstreamBodies[1].feedback)).byteLength <= 32 * 1024, true);
+  assert.equal(count.body.correction_count, 5);
 
   const otherSession = await createTestSession(db, "other-ocr-user");
   const other = await request(db, "POST", "/api/ocr-corrections", {
     transaction_id: "ocr-feedback-transaction",
-    feedback_token: ocr.body.feedback_token,
+    feedback_token: secondOcr.body.feedback_token,
     confirmed: { store_name: "別店舗", total_amount: 5382, paid_at: "2026-07-11", paid_time: "13:16", items: [] },
   }, feedbackEnv, { session: otherSession });
   assert.equal(other.response.status, 403);
@@ -1108,7 +1169,7 @@ test("OCR correction routes sign originals, isolate users, and send bounded feed
   assert.equal(otherCount.body.correction_count, 0);
 
   const deleted = await request(db, "DELETE", "/api/ocr-corrections", undefined, feedbackEnv);
-  assert.equal(deleted.body.deleted_corrections, 1);
+  assert.equal(deleted.body.deleted_corrections, 5);
   assert.equal((await request(db, "GET", "/api/ocr-corrections", undefined, feedbackEnv)).body.correction_count, 0);
 
   const disabledEnv = {
@@ -1136,6 +1197,7 @@ test("OCR correction routes sign originals, isolate users, and send bounded feed
     confirmed: disabledConfirmed,
   }, disabledEnv);
   assert.equal(disabledReconcile.response.status, 200);
+  assert.equal(disabledReconcile.body.ocr_feedback.status, "disabled");
   const disabledTransaction = await db.prepare("SELECT merchant_name, paid_amount, occurred_at FROM transactions WHERE id = ?").bind("ocr-disabled-write-transaction").first();
   assert.equal(disabledTransaction.merchant_name, disabledConfirmed.store_name);
   assert.equal(disabledTransaction.paid_amount, disabledConfirmed.total_amount);

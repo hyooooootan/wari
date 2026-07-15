@@ -18,16 +18,18 @@ test("public app click handler keeps the Gmail branch and other actions reachabl
   assert.match(source, /if \(button\.dataset\.gmailImport\)/);
 });
 
-test("OCR confirmation preserves originals, supports item edits, and saves feedback after reconciliation", () => {
+test("OCR confirmation preserves originals, supports item edits, and handles reconciled feedback status", () => {
   assert.match(source, /function receiptOcrMetadata\(result\)[\s\S]*original:[\s\S]*confirmed_items:/);
   assert.match(source, /const ocrFeedbackTokens = new Map\(\)/);
   assert.doesNotMatch(source, /feedback_token: String\(result\.feedback_token/);
   assert.match(source, /const editable = record\.source_type === "receipt"[\s\S]*ocrFeedbackTokens\.has\(ocr\.ocr_result_id\)/);
   assert.match(source, /data-import-ocr-field="item_name:\$\{index\}"/);
   assert.match(source, /data-import-ocr-field="item_amount:\$\{index\}"/);
-  assert.match(source, /function createFromImport[\s\S]*await Api\.reconcileImport[\s\S]*await Api\.saveOcrCorrections/);
-  assert.match(source, /function linkImport[\s\S]*await Api\.reconcileImport[\s\S]*await Api\.saveOcrCorrections/);
+  assert.match(source, /function createFromImport[\s\S]*await Api\.reconcileImport[\s\S]*reconciliation\.ocr_feedback/);
+  assert.match(source, /function linkImport[\s\S]*await Api\.reconcileImport[\s\S]*reconciliation\.ocr_feedback/);
   assert.match(source, /Api\.reconcileImport\(record\.id,[\s\S]*feedback_token: feedback\.feedback_token, confirmed: feedback\.confirmed/);
+  assert.match(source, /async function finishOcrFeedback[\s\S]*Api\.saveOcrCorrections\(feedback\)/);
+  assert.match(source, /status === "saved" \|\| status === "disabled"[\s\S]*ocrFeedbackTokens\.delete\(resultId\)/);
   assert.match(source, /取引は保存されましたが、OCR修正履歴の保存に失敗しました/);
 });
 

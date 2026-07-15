@@ -692,13 +692,14 @@ async function handleReconcile(request, db, env, importId, user) {
   if (!record) throw new ApiError(404, "not_found");
   await requireOpenProject(db, record.project_id);
   const hasOcrConfirmation = body.feedback_token !== undefined || body.confirmed !== undefined;
+  let ocrClaims = null;
   if (hasOcrConfirmation) {
     if (body.action !== "create" && body.action !== "link") throw new ApiError(400, "invalid_ocr_confirmation");
     if (record.source_type !== "receipt" || typeof body.feedback_token !== "string" || body.confirmed === undefined) {
       throw new ApiError(400, "invalid_ocr_confirmation");
     }
-    const claims = await verifyOcrFeedbackToken(env, body.feedback_token, user.id);
-    if (claims.project_id !== record.project_id || !matchesReceiptOcrResult(record, claims.ocr_result_id)) {
+    ocrClaims = await verifyOcrFeedbackToken(env, body.feedback_token, user.id);
+    if (ocrClaims.project_id !== record.project_id || !matchesReceiptOcrResult(record, ocrClaims.ocr_result_id)) {
       throw new ApiError(403, "ocr_feedback_token_mismatch");
     }
     body.confirmed_ocr = validateConfirmedOcrValues(body.confirmed);
@@ -708,7 +709,9 @@ async function handleReconcile(request, db, env, importId, user) {
     await assertTransactionProject(db, transactionId, record.project_id);
   }
   if (body.action === "create") {
-    if (!Number.isSafeInteger(record.paid_amount_raw) || !record.occurred_at_raw || !Number.isFinite(Date.parse(record.occurred_at_raw))) {
+    const reconciledAmount = body.confirmed_ocr?.total_amount ?? record.paid_amount_raw;
+    const reconciledDate = body.confirmed_ocr?.paid_at ?? record.occurred_at_raw;
+    if (!Number.isSafeInteger(reconciledAmount) || !reconciledDate || !Number.isFinite(Date.parse(reconciledDate))) {
       throw new ApiError(422, "import_not_reconcilable");
     }
     if (body.new_transaction_id) {
@@ -720,7 +723,28 @@ async function handleReconcile(request, db, env, importId, user) {
   const synchronization = await synchronizeHouseholdMutation(db, {
     sourceProjectId: record.project_id, syncScope: "project", reason: "import_reconciled", user,
   });
-  return json({ ...result, synchronization });
+  const ocrFeedback = ocrClaims
+    ? await saveReconciledOcrFeedback(db, env, user, body, ocrClaims, result.transaction?.id)
+    : null;
+  return json({ ...result, synchronization, ...(ocrFeedback ? { ocr_feedback: ocrFeedback } : {}) });
+}
+
+async function saveReconciledOcrFeedback(db, env, user, body, claims, transactionId) {
+  if (!feedbackWriteEnabled(env)) return { status: "disabled" };
+  const input = {
+    transaction_id: transactionId || body.transaction_id || body.new_transaction_id,
+    feedback_token: body.feedback_token,
+    confirmed: body.confirmed,
+  };
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const saved = await registerOcrCorrections(db, user, input, claims);
+      return { status: "saved", ...saved };
+    } catch {
+      if (attempt === 1) return { status: "failed" };
+    }
+  }
+  return { status: "failed" };
 }
 
 async function finalizeProject(db, projectId, user) {

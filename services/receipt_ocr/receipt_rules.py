@@ -50,7 +50,8 @@ def parse_receipt(lines):
     store_name = guess_store_name(lines)
     field_evidence = build_field_evidence(lines, store_name, total, subtotal, tax, paid_at, paid_time)
     field_confidence = field_confidences(store_name, total, subtotal, paid_at, paid_time, items, validations, field_evidence)
-    confidence = round(sum(field_confidence.values()) / len(field_confidence), 3)
+    priority_scores = [field_confidence[field] for field in ("store_name", "total_amount", "paid_at", "paid_time")]
+    confidence = round(sum(priority_scores) / len(priority_scores), 3)
     if total is None:
         warnings.append("合計金額を特定できませんでした。")
     if validations["deposit_change_total"] is False:
@@ -59,7 +60,8 @@ def parse_receipt(lines):
         warnings.append("小計・税額・値引・合計の計算が一致しません。")
     if validations["item_sum_total"] is False:
         warnings.append("品目合計と合計金額が一致しません。")
-    needs_review = confidence < REVIEW_THRESHOLD or bool(warnings)
+    priority_fields_ready = bool(store_name) and bool(total and total.value > 0) and bool(paid_at) and bool(paid_time)
+    needs_review = not priority_fields_ready or confidence < REVIEW_THRESHOLD or bool(warnings)
     notes = " ".join(warnings)
     result = {
         "store_name": store_name,

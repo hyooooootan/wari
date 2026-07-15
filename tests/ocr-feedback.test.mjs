@@ -163,11 +163,19 @@ test("five signed outcomes produce bounded preprocessing statistics and store ca
   seed(db);
   for (let index = 0; index < 5; index += 1) {
     const { claims, input } = await signedInput(`ocr_result_${index}`);
+    input.confirmed.total_amount = 5332;
     await registerOcrCorrections(db, { id: "user-a" }, input, claims);
   }
   const feedback = await buildReceiptFeedback(db, "user-a");
   assert.equal(feedback.store_corrections[0].count, 5);
-  assert.ok(feedback.character_confusions.some((entry) => entry.observed === "た" && entry.confirmed === "や"));
+  assert.ok(feedback.character_confusions.some((entry) => entry.observed === "た" && entry.confirmed === "や" && entry.character_type === "hiragana"));
+  assert.ok(feedback.character_confusions.some((entry) => entry.field_name === "total_amount"
+    && entry.observed === "8"
+    && entry.confirmed === "3"
+    && entry.character_type === "digit"
+    && entry.ocr_model === "PP-OCRv6_small_rec"
+    && entry.preprocessing === "contrast"
+    && entry.confidence_band === "high"));
   assert.ok(feedback.preprocessing_stats.some((entry) => entry.field_name === "store_name" && entry.confirmed_count === 5));
   assert.ok(new TextEncoder().encode(JSON.stringify(feedback)).byteLength <= 32 * 1024);
 });
@@ -186,4 +194,16 @@ test("registration rejects unknown image fields and invalid confirmed values", a
   await assert.rejects(() => registerOcrCorrections(db, { id: "user-a" }, { ...input, image_data_url: "data:image/png;base64,AAAA" }, claims), /invalid_field/);
   await assert.rejects(() => registerOcrCorrections(db, { id: "user-a" }, { ...input, confirmed: { ...input.confirmed, paid_time: "29:99" } }, claims), /invalid_paid_time/);
   await assert.rejects(() => registerOcrCorrections(db, { id: "user-a" }, { ...input, confirmed: { ...input.confirmed, store_name: "" } }, claims), /invalid_store_name/);
+  await assert.rejects(() => registerOcrCorrections(db, { id: "user-a" }, { ...input, confirmed: { ...input.confirmed, store_name: "店".repeat(201) } }, claims), /invalid_store_name/);
+});
+
+test("unchanged confirmed fields create outcomes without correction events", async (t) => {
+  const db = new Database();
+  t.after(() => db.close());
+  seed(db);
+  const { claims, input } = await signedInput("ocr_unchanged_values", "たまた 浜見平店");
+  const stored = await registerOcrCorrections(db, { id: "user-a" }, input, claims);
+  assert.equal(stored.accepted_outcomes, 6);
+  assert.equal(stored.accepted_events, 0);
+  assert.equal((await countOcrCorrections(db, { id: "user-a" })).correction_count, 0);
 });

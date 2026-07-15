@@ -65,6 +65,18 @@ class ReceiptRulesTest(unittest.TestCase):
         self.assertEqual(result["tax_amount"], 398)
         self.assertEqual(result["total_amount"], 5382)
 
+    def test_priority_fields_are_required_before_review_is_cleared(self):
+        missing_time = parse_receipt(lines("たまや 浜見平店", "2026年07月11日", "合計 5,382"))
+        self.assertTrue(missing_time["needs_review"])
+        complete = parse_receipt(lines("たまや 浜見平店", "2026年07月11日 13:16", "合計 5,382"))
+        self.assertEqual(complete["items"], [])
+        self.assertFalse(complete["needs_review"])
+
+    def test_subtotal_tax_deposit_and_change_are_not_selected_as_total(self):
+        result = parse_receipt(lines("たまや 浜見平店", "2026年07月11日 13:16", "小計 4,984", "外税 398", "お預り 6,000", "お釣り 618"))
+        self.assertIsNone(result["total_amount"])
+        self.assertTrue(result["needs_review"])
+
 
 if __name__ == "__main__":
     unittest.main()

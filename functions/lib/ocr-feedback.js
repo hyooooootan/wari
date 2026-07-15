@@ -64,12 +64,21 @@ export async function deleteOcrCorrections(db, user) {
 
 export async function buildReceiptFeedback(db, userId) {
   if (!userId) return emptyFeedback();
-  const [correctionResult, statsResult] = await Promise.all([
+  const [correctionResult, confusionResult, statsResult] = await Promise.all([
     db.prepare(`SELECT normalized_original_value AS original, corrected_value AS corrected, COUNT(*) AS count
       FROM receipt_ocr_correction_events
       WHERE user_id = ? AND field_name = 'store_name'
       GROUP BY normalized_original_value, corrected_value
       ORDER BY count DESC, MAX(created_at) DESC LIMIT 20`).bind(userId).all(),
+    db.prepare(`SELECT field_name, normalized_original_value AS original,
+        normalized_corrected_value AS corrected, ocr_model, preprocessing,
+        CASE WHEN confidence < 0.5 THEN 'low' WHEN confidence < 0.8 THEN 'medium' ELSE 'high' END AS confidence_band,
+        COUNT(*) AS count
+      FROM receipt_ocr_correction_events
+      WHERE user_id = ?
+      GROUP BY field_name, normalized_original_value, normalized_corrected_value,
+        ocr_model, preprocessing, confidence_band
+      ORDER BY count DESC, MAX(created_at) DESC LIMIT 100`).bind(userId).all(),
     db.prepare(`SELECT field_name, ocr_model, preprocessing, COUNT(*) AS confirmed_count,
         SUM(CASE WHEN was_corrected = 0 THEN 1 ELSE 0 END) AS correct_count,
         SUM(CASE WHEN was_corrected = 1 THEN 1 ELSE 0 END) AS corrected_count
@@ -87,7 +96,7 @@ export async function buildReceiptFeedback(db, userId) {
   const feedback = {
     version: 1,
     store_corrections: storeCorrections,
-    character_confusions: collectCharacterConfusions(storeCorrections).slice(0, 30),
+    character_confusions: collectCharacterConfusions(rows(confusionResult)).slice(0, 30),
     preprocessing_stats: rows(statsResult).map((row) => ({
       field_name: FIELD_NAMES.has(row.field_name) ? row.field_name : "",
       ocr_model: boundedText(row.ocr_model, 100),
@@ -202,19 +211,45 @@ function confirmedValues(value) {
 function collectCharacterConfusions(corrections) {
   const counts = new Map();
   for (const entry of corrections) {
+    const fieldName = FIELD_NAMES.has(entry.field_name) ? entry.field_name : "store_name";
+    const ocrModel = boundedText(entry.ocr_model, 100);
+    const preprocessing = boundedText(entry.preprocessing, 100);
+    const confidenceBand = new Set(["low", "medium", "high"]).has(entry.confidence_band) ? entry.confidence_band : "unknown";
     const original = Array.from(entry.original);
     const corrected = Array.from(entry.corrected);
     if (original.length !== corrected.length) continue;
     for (let index = 0; index < original.length; index += 1) {
       if (original[index] === corrected[index]) continue;
-      const key = `${original[index]}\u0000${corrected[index]}`;
+      const leftContext = original[index - 1] || "";
+      const rightContext = original[index + 1] || "";
+      const key = [fieldName, ocrModel, preprocessing, confidenceBand, original[index], corrected[index], leftContext, rightContext].join("\u0000");
       counts.set(key, (counts.get(key) || 0) + entry.count);
     }
   }
   return [...counts.entries()].map(([key, count]) => {
-    const [observed, confirmed] = key.split("\u0000");
-    return { observed, confirmed, count };
+    const [fieldName, ocrModel, preprocessing, confidenceBand, observed, confirmed, leftContext, rightContext] = key.split("\u0000");
+    return {
+      field_name: fieldName,
+      ocr_model: ocrModel,
+      preprocessing,
+      confidence_band: confidenceBand,
+      character_type: characterType(observed),
+      observed,
+      confirmed,
+      left_context: leftContext,
+      right_context: rightContext,
+      count,
+    };
   }).sort((left, right) => right.count - left.count);
+}
+
+function characterType(value) {
+  if (/^[0-9]$/u.test(value)) return "digit";
+  if (/^[\u3040-\u309f]$/u.test(value)) return "hiragana";
+  if (/^[\u30a0-\u30ff]$/u.test(value)) return "katakana";
+  if (/^\p{Script=Han}$/u.test(value)) return "kanji";
+  if (/^[A-Za-z]$/u.test(value)) return "latin";
+  return "other";
 }
 
 function fieldValue(value, fieldName, name) {

@@ -1,4 +1,5 @@
 import os
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -14,6 +15,7 @@ from services.receipt_ocr.ollama_fallback import (
     read_region,
     region_box,
     required_regions,
+    numeric_confusion_signal,
     valid_date,
     valid_time,
     validate_text_output,
@@ -69,6 +71,18 @@ class FeedbackTests(unittest.TestCase):
         candidates = store_correction_candidates("無関係店", {"store_corrections": [{"original": "たまた 浜見平店", "corrected": "たまや 浜見平店", "count": 3}]})
         self.assertEqual(candidates, [])
 
+    def test_similar_store_text_is_returned_as_review_candidate(self):
+        candidates = store_correction_candidates("たまた 浜見平", {"store_corrections": [{"original": "たまた 浜見平店", "corrected": "たまや 浜見平店", "count": 3}]})
+        self.assertEqual(candidates[0]["corrected"], "たまや 浜見平店")
+        self.assertLess(candidates[0]["similarity"], 1.0)
+
+    def test_different_branch_is_not_an_automatic_match(self):
+        feedback = {"store_corrections": [{"original": "たまた 茅ヶ崎店", "corrected": "たまや 茅ヶ崎店", "count": 5}]}
+        with mock.patch.dict(os.environ, {"RECEIPT_OCR_ENABLE_FEEDBACK": "true"}):
+            result = apply_feedback(base_result("たまた 浜見平店"), feedback)
+        self.assertEqual(result["store_name"], "たまた 浜見平店")
+        self.assertFalse(result.get("fallbacks", {}).get("past_feedback_used", False))
+
     def test_preprocessing_order_requires_five_matching_model_outcomes(self):
         default = ("clahe", "adaptive")
         sparse = {"preprocessing_stats": [{"field_name": "store_name", "ocr_model": "m1", "preprocessing": "adaptive", "confirmed_count": 4, "correct_count": 4}]}
@@ -93,6 +107,7 @@ class FeedbackTests(unittest.TestCase):
         self.assertEqual(validate_text_output(valid, "store:0", "たまた 浜見平店", past), "たまや 浜見平店")
         self.assertIsNone(validate_text_output({**valid, "source_id": "other"}, "store:0", "たまた 浜見平店", past))
         self.assertIsNone(validate_text_output({**valid, "corrected": "たまや2号店"}, "store:0", "たまた1号店", past))
+        self.assertIsNone(validate_text_output(valid, "store:0", "たまた 浜見平店", []))
         self.assertIsNone(validate_text_output("broken", "store:0", "店", past))
 
     def test_text_model_failure_returns_normal_ocr(self):
@@ -111,6 +126,27 @@ class FeedbackTests(unittest.TestCase):
         self.assertTrue(result["needs_review"])
         self.assertTrue(result["fallbacks"]["text_llm_used"])
 
+    def test_text_model_receives_at_most_five_store_examples_without_financial_fields(self):
+        result = base_result()
+        result["store_name_candidates"] = [{"corrected": f"候補{index}"} for index in range(8)]
+        feedback = {"character_confusions": [
+            {"field_name": "store_name", "observed": "た", "confirmed": "や", "count": 2},
+            {"field_name": "total_amount", "observed": "8", "confirmed": "3", "count": 2},
+        ]}
+        prompts = []
+
+        def capture(_model, prompt, _timeout):
+            prompts.append(json.loads(prompt))
+            return {"source_id": "store:0", "original": result["store_name"], "corrected": result["store_name"]}
+
+        with mock.patch.dict(os.environ, {"RECEIPT_OCR_ENABLE_TEXT_CORRECTION": "true"}), mock.patch("services.receipt_ocr.ollama_fallback.ollama_generate", side_effect=capture):
+            apply_text_correction(result, feedback)
+        self.assertEqual(len(prompts[0]["past_corrections"]), 5)
+        self.assertEqual([entry["field_name"] for entry in prompts[0]["character_confusions"]], ["store_name"])
+        self.assertNotIn("total_amount", prompts[0])
+        self.assertNotIn("paid_at", prompts[0])
+        self.assertNotIn("paid_time", prompts[0])
+
     def test_vision_total_requires_existing_candidate(self):
         result = base_result()
         apply_vision_output(result, "total_region", {"read_amount": 5332, "label": "合計", "confidence": 0.9})
@@ -127,6 +163,23 @@ class FeedbackTests(unittest.TestCase):
     def test_high_confidence_result_does_not_request_vision(self):
         result = base_result(store_confidence=0.9)
         self.assertEqual(required_regions(result), [])
+
+    def test_numeric_confusion_can_request_reread_without_replacing_total(self):
+        result = base_result(store_confidence=0.9)
+        result["field_confidence"]["total_amount"] = 0.8
+        result["field_evidence"]["total_amount"] = {"source_text": "合計 5,382", "confidence": 0.8, "preprocessing": "contrast"}
+        feedback = {"character_confusions": [{"field_name": "total_amount", "observed": "8", "confirmed": "3", "count": 2, "character_type": "digit", "preprocessing": "contrast", "confidence_band": "high", "left_context": "3", "right_context": "2"}]}
+        self.assertTrue(numeric_confusion_signal(result, feedback))
+        self.assertIn("total_region", required_regions(result, feedback))
+        self.assertEqual(result["total_amount"], 5382)
+        feedback["character_confusions"][0]["preprocessing"] = "adaptive"
+        self.assertFalse(numeric_confusion_signal(result, feedback))
+
+    def test_missing_datetime_precedes_history_triggered_total_reread(self):
+        result = base_result(store="", store_confidence=0.0)
+        result["paid_at"] = None
+        feedback = {"character_confusions": [{"field_name": "total_amount", "observed": "8", "confirmed": "3", "count": 2}]}
+        self.assertEqual(required_regions(result, feedback), ["store_region", "datetime_region", "total_region"])
 
     def test_region_crop_is_local_and_temporary_file_is_removed(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -147,9 +200,10 @@ class FeedbackTests(unittest.TestCase):
                 return handle
 
             with mock.patch("services.receipt_ocr.ollama_fallback.tempfile.NamedTemporaryFile", side_effect=tracked_temporary_file), mock.patch("services.receipt_ocr.ollama_fallback.ollama_generate", side_effect=fake_generate):
-                output = read_region(image_path, base_result(), "store_region")
-            self.assertEqual(output["store_name"], "店")
-            self.assertTrue(seen[0])
+                outputs = [read_region(image_path, base_result(), region) for region in ("store_region", "total_region", "datetime_region")]
+            self.assertTrue(all(output["store_name"] == "店" for output in outputs))
+            self.assertEqual(len(seen), 3)
+            self.assertTrue(all(seen_image for seen_image in seen))
             self.assertTrue(temporary_paths)
             self.assertTrue(all(not path.exists() for path in temporary_paths))
 
@@ -160,8 +214,14 @@ class FeedbackTests(unittest.TestCase):
         self.assertFalse(result.get("fallbacks", {}).get("vision_reread_used", False))
 
     def test_region_box_is_bounded(self):
-        box = region_box(base_result(), "store_region")
-        self.assertTrue(all(0 <= value <= 1 for value in box))
+        result = base_result()
+        result["field_evidence"]["total_amount"] = {"bounding_box": [0.2, 0.7, 0.8, 0.8], "preprocessing": "contrast"}
+        result["field_evidence"]["paid_at"] = {"bounding_box": [0.1, 0.2, 0.9, 0.3], "preprocessing": "contrast"}
+        for region in ("store_region", "total_region", "datetime_region"):
+            box = region_box(result, region)
+            self.assertTrue(all(0 <= value <= 1 for value in box))
+            self.assertLess(box[0], box[2])
+            self.assertLess(box[1], box[3])
 
     def test_total_band_coordinates_are_mapped_back_to_the_original_image(self):
         result = base_result()
@@ -178,6 +238,16 @@ class FeedbackTests(unittest.TestCase):
         generate.assert_not_called()
         self.assertEqual(text_result["store_name"], "たまた 浜見平店")
         self.assertFalse(vision_result.get("fallbacks", {}).get("vision_reread_used", False))
+
+    def test_vision_call_limit_applies_across_regions(self):
+        result = base_result(store="", store_confidence=0.0)
+        result["total_amount"] = None
+        result["paid_at"] = None
+        result["paid_time"] = None
+        with mock.patch.dict(os.environ, {"RECEIPT_OCR_ENABLE_VISION_REREAD": "true"}), mock.patch("services.receipt_ocr.ollama_fallback.MAX_VISION_CALLS", 2), mock.patch("services.receipt_ocr.ollama_fallback.read_region", return_value={"confidence": 0.1}) as reread:
+            applied = apply_vision_reread(result, Path("unused.jpg"), remaining_seconds=10)
+        self.assertEqual(reread.call_count, 2)
+        self.assertEqual(applied["fallbacks"]["vision_calls"], 2)
 
 
 if __name__ == "__main__":

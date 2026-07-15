@@ -881,7 +881,10 @@ function renderImportReview(project, projectIds = new Set([project.id]), include
     const values = editable
       ? `<div class="field-grid"><div class="field"><label>店名</label><input class="input" value="${esc(record.merchant_raw || "")}" data-import-ocr-field="merchant_raw" data-import-ocr-id="${esc(record.id)}"></div><div class="field"><label>金額</label><input class="input" type="number" inputmode="numeric" min="1" value="${esc(record.paid_amount_raw ?? record.gross_amount_raw ?? "")}" data-import-ocr-field="paid_amount_raw" data-import-ocr-id="${esc(record.id)}"></div></div><div class="field-grid"><div class="field"><label>日付</label><input class="input" type="date" value="${esc(dateValue(record.occurred_at_raw))}" data-import-ocr-field="occurred_at_raw" data-import-ocr-id="${esc(record.id)}"></div><div class="field"><label>時刻</label><input class="input" type="time" value="${esc(ocr.confirmed_paid_time || ocr.original?.paid_time || "")}" data-import-ocr-field="paid_time" data-import-ocr-id="${esc(record.id)}"></div></div>`
       : `<div class="review-row-value"><strong>${esc(record.merchant_raw || "店名未設定")}</strong><strong>${esc(yen(record.paid_amount_raw ?? record.gross_amount_raw))}</strong></div>`;
-    return `<div class="review-row"><div class="review-row-head"><span class="source-type">${esc(SOURCE_TYPES[record.source_type] || record.source_type)}</span><span>${esc(formatDate(record.occurred_at_raw || record.created_at))}</span></div>${values}${editable ? renderOcrItemFields(ocr, record.id) : ""}<div class="review-actions"><button class="small-button household-small" type="button" data-create-from-import="${esc(record.id)}">取引にする</button><select data-import-link-select="${esc(record.id)}" aria-label="既存の取引"><option value="">既存の取引</option>${transactions.map((transaction) => `<option value="${esc(transaction.id)}">${esc(dateValue(transaction.occurred_at))} ${esc(transaction.merchant_name)} ${esc(yen(transaction.paid_amount))}</option>`).join("")}</select><button class="small-button" type="button" data-link-import="${esc(record.id)}">紐付け</button><button class="icon-button quiet" type="button" data-reject-import="${esc(record.id)}" aria-label="却下">×</button></div>${editable ? `<p class="field-note">修正した内容は、次回以降の読み取り候補の改善に使用されます</p>` : ""}</div>`;
+    const feedbackNote = ocr?.feedback_write_enabled === false
+      ? "修正は取引へ反映されます。OCR修正履歴の保存は現在停止中です"
+      : "修正した内容は、次回以降の読み取り候補の改善に使用されます";
+    return `<div class="review-row"><div class="review-row-head"><span class="source-type">${esc(SOURCE_TYPES[record.source_type] || record.source_type)}</span><span>${esc(formatDate(record.occurred_at_raw || record.created_at))}</span></div>${values}${editable ? renderOcrItemFields(ocr, record.id) : ""}<div class="review-actions"><button class="small-button household-small" type="button" data-create-from-import="${esc(record.id)}">取引にする</button><select data-import-link-select="${esc(record.id)}" aria-label="既存の取引"><option value="">既存の取引</option>${transactions.map((transaction) => `<option value="${esc(transaction.id)}">${esc(dateValue(transaction.occurred_at))} ${esc(transaction.merchant_name)} ${esc(yen(transaction.paid_amount))}</option>`).join("")}</select><button class="small-button" type="button" data-link-import="${esc(record.id)}">紐付け</button><button class="icon-button quiet" type="button" data-reject-import="${esc(record.id)}" aria-label="却下">×</button></div>${editable ? `<p class="field-note">${feedbackNote}</p>` : ""}</div>`;
   }).join("");
 }
 
@@ -1976,7 +1979,6 @@ async function loadOcrFeedbackCount() {
 function createFromImport(project, record) {
   const transactionIdValue = makeId("txn");
   const feedback = ocrFeedbackFromRecord(record, transactionIdValue);
-  const saveFeedback = receiptOcrPayload(record)?.feedback_write_enabled !== false;
   let next = Household.createManualHouseholdTransaction(state, project.id, {
     id: transactionIdValue,
     merchant_name: record.merchant_raw || "取込取引",
@@ -1996,19 +1998,13 @@ function createFromImport(project, record) {
   commitState(next, "仮の取引を作成しました", {
     remoteFilter: () => false,
     remoteAction: async () => {
-      await Api.reconcileImport(record.id, {
+      const reconciliation = await Api.reconcileImport(record.id, {
         action: "create",
         new_transaction_id: transactionIdValue,
         ...(feedback ? { feedback_token: feedback.feedback_token, confirmed: feedback.confirmed } : {}),
       });
-      if (feedback && saveFeedback) {
-        try {
-          await Api.saveOcrCorrections(feedback);
-          ocrFeedbackTokens.delete(receiptOcrPayload(record)?.ocr_result_id);
-          ui.ocrFeedback.count = null;
-        } catch {
-          toast("取引は保存されましたが、OCR修正履歴の保存に失敗しました");
-        }
+      if (feedback) {
+        await finishOcrFeedback(reconciliation, feedback, receiptOcrPayload(record)?.ocr_result_id);
       }
       await refreshCloudProject(project.id);
     },
@@ -2021,7 +2017,6 @@ function linkImport(project, record, transactionIdValue) {
     return;
   }
   const feedback = ocrFeedbackFromRecord(record, transactionIdValue);
-  const saveFeedback = receiptOcrPayload(record)?.feedback_write_enabled !== false;
   const next = cloneState();
   const row = next.import_records.find((value) => value.id === record.id);
   row.transaction_id = transactionIdValue;
@@ -2031,23 +2026,32 @@ function linkImport(project, record, transactionIdValue) {
   commitState(next, "取引へ紐付けました", {
     remoteFilter: () => false,
     remoteAction: async () => {
-      await Api.reconcileImport(record.id, {
+      const reconciliation = await Api.reconcileImport(record.id, {
         action: "link",
         transaction_id: transactionIdValue,
         ...(feedback ? { feedback_token: feedback.feedback_token, confirmed: feedback.confirmed } : {}),
       });
-      if (feedback && saveFeedback) {
-        try {
-          await Api.saveOcrCorrections(feedback);
-          ocrFeedbackTokens.delete(receiptOcrPayload(record)?.ocr_result_id);
-          ui.ocrFeedback.count = null;
-        } catch {
-          toast("取引は保存されましたが、OCR修正履歴の保存に失敗しました");
-        }
+      if (feedback) {
+        await finishOcrFeedback(reconciliation, feedback, receiptOcrPayload(record)?.ocr_result_id);
       }
       await refreshCloudProject(project.id);
     },
   });
+}
+
+async function finishOcrFeedback(reconciliation, feedback, resultId) {
+  let status = reconciliation.ocr_feedback?.status;
+  if (status === "failed" || !status) {
+    try {
+      await Api.saveOcrCorrections(feedback);
+      status = "saved";
+    } catch {
+      toast("取引は保存されましたが、OCR修正履歴の保存に失敗しました");
+      return;
+    }
+  }
+  if (status === "saved") ui.ocrFeedback.count = null;
+  if (status === "saved" || status === "disabled") ocrFeedbackTokens.delete(resultId);
 }
 
 function rejectImport(project, record) {

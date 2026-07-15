@@ -13,9 +13,9 @@ from pathlib import Path
 from PIL import Image
 
 try:
-    from services.receipt_ocr.feedback import digits, feature_enabled, normalize_store, string_similarity
+    from services.receipt_ocr.feedback import digits, feature_enabled, normalize_store
 except ImportError:
-    from feedback import digits, feature_enabled, normalize_store, string_similarity
+    from feedback import digits, feature_enabled, normalize_store
 
 
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/")
@@ -44,11 +44,14 @@ def apply_text_correction(result, feedback, remaining_seconds=None):
     if timeout < 1:
         return result
     past = result.get("store_name_candidates", [])[:FEEDBACK_MAX_EXAMPLES]
+    confusions = []
+    if isinstance(feedback, dict):
+        confusions = [entry for entry in feedback.get("character_confusions", []) if isinstance(entry, dict) and entry.get("field_name") == "store_name"][:30]
     payload = {
         "task": "OCR店名の軽微な誤字候補を確認する。数字、支店名、識別子を変更しない。JSON以外を返さない。",
         "current": {"source_id": source_id, "text": original, "confidence": evidence.get("confidence", 0)},
         "past_corrections": past,
-        "character_confusions": feedback.get("character_confusions", [])[:30] if isinstance(feedback, dict) else [],
+        "character_confusions": confusions,
     }
     fallbacks = result.setdefault("fallbacks", {})
     fallbacks["text_llm_calls"] = 1
@@ -67,11 +70,11 @@ def apply_text_correction(result, feedback, remaining_seconds=None):
     return result
 
 
-def apply_vision_reread(result, image_path, remaining_seconds=None):
+def apply_vision_reread(result, image_path, remaining_seconds=None, feedback=None):
     result = dict(result)
     if MAX_VISION_CALLS == 0 or not feature_enabled("RECEIPT_OCR_ENABLE_VISION_REREAD", "OCR_VISION_ENABLED"):
         return result
-    regions = required_regions(result)[:MAX_VISION_CALLS]
+    regions = required_regions(result, feedback)[:MAX_VISION_CALLS]
     if not regions or not VISION_SEMAPHORE.acquire(timeout=0.1):
         return result
     budget = VISION_TIMEOUT if remaining_seconds is None else min(VISION_TIMEOUT, remaining_seconds)
@@ -115,22 +118,52 @@ def validate_text_output(output, source_id, original, past):
     if digits(original) != digits(corrected):
         return None
     allowed = {entry.get("corrected") for entry in past if isinstance(entry, dict)}
-    if corrected not in allowed and string_similarity(normalize_store(original), normalize_store(corrected)) < 0.75:
+    if corrected not in allowed and normalize_store(original) != normalize_store(corrected):
         return None
     return corrected
 
 
-def required_regions(result):
+def required_regions(result, feedback=None):
     fields = result.get("field_confidence", {})
     regions = []
     if not result.get("store_name") or float(fields.get("store_name", 0)) < 0.72:
         regions.append("store_region")
     validations = result.get("validations", {})
-    if result.get("total_amount") is None or any(value is False for value in validations.values()):
+    total_required = result.get("total_amount") is None or any(value is False for value in validations.values())
+    if total_required:
         regions.append("total_region")
     if not result.get("paid_at") or not result.get("paid_time"):
         regions.append("datetime_region")
+    if not total_required and numeric_confusion_signal(result, feedback):
+        regions.append("total_region")
     return regions
+
+
+def numeric_confusion_signal(result, feedback):
+    evidence = result.get("field_evidence", {}).get("total_amount", {})
+    confidence = float(evidence.get("confidence", result.get("field_confidence", {}).get("total_amount", 0.0)))
+    if confidence >= 0.95 or not isinstance(feedback, dict):
+        return False
+    source_text = str(evidence.get("source_text", ""))
+    source_digits = digits(source_text)
+    preprocessing = str(evidence.get("preprocessing", ""))
+    confidence_band = "low" if confidence < 0.5 else "medium" if confidence < 0.8 else "high"
+    for entry in feedback.get("character_confusions", [])[:30]:
+        if not isinstance(entry, dict) or entry.get("field_name") not in ("total_amount", "item_amount"):
+            continue
+        observed = entry.get("observed")
+        confirmed = entry.get("confirmed")
+        count = entry.get("count")
+        if entry.get("character_type") not in (None, "digit"):
+            continue
+        if entry.get("preprocessing") and entry.get("preprocessing") != preprocessing:
+            continue
+        if entry.get("confidence_band") and entry.get("confidence_band") != confidence_band:
+            continue
+        context = f"{entry.get('left_context', '')}{observed or ''}{entry.get('right_context', '')}"
+        if isinstance(observed, str) and observed.isdigit() and isinstance(confirmed, str) and confirmed.isdigit() and isinstance(count, int) and count >= 2 and observed in source_digits and (context == observed or context in source_digits):
+            return True
+    return False
 
 
 def read_region(image_path, result, region, timeout=VISION_TIMEOUT):

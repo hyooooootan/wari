@@ -141,10 +141,10 @@ def _read_receipt_from_path(source_path, feedback=None):
             lines.extend(variant_lines)
         parsed = apply_feedback(parsed, feedback)
         parsed = apply_text_correction(parsed, feedback or {}, max(0.0, TOTAL_OCR_TIMEOUT - (time.monotonic() - started_at)))
-        parsed = apply_vision_reread(parsed, source_path, max(0.0, TOTAL_OCR_TIMEOUT - (time.monotonic() - started_at)))
+        parsed = apply_vision_reread(parsed, source_path, max(0.0, TOTAL_OCR_TIMEOUT - (time.monotonic() - started_at)), feedback=feedback or {})
         parsed["ocr_result_id"] = f"ocr_{uuid.uuid4().hex}"
         parsed["ocr_engine_version"] = f"{TEXT_DET_MODEL}+{TEXT_REC_MODEL}"
-        parsed["rule_engine_version"] = "receipt-rules-2"
+        parsed["rule_engine_version"] = "receipt-rules-3"
         parsed["processing_started_at"] = processing_started_at
         parsed["model"] = "paddleocr-onnxruntime"
         parsed["processing_time_ms"] = round((time.monotonic() - started_at) * 1000)
