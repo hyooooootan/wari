@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import { bulkCandidateAction, decryptRefreshToken, disconnectGmail, encryptRefreshToken, finishGmailOAuth, importCandidate, listCandidates, retryGmailRevocations, startGmailOAuth, syncGmail, updateCandidate } from "../functions/lib/gmail.js";
 import { extractGmailText } from "../functions/lib/gmail-mime.js";
 import { parsePaymentNotification } from "../functions/lib/gmail-parsers.js";
+import { getProjectSummaries } from "../functions/lib/api-data.js";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
 const schema = readFileSync(`${root}/db/schema.sql`, "utf8");
@@ -482,6 +483,29 @@ test("parallel candidate imports create one transaction and return the same resu
   db.raw.prepare("INSERT INTO gmail_import_candidates (id,connection_id,gmail_message_row_id,user_id,status,merchant_name,amount,occurred_at,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)").run("parallel-candidate","parallel-connection","parallel-message","user-1","ready","Shop",1000,now,now,now);
   const results=await Promise.all([importCandidate(db,{id:"user-1"},"parallel-candidate",{project_id:"personal-home"}),importCandidate(db,{id:"user-1"},"parallel-candidate",{project_id:"personal-home"})]);
   assert.equal(results[0].import.id,results[1].import.id);assert.equal(results[0].transaction.id,results[1].transaction.id);assert.equal(db.raw.prepare("SELECT count(*) AS n FROM transactions").get().n,1);
+});
+
+test("Gmailのクレジットカード返金を負数で家計簿と集計へ登録する", async (t) => {
+  const db = new Database();
+  t.after(() => db.close());
+  seed(db);
+  const now = "2026-07-12T00:00:00.000Z";
+  db.raw.prepare("INSERT INTO project_members (id,project_id,display_name,role,is_active,created_at,updated_at) VALUES (?,?,?,?,?,?,?)").run("refund-member", "personal-home", "Owner", "owner", 1, now, now);
+  db.raw.prepare("INSERT INTO gmail_connections (id,user_id,household_project_id,gmail_email,refresh_token_ciphertext,refresh_token_iv,key_generation,aad_version,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,1,'active',?,?)").run("refund-connection", "user-1", "personal-home", "refund@example.test", "x", "y", 1, now, now);
+  db.raw.prepare("INSERT INTO gmail_sync_runs (id,connection_id,user_id,days,message_limit,status,started_at) VALUES (?,?,?,?,?,'completed',?)").run("refund-run", "refund-connection", "user-1", 7, 1, now);
+  db.raw.prepare("INSERT INTO gmail_messages (id,connection_id,gmail_message_id,sync_run_id,parse_status,created_at) VALUES (?,?,?,?,?,?)").run("refund-message", "refund-connection", "refund-gmail-id", "refund-run", "parsed", now);
+  db.raw.prepare("INSERT INTO gmail_import_candidates (id,connection_id,gmail_message_row_id,user_id,status,merchant_name,amount,occurred_at,payment_method,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)").run("refund-candidate", "refund-connection", "refund-message", "user-1", "ready", "Card refund", -1500, now, "credit_card", now, now);
+
+  const imported = await importCandidate(db, { id: "user-1" }, "refund-candidate");
+  assert.equal(imported.transaction.paid_amount, -1500);
+  assert.equal(imported.transaction.entry_type, "refund");
+  assert.equal(imported.transaction.status, "refunded");
+  const payment = db.raw.prepare("SELECT amount,payment_method,payment_status FROM transaction_payments WHERE transaction_id=?").get(imported.transaction.id);
+  assert.deepEqual({ ...payment }, { amount: -1500, payment_method: "credit_card", payment_status: "refunded" });
+  const summaries = await getProjectSummaries(db, "personal-home");
+  assert.equal(summaries.summary.confirmed_total, -1500);
+  assert.equal(summaries.summary.excluded_total, 0);
+  assert.deepEqual(summaries.by_payment_method.map((row) => ({ ...row })), [{ payment_method: "credit_card", transaction_count: 1, total_amount: -1500 }]);
 });
 
 test("payment parsing requires a nonzero body amount and distinguishes review states", () => {
