@@ -25,6 +25,21 @@ test("認証状態に応じたGoogleログイン操作を表示する", () => {
   assert.match(source, /cloudSession\.user\?\.name \|\| cloudSession\.user\?\.email/);
 });
 
+test("未認証で家計簿が空でも同じ取込画面を表示する", () => {
+  assert.match(source, /const project = savedProject \|\| PREVIEW_HOUSEHOLD/);
+  assert.match(source, /<h3>レシート<\/h3>/);
+  assert.match(source, /<h3>CSV<\/h3>/);
+  assert.match(source, /<h3>通知<\/h3>/);
+  assert.match(source, /<h3>Gmail支払い通知<\/h3>/);
+  assert.doesNotMatch(source, /if \(!project\) return[^;]+取込記録はありません/);
+});
+
+test("未認証のクラウド取込操作はログインへつなぐ", () => {
+  assert.match(source, /const receiptDisabled = cloudSession\.status === "authenticated" \? "" : "disabled"/);
+  assert.match(source, /if \(cloudSession\.status !== "authenticated"\) \{[\s\S]*?data-google-login>Googleでログイン/);
+  assert.match(source, /if \(button\.dataset\.gmailConnect !== undefined\) \{\s*if \(cloudSession\.status !== "authenticated"\) \{\s*await startGoogleLogin\(\)/);
+});
+
 test("認可先への遷移とログアウト後の端末状態を処理する", () => {
   assert.match(source, /await Api\.startGoogleLogin\(\)/);
   assert.match(source, /location\.assign\(result\.url\)/);

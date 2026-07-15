@@ -1,14 +1,14 @@
-const CACHE_NAME = "wari-pwa-20260715-morning-refresh";
+const CACHE_NAME = "wari-pwa-20260715-guest-shell";
 const APP_SHELL = [
   "/",
   "/index.html",
-  "/styles.css?v=20260715-morning-refresh",
-  "/app.js?v=20260715-morning-refresh",
-  "/modules/storage.js?v=20260715-morning-refresh",
-  "/modules/split.js?v=20260715-morning-refresh",
-  "/modules/api.js?v=20260715-morning-refresh",
-  "/modules/imports.js?v=20260715-morning-refresh",
-  "/modules/household.js?v=20260715-morning-refresh",
+  "/styles.css?v=20260715-guest-shell",
+  "/app.js?v=20260715-guest-shell",
+  "/modules/storage.js?v=20260715-guest-shell",
+  "/modules/split.js?v=20260715-guest-shell",
+  "/modules/api.js?v=20260715-guest-shell",
+  "/modules/imports.js?v=20260715-guest-shell",
+  "/modules/household.js?v=20260715-guest-shell",
   "/manifest.webmanifest",
   "/icons/icon.svg",
   "/icons/icon-192.png",
