@@ -495,15 +495,7 @@ function createApiClient(options = {}) {
     const options = limitOrOptions && typeof limitOrOptions === "object" ? limitOrOptions : { limit: limitOrOptions };
     return request(`/gmail/connections/${encoded(connectionId)}/sync`, { method: "POST", json: { days, ...options } });
   };
-  const listGmailCandidates = (status, range = {}) => request("/gmail/candidates", { query: {
-    ...(status ? { status } : {}),
-    ...(range.from_date ? { from_date: range.from_date } : {}),
-    ...(range.to_date ? { to_date: range.to_date } : {}),
-  } });
-  const bulkGmailCandidates = (action, candidateIds) => request("/gmail/candidates/bulk", {
-    method: "POST",
-    json: { action, candidate_ids: candidateIds },
-  });
+  const listGmailCandidates = (status) => request("/gmail/candidates", { query: status ? { status } : undefined });
   const updateGmailCandidate = (candidateId, values) => request(`/gmail/candidates/${encoded(candidateId)}`, { method: "PATCH", json: values });
   const importGmailCandidate = (candidateId) => request(`/gmail/candidates/${encoded(candidateId)}/import`, { method: "POST", json: {} });
   const updateImportRecord = (importId, row = {}) => {
@@ -692,7 +684,6 @@ function createApiClient(options = {}) {
     disconnectGmail,
     syncGmail,
     listGmailCandidates,
-    bulkGmailCandidates,
     updateGmailCandidate,
     importGmailCandidate,
     getProjectSummaries,

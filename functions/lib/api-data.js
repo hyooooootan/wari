@@ -30,7 +30,7 @@ export async function listProjects(db) {
       (SELECT COUNT(*) FROM import_records WHERE project_id = projects.id) AS import_count,
       COALESCE((SELECT SUM(paid_amount) FROM transactions
         WHERE project_id = projects.id
-          AND (status IN ('confirmed', 'corrected') OR (status = 'refunded' AND entry_type = 'refund'))
+          AND status IN ('confirmed', 'refunded', 'corrected')
           AND entry_type IN ('purchase', 'split_expense', 'refund', 'adjustment')), 0) AS confirmed_total
     FROM projects
     WHERE projects.project_type IN ('split', 'household')
@@ -49,7 +49,7 @@ export async function listProjectsForUser(db, user) {
       (SELECT COUNT(*) FROM import_records WHERE project_id = projects.id) AS import_count,
       COALESCE((SELECT SUM(paid_amount) FROM transactions
         WHERE project_id = projects.id
-          AND (status IN ('confirmed', 'corrected') OR (status = 'refunded' AND entry_type = 'refund'))
+          AND status IN ('confirmed', 'refunded', 'corrected')
           AND entry_type IN ('purchase', 'split_expense', 'refund', 'adjustment')), 0) AS confirmed_total
     FROM projects
     LEFT JOIN project_user_roles roles
@@ -848,25 +848,25 @@ export async function getProjectSummaries(db, projectId) {
   await requireProject(db, id);
   const totals = await db.prepare(`SELECT
     COUNT(CASE
-      WHEN (status IN ('confirmed', 'corrected') OR (status = 'refunded' AND entry_type = 'refund'))
+      WHEN status IN ('confirmed', 'refunded', 'corrected')
         AND entry_type IN ('purchase', 'split_expense', 'refund', 'adjustment')
       THEN 1 END) AS transaction_count,
     COALESCE(SUM(CASE
-      WHEN (status IN ('confirmed', 'corrected') OR (status = 'refunded' AND entry_type = 'refund'))
+      WHEN status IN ('confirmed', 'refunded', 'corrected')
         AND entry_type IN ('purchase', 'split_expense', 'refund', 'adjustment')
       THEN paid_amount ELSE 0 END), 0) AS confirmed_total,
     COALESCE(SUM(CASE
       WHEN status = 'provisional'
         AND entry_type IN ('purchase', 'split_expense', 'refund', 'adjustment')
       THEN paid_amount ELSE 0 END), 0) AS provisional_total,
-    COALESCE(SUM(CASE WHEN status = 'cancelled' OR (status = 'refunded' AND entry_type <> 'refund') THEN paid_amount ELSE 0 END), 0) AS excluded_total
+    COALESCE(SUM(CASE WHEN status IN ('cancelled', 'refunded') THEN paid_amount ELSE 0 END), 0) AS excluded_total
     FROM transactions
     WHERE project_id = ?`).bind(id).first();
   const byCategory = await all(
     db.prepare(`SELECT COALESCE(category, '') AS category, COUNT(*) AS transaction_count, COALESCE(SUM(paid_amount), 0) AS total_amount
       FROM transactions
       WHERE project_id = ?
-        AND (status IN ('confirmed', 'corrected') OR (status = 'refunded' AND entry_type = 'refund'))
+        AND status IN ('confirmed', 'refunded', 'corrected')
         AND entry_type IN ('purchase', 'split_expense', 'refund', 'adjustment')
       GROUP BY COALESCE(category, '')
       ORDER BY total_amount DESC, category`).bind(id),
@@ -875,7 +875,7 @@ export async function getProjectSummaries(db, projectId) {
     db.prepare(`SELECT substr(occurred_at, 1, 7) AS month, COUNT(*) AS transaction_count, COALESCE(SUM(paid_amount), 0) AS total_amount
       FROM transactions
       WHERE project_id = ?
-        AND (status IN ('confirmed', 'corrected') OR (status = 'refunded' AND entry_type = 'refund'))
+        AND status IN ('confirmed', 'refunded', 'corrected')
         AND entry_type IN ('purchase', 'split_expense', 'refund', 'adjustment')
       GROUP BY substr(occurred_at, 1, 7)
       ORDER BY month DESC`).bind(id),
@@ -886,9 +886,9 @@ export async function getProjectSummaries(db, projectId) {
       FROM transaction_payments payments
       JOIN transactions ON transactions.id = payments.transaction_id
       WHERE transactions.project_id = ?
-        AND (transactions.status IN ('confirmed', 'corrected') OR (transactions.status = 'refunded' AND transactions.entry_type = 'refund'))
+        AND transactions.status IN ('confirmed', 'refunded', 'corrected')
         AND transactions.entry_type IN ('purchase', 'split_expense', 'refund', 'adjustment')
-        AND (payments.payment_status NOT IN ('cancelled', 'refunded') OR (payments.payment_status = 'refunded' AND transactions.entry_type = 'refund'))
+        AND payments.payment_status NOT IN ('cancelled', 'refunded')
       GROUP BY payments.payment_method
       ORDER BY total_amount DESC, payments.payment_method`).bind(id),
   );
@@ -897,17 +897,15 @@ export async function getProjectSummaries(db, projectId) {
         SELECT payments.payer_member_id AS member_id, COALESCE(SUM(payments.amount), 0) AS amount
         FROM transaction_payments payments
         JOIN transactions ON transactions.id = payments.transaction_id
-        WHERE transactions.project_id = ?
-          AND (transactions.status = 'confirmed' OR (transactions.status = 'refunded' AND transactions.entry_type = 'refund'))
-          AND (payments.payment_status NOT IN ('cancelled', 'refunded') OR (payments.payment_status = 'refunded' AND transactions.entry_type = 'refund'))
+        WHERE transactions.project_id = ? AND transactions.status = 'confirmed'
+          AND payments.payment_status NOT IN ('cancelled', 'refunded')
         GROUP BY payments.payer_member_id
       ), allocated AS (
         SELECT allocations.project_member_id AS member_id, COALESCE(SUM(allocations.allocated_amount), 0) AS amount
         FROM item_allocations allocations
         JOIN transaction_items items ON items.id = allocations.transaction_item_id
         JOIN transactions ON transactions.id = items.transaction_id
-        WHERE transactions.project_id = ?
-          AND (transactions.status = 'confirmed' OR (transactions.status = 'refunded' AND transactions.entry_type = 'refund'))
+        WHERE transactions.project_id = ? AND transactions.status = 'confirmed'
         GROUP BY allocations.project_member_id
       )
       SELECT members.id AS project_member_id, members.display_name, members.is_active,

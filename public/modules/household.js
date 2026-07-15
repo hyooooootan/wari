@@ -200,7 +200,7 @@ function createManualHouseholdTransaction(state, projectId, input = {}, options 
     occurred_at: occurredAt,
     settled_at: input.settled_at ?? null,
     note: input.note ?? null,
-    entry_type: input.entry_type || (amount < 0 ? "refund" : "purchase"),
+    entry_type: input.entry_type || "purchase",
     origin_project_id: null,
     origin_transaction_id: null,
     origin_member_id: null,
@@ -315,7 +315,7 @@ function paymentStatus(status) {
   return "confirmed";
 }
 
-function replaceGeneratedChildren(state, transaction, targetMember, itemShares, amount, timestamp, status, sourcePaymentMethod) {
+function replaceGeneratedChildren(state, transaction, targetMember, itemShares, amount, timestamp, status) {
   const transactionPayments = state.transaction_payments.filter((row) => transactionId(row) === transaction.id);
   const paymentId = generatedRowId(
     "payment",
@@ -331,7 +331,7 @@ function replaceGeneratedChildren(state, transaction, targetMember, itemShares, 
     transaction_id: transaction.id,
     payer_member_id: targetMember.id,
     amount,
-    payment_method: sourcePaymentMethod || existingPayment?.payment_method || "other",
+    payment_method: existingPayment?.payment_method || "other",
     provider: existingPayment?.provider ?? null,
     account_label: existingPayment?.account_label ?? null,
     external_payment_id: existingPayment?.external_payment_id ?? null,
@@ -438,9 +438,7 @@ function synchronizeSplitAllocations(state, splitProjectId, options = {}) {
   }
   const expected = new Set();
   for (const sourceTransaction of transactions) {
-    const sourceStatus = String(sourceTransaction.status || "").toLowerCase();
-    const activeRefund = sourceStatus === "refunded" && sourceTransaction.entry_type === "refund";
-    if (["cancelled", "corrected"].includes(sourceStatus) || sourceStatus === "refunded" && !activeRefund) continue;
+    if (["cancelled", "refunded", "corrected"].includes(String(sourceTransaction.status || "").toLowerCase())) continue;
     for (const sourceMember of linkedMembers) {
       const totalKey = `${stablePart(sourceTransaction.id)}:${stablePart(sourceMember.id)}`;
       const shares = allocationShares.get(totalKey) || new Map();
@@ -480,12 +478,6 @@ function synchronizeSplitAllocations(state, splitProjectId, options = {}) {
       }
       for (const duplicate of matches.slice(1)) cancelGeneratedRow(next, duplicate, timestamp);
       const status = generatedStatus(Boolean(splitProject.finalized_at));
-      const sourcePayment = next.transaction_payments.find((row) => {
-        if (transactionId(row) !== sourceTransaction.id) return false;
-        const paymentStatusValue = String(row.payment_status || "confirmed").toLowerCase();
-        if (paymentStatusValue === "cancelled") return false;
-        return paymentStatusValue !== "refunded" || sourceTransaction.entry_type === "refund";
-      });
       Object.assign(transaction, {
         project_id: householdProjectId,
         merchant_name: String(sourceTransaction.merchant_name || "割り勘"),
@@ -510,7 +502,7 @@ function synchronizeSplitAllocations(state, splitProjectId, options = {}) {
         generated_automatically: 1,
         updated_at: timestamp,
       });
-      replaceGeneratedChildren(next, transaction, targetMember, itemShares, amount, timestamp, status, sourcePayment?.payment_method);
+      replaceGeneratedChildren(next, transaction, targetMember, itemShares, amount, timestamp, status);
     }
   }
   for (const transaction of next.transactions) {

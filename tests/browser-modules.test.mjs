@@ -217,51 +217,6 @@ test("家計企画と手入力取引に本人、要約品目、支払い、配�
   assert.equal(state.transaction_payments[0].payer_member_id, "self");
   assert.equal(state.item_allocations[0].project_member_id, "self");
   assert.equal(WariSplit.validateProjectTransactions(state, "home").valid, true);
-
-  state = WariHousehold.createManualHouseholdTransaction(
-    state,
-    "home",
-    {
-      id: "refund",
-      payment_id: "refund-payment",
-      summary_item_id: "refund-item",
-      allocation_id: "refund-allocation",
-      merchant_name: "書店返金",
-      amount: -500,
-      payment_method: "credit_card",
-      occurred_at: T2,
-    },
-    { now: T2, storage: WariStorage },
-  );
-  assert.equal(state.transactions.find((row) => row.id === "refund").entry_type, "refund");
-  assert.equal(state.transaction_payments.find((row) => row.id === "refund-payment").amount, -500);
-});
-
-test("クレジットカード返金を負数の割り勘から家計簿へ反映する", () => {
-  const state = linkedSplitState();
-  const source = state.transactions.find((row) => row.id === "source");
-  source.gross_amount = -200;
-  source.paid_amount = -200;
-  source.status = "refunded";
-  source.entry_type = "refund";
-  const payment = state.transaction_payments.find((row) => row.id === "source-payment");
-  payment.amount = -200;
-  payment.payment_status = "refunded";
-  for (const item of state.transaction_items) item.amount *= -1;
-  for (const allocation of state.item_allocations) allocation.allocated_amount *= -1;
-
-  assert.equal(WariSplit.validateProjectTransactions(state, "split").valid, true);
-  const provisional = WariHousehold.synchronizeSplitAllocations(state, "split", { now: T1, storage: WariStorage });
-  const generated = provisional.transactions.find((row) => row.generated_automatically === 1);
-  const generatedPayment = provisional.transaction_payments.find((row) => row.transaction_id === generated.id);
-  assert.equal(generated.status, "provisional");
-  assert.equal(generated.paid_amount, -80);
-  assert.equal(generatedPayment.amount, -80);
-  assert.equal(generatedPayment.payment_method, "credit_card");
-
-  let finalized = WariHousehold.finalizeProjectState(state, "split", { now: T2, storage: WariStorage, split: WariSplit });
-  finalized = WariHousehold.synchronizeSplitAllocations(finalized, "split", { now: T2, storage: WariStorage });
-  assert.equal(WariSplit.aggregateHousehold(finalized, "home").total_amount, -80);
 });
 
 test("割り勘負担を家計取引へ繰り返し同期し、元品目と確定状態を引き継ぐ", () => {

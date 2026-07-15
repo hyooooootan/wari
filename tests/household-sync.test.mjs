@@ -322,28 +322,6 @@ test("transaction sync creates provisional household rows, remains idempotent, a
   }
 });
 
-test("negative credit card refund synchronizes to household transactions", async () => {
-  const { database, db } = createFixture();
-  try {
-    database.prepare("UPDATE transactions SET gross_amount = -100, paid_amount = -100, status = 'refunded', entry_type = 'refund' WHERE id = 'tx-source'").run();
-    database.prepare("UPDATE transaction_payments SET amount = -100, payment_status = 'refunded' WHERE id = 'payment-source'").run();
-    database.prepare("UPDATE transaction_items SET amount = -amount WHERE transaction_id = 'tx-source'").run();
-    database.prepare("UPDATE item_allocations SET allocated_amount = -allocated_amount WHERE transaction_item_id IN ('item-food', 'item-travel')").run();
-
-    assert.equal((await validateSplitProject(db, "split")).valid, true);
-    const result = await syncSplitTransactionToHouseholds(db, "tx-source", { now });
-    assert.equal(result.status, "synced");
-    const generated = queryOne(database, "SELECT * FROM transactions WHERE generated_automatically = 1 AND origin_member_id = 'A'");
-    const generatedPayment = queryOne(database, "SELECT * FROM transaction_payments WHERE transaction_id = ?", generated.id);
-    assert.equal(generated.paid_amount, -30);
-    assert.equal(generated.status, "provisional");
-    assert.equal(generatedPayment.amount, -30);
-    assert.equal(generatedPayment.payment_method, "credit_card");
-  } finally {
-    database.close();
-  }
-});
-
 test("updates replace removed items, copy categories, link after finalization, reopen, and cancel deleted sources", async () => {
   const { database, db } = createFixture();
   try {
