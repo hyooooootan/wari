@@ -1,14 +1,14 @@
-const CACHE_NAME = "wari-pwa-20260715-guest-shell";
+const CACHE_NAME = "wari-pwa-20260715-no-csv";
 const APP_SHELL = [
   "/",
   "/index.html",
-  "/styles.css?v=20260715-guest-shell",
-  "/app.js?v=20260715-guest-shell",
-  "/modules/storage.js?v=20260715-guest-shell",
-  "/modules/split.js?v=20260715-guest-shell",
-  "/modules/api.js?v=20260715-guest-shell",
-  "/modules/imports.js?v=20260715-guest-shell",
-  "/modules/household.js?v=20260715-guest-shell",
+  "/styles.css?v=20260715-no-csv",
+  "/app.js?v=20260715-no-csv",
+  "/modules/storage.js?v=20260715-no-csv",
+  "/modules/split.js?v=20260715-no-csv",
+  "/modules/api.js?v=20260715-no-csv",
+  "/modules/imports.js?v=20260715-no-csv",
+  "/modules/household.js?v=20260715-no-csv",
   "/manifest.webmanifest",
   "/icons/icon.svg",
   "/icons/icon-192.png",
