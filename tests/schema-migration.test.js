@@ -16,6 +16,7 @@ const householdSyncMigrationSql = readFileSync(path.join(repositoryRoot, 'db', '
 const gmailRevocationGuardsMigrationSql = readFileSync(path.join(repositoryRoot, 'db', 'migrations', '0008_gmail_revocation_guards.sql'), 'utf8');
 const personalHouseholdsMigrationSql = readFileSync(path.join(repositoryRoot, 'db', 'migrations', '0009_personal_households.sql'), 'utf8');
 const receiptOcrFeedbackMigrationSql = readFileSync(path.join(repositoryRoot, 'db', 'migrations', '0010_receipt_ocr_feedback.sql'), 'utf8');
+const receiptOcrFeedbackPendingMigrationSql = readFileSync(path.join(repositoryRoot, 'db', 'migrations', '0011_receipt_ocr_feedback_pending.sql'), 'utf8');
 const verificationSql = readFileSync(path.join(repositoryRoot, 'db', 'verify_household_ledger.sql'), 'utf8');
 
 const runtimeTables = [
@@ -35,6 +36,7 @@ const runtimeTables = [
   'project_user_roles',
   'projects',
   'receipt_ocr_correction_events',
+  'receipt_ocr_feedback_pending',
   'receipt_ocr_field_outcomes',
   'sessions',
   'transaction_items',
@@ -67,6 +69,7 @@ const requestedIndexes = [
   'idx_projects_share_token',
   'idx_receipt_ocr_corrections_lookup',
   'idx_receipt_ocr_corrections_user_created',
+  'idx_receipt_ocr_feedback_pending_user',
   'idx_receipt_ocr_outcomes_stats',
   'idx_sessions_user',
   'idx_transaction_items_transaction',
@@ -292,7 +295,7 @@ test('fresh schema creates the runtime tables and requested indexes', (t) => {
 });
 
 test('numbered migrations create the runtime tables from an empty database', (t) => {
-  const database = openDatabase(`${baselineSql}\n${migrationSql}\n${authMigrationSql}\n${gmailMigrationSql}\n${gmailOauthProjectMigrationSql}\n${accountDeletionMigrationSql}\n${householdSyncMigrationSql}\n${gmailRevocationGuardsMigrationSql}\n${personalHouseholdsMigrationSql}\n${receiptOcrFeedbackMigrationSql}`);
+  const database = openDatabase(`${baselineSql}\n${migrationSql}\n${authMigrationSql}\n${gmailMigrationSql}\n${gmailOauthProjectMigrationSql}\n${accountDeletionMigrationSql}\n${householdSyncMigrationSql}\n${gmailRevocationGuardsMigrationSql}\n${personalHouseholdsMigrationSql}\n${receiptOcrFeedbackMigrationSql}\n${receiptOcrFeedbackPendingMigrationSql}`);
   t.after(() => database.close());
 
   assert.deepEqual(tableNames(database), runtimeTables);
@@ -317,7 +320,7 @@ test('legacy migration preserves data and creates deterministic ledger rows', (t
   t.after(() => database.close());
   seedLegacyDatabase(database);
 
-  database.exec(`BEGIN IMMEDIATE;\n${migrationSql}\n${authMigrationSql}\n${gmailMigrationSql}\n${gmailOauthProjectMigrationSql}\n${accountDeletionMigrationSql}\n${householdSyncMigrationSql}\n${gmailRevocationGuardsMigrationSql}\n${personalHouseholdsMigrationSql}\n${receiptOcrFeedbackMigrationSql}\nCOMMIT;`);
+  database.exec(`BEGIN IMMEDIATE;\n${migrationSql}\n${authMigrationSql}\n${gmailMigrationSql}\n${gmailOauthProjectMigrationSql}\n${accountDeletionMigrationSql}\n${householdSyncMigrationSql}\n${gmailRevocationGuardsMigrationSql}\n${personalHouseholdsMigrationSql}\n${receiptOcrFeedbackMigrationSql}\n${receiptOcrFeedbackPendingMigrationSql}\nCOMMIT;`);
 
   const freshDatabase = openDatabase(schemaSql);
   t.after(() => freshDatabase.close());

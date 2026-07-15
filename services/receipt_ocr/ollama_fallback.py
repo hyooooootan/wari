@@ -9,6 +9,7 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+from urllib.parse import urlparse
 
 from PIL import Image
 
@@ -247,7 +248,17 @@ def valid_time(value):
     return value if 0 <= hour <= 23 and 0 <= minute <= 59 else None
 
 
+def valid_loopback_ollama_url(value):
+    try:
+        parsed = urlparse(value)
+    except ValueError:
+        return False
+    return parsed.scheme in ("http", "https") and parsed.hostname in ("localhost", "127.0.0.1", "::1") and not parsed.username and not parsed.password
+
+
 def ollama_generate(model, prompt, timeout, images=None):
+    if not valid_loopback_ollama_url(OLLAMA_URL):
+        raise ValueError("ollama_url_not_loopback")
     body = {"model": model, "prompt": prompt, "stream": False, "format": "json", "keep_alive": OLLAMA_KEEP_ALIVE, "options": {"temperature": 0, "num_ctx": 2048, "num_predict": 160}}
     if images:
         body["images"] = images

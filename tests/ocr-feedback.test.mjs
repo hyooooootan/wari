@@ -100,6 +100,14 @@ test("OCR feedback token rejects tampering, expiry, and another user", async () 
   await assert.rejects(() => verifyOcrFeedbackToken(env, token, "user-a", new Date("2026-07-17T01:00:00.000Z")), /expired_ocr_feedback_token/);
 });
 
+test("OCR feedback token is not issued when signed originals exceed the verification limit", async () => {
+  const oversized = result("ocr_oversized_token");
+  oversized.items = Array.from({ length: 40 }, (_, index) => ({ source_id: `item:${index}`, name: "商".repeat(200), amount: index + 1 }));
+  for (const field of ["store_name", "total_amount", "paid_at", "paid_time"]) oversized.field_evidence[field].source_text = "根".repeat(500);
+  const token = await createOcrFeedbackToken(env, "user-a", "house-a", oversized, new Date("2026-07-15T00:00:00.000Z"));
+  assert.equal(token, null);
+});
+
 test("registering feedback stores changed fields, outcomes, and remains idempotent", async (t) => {
   const db = new Database();
   t.after(() => db.close());
@@ -151,7 +159,7 @@ test("feedback deletion is scoped to the current user", async (t) => {
   const { claims, input } = await signedInput();
   await registerOcrCorrections(db, { id: "user-a" }, input, claims);
   const deleted = await deleteOcrCorrections(db, { id: "user-b" });
-  assert.deepEqual(deleted, { deleted_corrections: 0, deleted_outcomes: 0 });
+  assert.deepEqual(deleted, { deleted_pending: 0, deleted_corrections: 0, deleted_outcomes: 0 });
   assert.equal((await countOcrCorrections(db, { id: "user-a" })).correction_count, 1);
   await deleteOcrCorrections(db, { id: "user-a" });
   assert.equal((await countOcrCorrections(db, { id: "user-a" })).correction_count, 0);

@@ -1919,6 +1919,7 @@ function ocrFeedbackFromRecord(record, transactionIdValue) {
   const feedbackToken = ocrFeedbackTokens.get(ocr?.ocr_result_id);
   if (!feedbackToken || !ocr?.original) return null;
   return {
+    import_id: record.id,
     transaction_id: transactionIdValue,
     feedback_token: feedbackToken,
     confirmed: {
@@ -2004,7 +2005,7 @@ function createFromImport(project, record) {
         ...(feedback ? { feedback_token: feedback.feedback_token, confirmed: feedback.confirmed } : {}),
       });
       if (feedback) {
-        await finishOcrFeedback(reconciliation, feedback, receiptOcrPayload(record)?.ocr_result_id);
+        await finishOcrFeedback(reconciliation, feedback, record.id, receiptOcrPayload(record)?.ocr_result_id);
       }
       await refreshCloudProject(project.id);
     },
@@ -2032,18 +2033,18 @@ function linkImport(project, record, transactionIdValue) {
         ...(feedback ? { feedback_token: feedback.feedback_token, confirmed: feedback.confirmed } : {}),
       });
       if (feedback) {
-        await finishOcrFeedback(reconciliation, feedback, receiptOcrPayload(record)?.ocr_result_id);
+        await finishOcrFeedback(reconciliation, feedback, record.id, receiptOcrPayload(record)?.ocr_result_id);
       }
       await refreshCloudProject(project.id);
     },
   });
 }
 
-async function finishOcrFeedback(reconciliation, feedback, resultId) {
+async function finishOcrFeedback(reconciliation, feedback, importId, resultId) {
   let status = reconciliation.ocr_feedback?.status;
   if (status === "failed" || !status) {
     try {
-      await Api.saveOcrCorrections(feedback);
+      await Api.retryOcrCorrections(importId);
       status = "saved";
     } catch {
       toast("取引は保存されましたが、OCR修正履歴の保存に失敗しました");

@@ -459,7 +459,8 @@ async function linkImport(db, importRecord, details) {
   if (transaction.project_id !== importRecord.project_id) throw new Error("Transaction does not belong to the import project");
   const oldTransactionId = importRecord.transaction_id;
   const reason = jsonValue(details.match_reason_json ?? details.matchReason, importRecord.match_reason_json);
-  await runStatement(
+  const now = currentTime(details);
+  const statements = [boundStatement(
     db,
     `UPDATE import_records
      SET transaction_id = ?, source_status = 'linked', merchant_raw = ?, merchant_normalized = ?,
@@ -476,10 +477,13 @@ async function linkImport(db, importRecord, details) {
       importRecord.raw_payload,
       integerValue(details.match_score ?? details.matchScore, importRecord.match_score),
       reason,
-      currentTime(details),
+      now,
       importRecord.id,
     ],
-  );
+  )];
+  const pendingStatement = pendingOcrFeedbackStatement(db, importRecord, transactionId, details, now);
+  if (pendingStatement) statements.push(pendingStatement);
+  await runBatch(db, statements);
   if (oldTransactionId && oldTransactionId !== transactionId) {
     await applyResolvedTransactionFields(db, oldTransactionId, details);
   }
@@ -620,6 +624,8 @@ async function createTransactionForImport(db, importRecord, details) {
       ],
     ),
   );
+  const pendingStatement = pendingOcrFeedbackStatement(db, importRecord, transactionId, details, now);
+  if (pendingStatement) statements.push(pendingStatement);
   await runBatch(db, statements);
   const createdTransaction = await firstRow(db, "SELECT * FROM transactions WHERE id = ?", [transactionId]);
   const updatedImport = await firstRow(db, "SELECT * FROM import_records WHERE id = ?", [importRecord.id]);
@@ -630,6 +636,37 @@ async function createTransactionForImport(db, importRecord, details) {
     candidates: details.candidates || [],
     transaction: createdTransaction,
   });
+}
+
+function pendingOcrFeedbackStatement(db, importRecord, transactionId, details, timestampValue) {
+  const pending = details?.pending_ocr_feedback;
+  if (!pending || importRecord.source_type !== "receipt") return null;
+  return boundStatement(
+    db,
+    `INSERT INTO receipt_ocr_feedback_pending (
+       import_id, user_id, project_id, transaction_id, ocr_result_id,
+       claims_json, confirmed_json, created_at, updated_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(import_id) DO UPDATE SET
+       user_id = excluded.user_id,
+       project_id = excluded.project_id,
+       transaction_id = excluded.transaction_id,
+       ocr_result_id = excluded.ocr_result_id,
+       claims_json = excluded.claims_json,
+       confirmed_json = excluded.confirmed_json,
+       updated_at = excluded.updated_at`,
+    [
+      importRecord.id,
+      requiredString(pending.user_id, "pendingOcrUserId"),
+      importRecord.project_id,
+      transactionId,
+      requiredString(pending.ocr_result_id, "pendingOcrResultId"),
+      JSON.stringify(pending.claims),
+      JSON.stringify(pending.confirmed),
+      timestampValue,
+      timestampValue,
+    ],
+  );
 }
 
 function confirmedOcrImportRecord(importRecord, details) {

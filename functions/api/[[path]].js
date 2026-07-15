@@ -263,8 +263,8 @@ async function dispatchAccount(request, db, env) {
     const user = await requireAccountDeletionUser(db, request);
     assertCsrf(request, user);
     const migration = await db.prepare(`SELECT COUNT(*) AS table_count FROM sqlite_master
-      WHERE type = 'table' AND name IN ('receipt_ocr_correction_events', 'receipt_ocr_field_outcomes')`).first();
-    if (Number(migration?.table_count || 0) !== 2) throw new ApiError(503, "database_migration_required");
+      WHERE type = 'table' AND name IN ('receipt_ocr_correction_events', 'receipt_ocr_field_outcomes', 'receipt_ocr_feedback_pending')`).first();
+    if (Number(migration?.table_count || 0) !== 3) throw new ApiError(503, "database_migration_required");
     const startedAt = user.deletion_started_at || new Date().toISOString();
     const started = await db.prepare(`UPDATE users SET deletion_started_at = COALESCE(deletion_started_at, ?), updated_at = ?
       WHERE id = ? AND deleted_at IS NULL`).bind(startedAt, startedAt, user.id).run();
@@ -275,6 +275,7 @@ async function dispatchAccount(request, db, env) {
       db.prepare("UPDATE users SET deleted_at = ?, updated_at = ? WHERE id = ?").bind(timestamp, timestamp, user.id),
       db.prepare("UPDATE sessions SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL").bind(timestamp, user.id),
       db.prepare("UPDATE project_user_roles SET revoked_at = ?, updated_at = ? WHERE user_id = ? AND revoked_at IS NULL").bind(timestamp, timestamp, user.id),
+      db.prepare("DELETE FROM receipt_ocr_feedback_pending WHERE user_id = ?").bind(user.id),
       db.prepare("DELETE FROM receipt_ocr_correction_events WHERE user_id = ?").bind(user.id),
       db.prepare("DELETE FROM receipt_ocr_field_outcomes WHERE user_id = ?").bind(user.id),
     ]);
@@ -290,9 +291,21 @@ async function dispatchOcrCorrections(request, db, env, user) {
   if (request.method === "POST") {
     if (!feedbackWriteEnabled(env)) throw new ApiError(503, "ocr_feedback_unavailable");
     const input = await readJson(request);
+    if (input.retry_pending === true) return json(await retryPendingOcrFeedback(db, user, input.import_id), 201);
     const claims = await verifyOcrFeedbackToken(env, input.feedback_token, user.id);
     await requireProjectRole(db, user, claims.project_id, "editor");
-    return json(await registerOcrCorrections(db, user, input, claims), 201);
+    const importId = typeof input.import_id === "string" ? input.import_id : "";
+    const importRecord = await db.prepare("SELECT id, project_id, transaction_id, source_type, raw_payload FROM import_records WHERE id = ?").bind(importId).first();
+    if (!importRecord || importRecord.project_id !== claims.project_id || importRecord.source_type !== "receipt" || importRecord.transaction_id !== input.transaction_id || !matchesReceiptOcrResult(importRecord, claims.ocr_result_id)) {
+      throw new ApiError(403, "ocr_feedback_token_mismatch");
+    }
+    const saved = await registerOcrCorrections(db, user, {
+      transaction_id: input.transaction_id,
+      feedback_token: input.feedback_token,
+      confirmed: input.confirmed,
+    }, claims);
+    await deletePendingOcrFeedback(db, user.id, importId);
+    return json(saved, 201);
   }
   if (request.method === "DELETE") return json(await deleteOcrCorrections(db, user));
   return methodNotAllowed(["GET", "POST", "DELETE"]);
@@ -703,6 +716,14 @@ async function handleReconcile(request, db, env, importId, user) {
       throw new ApiError(403, "ocr_feedback_token_mismatch");
     }
     body.confirmed_ocr = validateConfirmedOcrValues(body.confirmed);
+    if (feedbackWriteEnabled(env)) {
+      body.pending_ocr_feedback = {
+        user_id: user.id,
+        ocr_result_id: ocrClaims.ocr_result_id,
+        claims: ocrClaims,
+        confirmed: body.confirmed_ocr,
+      };
+    }
   }
   if (body.action === "link") {
     const transactionId = requiredBodyString(body, "transaction_id", 128);
@@ -724,12 +745,12 @@ async function handleReconcile(request, db, env, importId, user) {
     sourceProjectId: record.project_id, syncScope: "project", reason: "import_reconciled", user,
   });
   const ocrFeedback = ocrClaims
-    ? await saveReconciledOcrFeedback(db, env, user, body, ocrClaims, result.transaction?.id)
+    ? await saveReconciledOcrFeedback(db, env, user, body, ocrClaims, result.transaction?.id, importId)
     : null;
   return json({ ...result, synchronization, ...(ocrFeedback ? { ocr_feedback: ocrFeedback } : {}) });
 }
 
-async function saveReconciledOcrFeedback(db, env, user, body, claims, transactionId) {
+async function saveReconciledOcrFeedback(db, env, user, body, claims, transactionId, importId) {
   if (!feedbackWriteEnabled(env)) return { status: "disabled" };
   const input = {
     transaction_id: transactionId || body.transaction_id || body.new_transaction_id,
@@ -739,12 +760,39 @@ async function saveReconciledOcrFeedback(db, env, user, body, claims, transactio
   for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
       const saved = await registerOcrCorrections(db, user, input, claims);
+      await deletePendingOcrFeedback(db, user.id, importId);
       return { status: "saved", ...saved };
     } catch {
       if (attempt === 1) return { status: "failed" };
     }
   }
   return { status: "failed" };
+}
+
+async function retryPendingOcrFeedback(db, user, importIdValue) {
+  const importId = typeof importIdValue === "string" && /^[A-Za-z0-9_.:-]{1,128}$/u.test(importIdValue) ? importIdValue : "";
+  if (!importId) throw new ApiError(400, "invalid_import_id");
+  const pending = await db.prepare("SELECT * FROM receipt_ocr_feedback_pending WHERE import_id = ? AND user_id = ?").bind(importId, user.id).first();
+  if (!pending) throw new ApiError(404, "not_found");
+  await requireProjectRole(db, user, pending.project_id, "editor");
+  let claims;
+  let confirmed;
+  try {
+    claims = JSON.parse(pending.claims_json);
+    confirmed = JSON.parse(pending.confirmed_json);
+  } catch {
+    throw new ApiError(409, "invalid_pending_ocr_feedback");
+  }
+  if (claims?.user_id !== user.id || claims?.project_id !== pending.project_id || claims?.ocr_result_id !== pending.ocr_result_id) {
+    throw new ApiError(409, "invalid_pending_ocr_feedback");
+  }
+  const saved = await registerOcrCorrections(db, user, { transaction_id: pending.transaction_id, confirmed }, claims);
+  await deletePendingOcrFeedback(db, user.id, importId);
+  return { status: "saved", ...saved };
+}
+
+async function deletePendingOcrFeedback(db, userId, importId) {
+  await db.prepare("DELETE FROM receipt_ocr_feedback_pending WHERE user_id = ? AND import_id = ?").bind(userId, importId).run();
 }
 
 async function finalizeProject(db, projectId, user) {

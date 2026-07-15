@@ -11,6 +11,7 @@ import unicodedata
 import urllib.error
 import urllib.request
 from pathlib import Path
+from urllib.parse import urlparse
 
 from PIL import Image, ImageEnhance, ImageOps
 
@@ -193,6 +194,8 @@ def parse_tsv_lines(tsv_text):
 
 
 def structure_with_ollama(ocr):
+    if not valid_loopback_ollama_url(OLLAMA_BASE_URL):
+        raise ValueError("ollama_url_not_loopback")
     prompt = build_ollama_prompt(ocr)
     payload = {
         "model": OLLAMA_MODEL,
@@ -221,6 +224,14 @@ def structure_with_ollama(ocr):
     if parsed is None:
         return empty_receipt(["ollama_invalid_json"])
     return parsed
+
+
+def valid_loopback_ollama_url(value):
+    try:
+        parsed = urlparse(value)
+    except ValueError:
+        return False
+    return parsed.scheme in ("http", "https") and parsed.hostname in ("localhost", "127.0.0.1", "::1") and not parsed.username and not parsed.password
 
 
 def build_ollama_prompt(ocr):

@@ -16,6 +16,7 @@ from services.receipt_ocr.ollama_fallback import (
     region_box,
     required_regions,
     numeric_confusion_signal,
+    valid_loopback_ollama_url,
     valid_date,
     valid_time,
     validate_text_output,
@@ -38,6 +39,12 @@ def base_result(store="たまた 浜見平店", store_confidence=0.64):
 
 
 class FeedbackTests(unittest.TestCase):
+    def test_ollama_url_is_limited_to_loopback(self):
+        self.assertTrue(valid_loopback_ollama_url("http://127.0.0.1:11434"))
+        self.assertTrue(valid_loopback_ollama_url("http://[::1]:11434"))
+        self.assertFalse(valid_loopback_ollama_url("http://192.0.2.10:11434"))
+        self.assertFalse(valid_loopback_ollama_url("https://example.com"))
+
     def test_store_normalization_preserves_long_vowel(self):
         self.assertEqual(normalize_store(" スーパー  A "), "スーパー a")
 

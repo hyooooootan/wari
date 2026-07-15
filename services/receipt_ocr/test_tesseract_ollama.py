@@ -11,6 +11,12 @@ from services.receipt_ocr import tesseract_ollama as ocr
 
 
 class TesseractOllamaTests(unittest.TestCase):
+    def test_ollama_url_is_limited_to_loopback(self):
+        self.assertTrue(ocr.valid_loopback_ollama_url("http://localhost:11434"))
+        self.assertTrue(ocr.valid_loopback_ollama_url("http://[::1]:11434"))
+        self.assertFalse(ocr.valid_loopback_ollama_url("http://192.0.2.20:11434"))
+        self.assertFalse(ocr.valid_loopback_ollama_url("https://example.com"))
+
     def test_shared_bearer_authorization(self):
         class Handler:
             def __init__(self, authorization):

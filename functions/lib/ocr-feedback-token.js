@@ -4,6 +4,7 @@ import { ApiError } from "./responses.js";
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 const TOKEN_TTL_MS = 24 * 60 * 60 * 1000;
+const MAX_TOKEN_LENGTH = 16_384;
 
 export async function createOcrFeedbackToken(env, userId, projectId, result, timestamp = new Date()) {
   const secret = tokenSecret(env);
@@ -20,11 +21,12 @@ export async function createOcrFeedbackToken(env, userId, projectId, result, tim
     original: signedOriginal(result),
   };
   const encoded = base64UrlEncode(encoder.encode(JSON.stringify(payload)));
-  return `${encoded}.${base64UrlEncode(await sign(secret, encoded))}`;
+  const token = `${encoded}.${base64UrlEncode(await sign(secret, encoded))}`;
+  return token.length <= MAX_TOKEN_LENGTH ? token : null;
 }
 
 export async function verifyOcrFeedbackToken(env, token, userId, timestamp = new Date()) {
-  if (typeof token !== "string" || token.length > 16_384) throw new ApiError(400, "invalid_ocr_feedback_token");
+  if (typeof token !== "string" || token.length > MAX_TOKEN_LENGTH) throw new ApiError(400, "invalid_ocr_feedback_token");
   const parts = token.split(".");
   const secret = tokenSecret(env);
   if (parts.length !== 2 || !secret) throw new ApiError(400, "invalid_ocr_feedback_token");

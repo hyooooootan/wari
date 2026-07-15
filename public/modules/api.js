@@ -524,6 +524,7 @@ function createApiClient(options = {}) {
   const deleteAccount = () => request("/account", { method: "DELETE" });
   const getOcrCorrectionCount = () => request("/ocr-corrections");
   const saveOcrCorrections = (payload) => request("/ocr-corrections", { method: "POST", json: payload });
+  const retryOcrCorrections = (importId) => request("/ocr-corrections", { method: "POST", json: { retry_pending: true, import_id: importId } });
   const deleteOcrCorrections = () => request("/ocr-corrections", { method: "DELETE" });
   const readReceipt = (imageDataUrl) => request("/ocr-receipt", {
     method: "POST",
@@ -704,6 +705,7 @@ function createApiClient(options = {}) {
     deleteAccount,
     getOcrCorrectionCount,
     saveOcrCorrections,
+    retryOcrCorrections,
     deleteOcrCorrections,
     readReceipt,
     mutateRow,

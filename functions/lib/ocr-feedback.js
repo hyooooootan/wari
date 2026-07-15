@@ -56,10 +56,11 @@ export async function countOcrCorrections(db, user) {
 
 export async function deleteOcrCorrections(db, user) {
   const results = await db.batch([
+    db.prepare("DELETE FROM receipt_ocr_feedback_pending WHERE user_id = ?").bind(user.id),
     db.prepare("DELETE FROM receipt_ocr_correction_events WHERE user_id = ?").bind(user.id),
     db.prepare("DELETE FROM receipt_ocr_field_outcomes WHERE user_id = ?").bind(user.id),
   ]);
-  return { deleted_corrections: resultChanges(results[0]), deleted_outcomes: resultChanges(results[1]) };
+  return { deleted_pending: resultChanges(results[0]), deleted_corrections: resultChanges(results[1]), deleted_outcomes: resultChanges(results[2]) };
 }
 
 export async function buildReceiptFeedback(db, userId) {

@@ -68,14 +68,31 @@ class ReceiptRulesTest(unittest.TestCase):
     def test_priority_fields_are_required_before_review_is_cleared(self):
         missing_time = parse_receipt(lines("たまや 浜見平店", "2026年07月11日", "合計 5,382"))
         self.assertTrue(missing_time["needs_review"])
-        complete = parse_receipt(lines("たまや 浜見平店", "2026年07月11日 13:16", "合計 5,382"))
-        self.assertEqual(complete["items"], [])
+        complete = parse_receipt(lines("たまや 浜見平店", "2026年07月11日 13:16", "商品合計 4,984", "外税 398", "合計 5,382"))
         self.assertFalse(complete["needs_review"])
 
     def test_subtotal_tax_deposit_and_change_are_not_selected_as_total(self):
         result = parse_receipt(lines("たまや 浜見平店", "2026年07月11日 13:16", "小計 4,984", "外税 398", "お預り 6,000", "お釣り 618"))
         self.assertIsNone(result["total_amount"])
         self.assertTrue(result["needs_review"])
+
+    def test_points_and_balance_are_not_selected_as_total(self):
+        result = parse_receipt(lines("たまや 浜見平店", "2026年07月11日 13:16", "ポイント 500", "残高 12,000"))
+        self.assertIsNone(result["total_amount"])
+        self.assertTrue(result["needs_review"])
+
+    def test_labeled_total_without_independent_evidence_requires_review(self):
+        result = parse_receipt(lines("たまや 浜見平店", "2026年07月11日 13:16", "合計 5,382"))
+        self.assertEqual(result["total_amount"], 5382)
+        self.assertTrue(result["needs_review"])
+
+    def test_future_and_expiry_dates_are_not_purchase_dates(self):
+        future = parse_receipt(lines("たまや 浜見平店", "2099年12月31日 12:34", "商品合計 100", "合計 100"))
+        expiry = parse_receipt(lines("たまや 浜見平店", "有効期限 2026年07月14日 12:34", "商品合計 100", "合計 100"))
+        self.assertIsNone(future["paid_at"])
+        self.assertIsNone(expiry["paid_at"])
+        self.assertTrue(future["needs_review"])
+        self.assertTrue(expiry["needs_review"])
 
 
 if __name__ == "__main__":

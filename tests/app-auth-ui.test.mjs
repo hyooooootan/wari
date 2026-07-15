@@ -28,7 +28,7 @@ test("OCR confirmation preserves originals, supports item edits, and handles rec
   assert.match(source, /function createFromImport[\s\S]*await Api\.reconcileImport[\s\S]*reconciliation\.ocr_feedback/);
   assert.match(source, /function linkImport[\s\S]*await Api\.reconcileImport[\s\S]*reconciliation\.ocr_feedback/);
   assert.match(source, /Api\.reconcileImport\(record\.id,[\s\S]*feedback_token: feedback\.feedback_token, confirmed: feedback\.confirmed/);
-  assert.match(source, /async function finishOcrFeedback[\s\S]*Api\.saveOcrCorrections\(feedback\)/);
+  assert.match(source, /async function finishOcrFeedback[\s\S]*Api\.retryOcrCorrections\(importId\)/);
   assert.match(source, /status === "saved" \|\| status === "disabled"[\s\S]*ocrFeedbackTokens\.delete\(resultId\)/);
   assert.match(source, /取引は保存されましたが、OCR修正履歴の保存に失敗しました/);
 });

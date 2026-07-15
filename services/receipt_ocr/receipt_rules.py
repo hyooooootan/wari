@@ -16,7 +16,9 @@ DISCOUNT_LABELS = ("値引", "割引", "クーポン", "奉仕")
 DEPOSIT_LABELS = ("お預り", "お預かり", "預り", "受取")
 CHANGE_LABELS = ("お釣", "釣銭", "お返し")
 PAYMENT_LABELS = ("支払", "クレジット", "カード", "電子マネー", "PayPay", "VISA")
-NON_ITEM_LABELS = TOTAL_LABELS + SUBTOTAL_LABELS + TAX_LABELS + DISCOUNT_LABELS + DEPOSIT_LABELS + CHANGE_LABELS + PAYMENT_LABELS
+EXCLUDED_AMOUNT_LABELS = ("ポイント", "残高", "会員番号", "会員No", "単価", "電話", "TEL", "FAX", "登録番号", "伝票番号", "レシート番号")
+EXCLUDED_DATE_LABELS = ("有効期限", "賞味期限", "消費期限", "使用期限", "カード期限", "会員期限")
+NON_ITEM_LABELS = TOTAL_LABELS + SUBTOTAL_LABELS + TAX_LABELS + DISCOUNT_LABELS + DEPOSIT_LABELS + CHANGE_LABELS + PAYMENT_LABELS + EXCLUDED_AMOUNT_LABELS
 
 
 @dataclass(frozen=True)
@@ -60,8 +62,11 @@ def parse_receipt(lines):
         warnings.append("小計・税額・値引・合計の計算が一致しません。")
     if validations["item_sum_total"] is False:
         warnings.append("品目合計と合計金額が一致しません。")
+    total_has_independent_evidence = bool(total and total.kind == "total" and any(value is True for value in validations.values()))
+    if total is not None and not total_has_independent_evidence:
+        warnings.append("合計金額を独立した根拠で確認できませんでした。")
     priority_fields_ready = bool(store_name) and bool(total and total.value > 0) and bool(paid_at) and bool(paid_time)
-    needs_review = not priority_fields_ready or confidence < REVIEW_THRESHOLD or bool(warnings)
+    needs_review = not priority_fields_ready or not total_has_independent_evidence or confidence < REVIEW_THRESHOLD or bool(warnings)
     notes = " ".join(warnings)
     result = {
         "store_name": store_name,
@@ -100,6 +105,8 @@ def extract_amount_candidates(lines, warnings):
     correction_warnings = set()
     for index, line in enumerate(lines):
         row = row_text(lines, line)
+        if contains_any(row, EXCLUDED_AMOUNT_LABELS):
+            continue
         kind = classify_amount_row(row)
         product_code_spans = product_code_ranges(row)
         for match in re.finditer(r"(?:[¥￥]\s*)?([0-9OIl]{1,3}(?:,[0-9OIl]{3})+|[0-9OIl]{2,7})", row):
@@ -234,10 +241,6 @@ def select_amount(candidates, kind):
     matches_for_kind = [candidate for candidate in candidates if candidate.kind == kind]
     if matches_for_kind:
         return matches_for_kind[0]
-    if kind == "total":
-        unknown = [candidate for candidate in candidates if candidate.kind == "unknown"]
-        if len(unknown) == 1:
-            return unknown[0]
     return None
 
 
@@ -322,22 +325,29 @@ def guess_datetime(text):
         r"(20\d{2})[/-](\d{1,2})[/-](\d{1,2})",
         r"R\s*(\d{1,2})[年./-]\s*(\d{1,2})[月./-]\s*(\d{1,2})日?",
     )
-    for pattern in patterns:
-        match = re.search(pattern, text, re.I)
-        if not match:
+    for row in text.splitlines():
+        if contains_any(row, EXCLUDED_DATE_LABELS):
             continue
-        year, month, day = (int(match.group(i)) for i in range(1, 4))
-        if pattern.startswith("R"):
-            year += 2018
-        try:
-            date = dt.date(year, month, day).isoformat()
-        except ValueError:
-            return None, None, "日付として成立しない値を読み取りました。"
-        if match.lastindex and match.lastindex >= 5:
-            hour, minute = int(match.group(4)), int(match.group(5))
-            if hour <= 23 and minute <= 59:
-                return date, f"{hour:02d}:{minute:02d}", None
-        return date, None, None
+        for pattern in patterns:
+            match = re.search(pattern, row, re.I)
+            if not match:
+                continue
+            year, month, day = (int(match.group(i)) for i in range(1, 4))
+            if pattern.startswith("R"):
+                year += 2018
+            try:
+                parsed_date = dt.date(year, month, day)
+            except ValueError:
+                return None, None, "日付として成立しない値を読み取りました。"
+            if parsed_date > dt.date.today():
+                return None, None, "未来の日付を読み取りました。"
+            date = parsed_date.isoformat()
+            if match.lastindex and match.lastindex >= 5:
+                hour, minute = int(match.group(4)), int(match.group(5))
+                if hour <= 23 and minute <= 59:
+                    return date, f"{hour:02d}:{minute:02d}", None
+                return date, None, "時刻として成立しない値を読み取りました。"
+            return date, None, None
     return None, None, None
 
 
