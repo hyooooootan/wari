@@ -1,6 +1,6 @@
 # Oracle A1 のレシート OCR
 
-Oracle A1 では `OCR_BACKEND=local` を使います。PaddleOCR が文字列と位置情報を出し、`services/receipt_ocr/receipt_rules.py` が金額、日付、品目候補を判定します。Ollama はこの構成で起動しません。
+Oracle A1 では `OCR_BACKEND=local` を使います。PP-OCRが文字列と位置情報を出し、`services/receipt_ocr/receipt_rules.py`が金額、日付、品目候補を判定します。Ollamaは通常経路では使わず、低信頼度時の文字訂正と局所再読取を設定で有効にした場合に使います。
 
 HEIC/HEIF は `pillow-heif` で開きます。ブラウザから送る元画像、A1 側の画像データ URL、画像本体の各経路で同じ形式を扱えます。
 
@@ -37,6 +37,8 @@ LOCAL_OCR_BATCH_SIZE=4
 LOCAL_OCR_MAX_ATTEMPTS=3
 RECEIPT_OCR_REVIEW_THRESHOLD=0.68
 RECEIPT_OCR_AMOUNT_TOLERANCE=1
+RECEIPT_OCR_TOTAL_TIMEOUT=55
+OCR_MAX_CONCURRENCY=1
 ```
 
 再試行は初回結果で合計が取れない、または確認表示になった場合に限り、合計欄の画像帯域、局所コントラスト補正、適応的二値化を順に試します。連続的な OCR 実行は行いません。
@@ -49,3 +51,5 @@ curl http://127.0.0.1:4190/health
 ```
 
 実画像の試験では、正解の店名、合計、日付、品目数を別表で記録し、各画像の `needs_review` と `warnings` も確認します。画像自体と API 応答は個人情報を含むため、公開リポジトリへ追加しません。
+
+利用者別の訂正履歴、文字訂正LLM、局所VLM、環境変数、評価器、配備順序は`docs/receipt-ocr-feedback.md`を参照してください。

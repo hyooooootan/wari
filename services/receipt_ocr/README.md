@@ -15,6 +15,10 @@ POST /api/ocr-receipt
 - JSON `{ "image_data_url": "data:image/..." }`
 - JSON `{ "image_path": "/path/to/image" }` for local testing
 
+## Oracle A1のPP-OCR経路
+
+運用構成は`OCR_BACKEND=local`です。PP-OCRと規則処理を通常経路にし、利用者別訂正候補、文字訂正LLM、局所VLMは個別の環境変数で停止できます。詳細は`docs/receipt-ocr-feedback.md`を参照してください。
+
 ## Tesseract + Ollama backend
 
 Use this backend on Oracle Cloud A1 or another VM where Tesseract and Ollama can run locally.
@@ -145,3 +149,5 @@ python -m services.receipt_ocr.api
 ## Deployment recommendation
 
 For `tesseract_ollama`, prefer Oracle Cloud A1 or another VM. Render Free is suitable for the Gemini relay backend, but it is not a good target for Ollama model residency. Cloudflare Workers should remain an API edge/storage layer, not the OCR/Ollama execution host.
+
+WariのA1運用ではPP-OCRローカル経路を使用し、Cloudflare Pages Functionsを認証、D1、候補集約の境界にします。本番D1移行とA1反映は`docs/receipt-ocr-feedback.md`の順序で行います。
