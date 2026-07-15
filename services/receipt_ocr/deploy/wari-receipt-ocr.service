@@ -10,7 +10,6 @@ EnvironmentFile=-/etc/wari/receipt-ocr.env
 Environment=OCR_BACKEND=local
 Environment=OCR_HOST=127.0.0.1
 Environment=PORT=4190
-Environment=OCR_CORS_ORIGIN=*
 Environment=LOCAL_OCR_MAX_SIDE=1600
 Environment=LOCAL_OCR_DET_LIMIT=1280
 Environment=LOCAL_OCR_BATCH_SIZE=4
@@ -18,6 +17,7 @@ Environment=LOCAL_OCR_MAX_ATTEMPTS=3
 Environment=RECEIPT_OCR_REVIEW_THRESHOLD=0.68
 Environment=RECEIPT_OCR_AMOUNT_TOLERANCE=1
 Environment=OMP_THREAD_LIMIT=2
+Environment=OCR_MAX_CONCURRENCY=1
 ExecStart=/opt/wari/services/receipt_ocr/.venv/bin/python -m services.receipt_ocr.api
 Restart=on-failure
 RestartSec=5

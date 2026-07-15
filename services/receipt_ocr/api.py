@@ -23,9 +23,11 @@ RECEIPT_OCR_SHARED_SECRET = os.environ.get("RECEIPT_OCR_SHARED_SECRET", "")
 
 class ReceiptOcrHandler(BaseHTTPRequestHandler):
     def end_headers(self):
-        self.send_header("Access-Control-Allow-Origin", os.environ.get("OCR_CORS_ORIGIN", "*"))
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "content-type")
+        cors_origin = os.environ.get("OCR_CORS_ORIGIN", "").strip()
+        if cors_origin:
+            self.send_header("Access-Control-Allow-Origin", cors_origin)
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "content-type, authorization")
         super().end_headers()
 
     def do_OPTIONS(self):
@@ -66,11 +68,10 @@ class ReceiptOcrHandler(BaseHTTPRequestHandler):
                 result.pop("ocr_lines", None)
                 result.pop("amount_candidates", None)
             self.send_json(200, result)
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")
-            self.send_json(502, {"error": "ocr_provider_error", "message": detail[:1000]})
-        except Exception as exc:
-            self.send_json(400, {"error": "ocr_failed", "message": str(exc)})
+        except urllib.error.HTTPError:
+            self.send_json(502, {"error": "ocr_provider_error"})
+        except Exception:
+            self.send_json(400, {"error": "ocr_failed"})
 
     def read_ocr_request(self):
         length = int(self.headers.get("Content-Length", "0"))
@@ -84,10 +85,11 @@ class ReceiptOcrHandler(BaseHTTPRequestHandler):
 
         if content_type.startswith("application/json"):
             payload = json.loads(body.decode("utf-8"))
+            feedback = validate_feedback(payload.get("feedback"))
             if payload.get("image_data_url"):
-                return read_receipt_from_data_url(payload["image_data_url"])
+                return read_receipt_from_data_url(payload["image_data_url"], feedback=feedback)
             if payload.get("image_path"):
-                return read_receipt_from_path(Path(payload["image_path"]))
+                return read_receipt_from_path(Path(payload["image_path"]), feedback=feedback)
             raise ValueError("JSON must include image_path or image_data_url")
 
         if content_type.startswith("multipart/form-data"):
@@ -221,24 +223,24 @@ def read_temp_image(image_bytes, suffix):
             pass
 
 
-def read_receipt_from_data_url(image_data_url):
+def read_receipt_from_data_url(image_data_url, feedback=None):
     if use_tesseract_ollama_backend():
         return read_receipt_from_data_url_tesseract_ollama(image_data_url)
     if use_gemini_backend():
         return read_receipt_with_gemini(image_data_url)
     if OCR_BACKEND not in ("local", "auto"):
         raise RuntimeError("OCR_BACKEND must be gemini, local, tesseract_ollama, or auto.")
-    return read_receipt_from_data_url_local(image_data_url)
+    return read_receipt_from_data_url_local(image_data_url, feedback=feedback)
 
 
-def read_receipt_from_path(path):
+def read_receipt_from_path(path, feedback=None):
     if use_tesseract_ollama_backend():
         return read_receipt_from_path_tesseract_ollama(path)
     if use_gemini_backend():
         return read_receipt_with_gemini(to_data_url(path))
     if OCR_BACKEND not in ("local", "auto"):
         raise RuntimeError("OCR_BACKEND must be gemini, local, tesseract_ollama, or auto.")
-    return read_receipt_from_path_local(path)
+    return read_receipt_from_path_local(path, feedback=feedback)
 
 
 def use_gemini_backend():
@@ -269,20 +271,35 @@ def read_receipt_from_path_tesseract_ollama(path):
     return read_ocr(path)
 
 
-def read_receipt_from_data_url_local(image_data_url):
+def read_receipt_from_data_url_local(image_data_url, feedback=None):
     try:
         from services.receipt_ocr.core import read_receipt_from_data_url as read_local
     except ImportError:
         from core import read_receipt_from_data_url as read_local
-    return read_local(image_data_url)
+    return read_local(image_data_url, feedback=feedback)
 
 
-def read_receipt_from_path_local(path):
+def read_receipt_from_path_local(path, feedback=None):
     try:
         from services.receipt_ocr.core import read_receipt_from_path as read_local
     except ImportError:
         from core import read_receipt_from_path as read_local
-    return read_local(path)
+    return read_local(path, feedback=feedback)
+
+
+def validate_feedback(value):
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("feedback must be an object")
+    encoded = json.dumps(value, ensure_ascii=False).encode("utf-8")
+    if len(encoded) > 32 * 1024:
+        raise ValueError("feedback is too large")
+    for key, maximum in (("store_corrections", 20), ("character_confusions", 30), ("preprocessing_stats", 30)):
+        entries = value.get(key, [])
+        if not isinstance(entries, list) or len(entries) > maximum:
+            raise ValueError(f"invalid feedback field: {key}")
+    return value
 
 
 def read_receipt_with_gemini(image_data_url):

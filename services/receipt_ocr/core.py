@@ -5,6 +5,9 @@ import re
 import tempfile
 import time
 import unicodedata
+import uuid
+import threading
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -18,8 +21,12 @@ from pillow_heif import register_heif_opener
 
 try:
     from services.receipt_ocr.receipt_rules import parse_receipt as parse_receipt_with_rules
+    from services.receipt_ocr.feedback import apply_feedback, preprocessing_order
+    from services.receipt_ocr.ollama_fallback import apply_text_correction, apply_vision_reread
 except ImportError:
     from receipt_rules import parse_receipt as parse_receipt_with_rules
+    from feedback import apply_feedback, preprocessing_order
+    from ollama_fallback import apply_text_correction, apply_vision_reread
 
 
 MAX_OCR_SIDE = int(os.environ.get("LOCAL_OCR_MAX_SIDE", "720"))
@@ -28,7 +35,9 @@ TEXT_DET_MODEL = os.environ.get("LOCAL_OCR_DET_MODEL", "PP-OCRv5_mobile_det")
 TEXT_REC_MODEL = os.environ.get("LOCAL_OCR_REC_MODEL", "PP-OCRv6_small_rec")
 TEXT_REC_BATCH_SIZE = int(os.environ.get("LOCAL_OCR_BATCH_SIZE", "8"))
 MAX_OCR_ATTEMPTS = max(1, min(4, int(os.environ.get("LOCAL_OCR_MAX_ATTEMPTS", "3"))))
+TOTAL_OCR_TIMEOUT = max(10.0, min(55.0, float(os.environ.get("RECEIPT_OCR_TOTAL_TIMEOUT", "55"))))
 _OCR = None
+_OCR_SEMAPHORE = threading.BoundedSemaphore(max(1, min(2, int(os.environ.get("OCR_MAX_CONCURRENCY", "1")))))
 
 register_heif_opener()
 
@@ -72,16 +81,20 @@ class OcrLine:
     y: float
     w: float
     h: float
+    source_id: str = ""
+    preprocessing: str = "contrast"
+    image_width: float = 1.0
+    image_height: float = 1.0
 
 
-def read_receipt_from_data_url(image_data_url):
+def read_receipt_from_data_url(image_data_url, feedback=None):
     suffix, data = decode_data_url(image_data_url)
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         tmp.write(data)
         source_path = Path(tmp.name)
 
     try:
-        return read_receipt_from_path(source_path)
+        return read_receipt_from_path(source_path, feedback=feedback)
     finally:
         try:
             source_path.unlink(missing_ok=True)
@@ -89,32 +102,50 @@ def read_receipt_from_data_url(image_data_url):
             pass
 
 
-def read_receipt_from_path(source_path):
+def read_receipt_from_path(source_path, feedback=None):
+    if not _OCR_SEMAPHORE.acquire(timeout=5):
+        raise RuntimeError("OCR server is busy")
+    try:
+        return _read_receipt_from_path(source_path, feedback=feedback)
+    finally:
+        _OCR_SEMAPHORE.release()
+
+
+def _read_receipt_from_path(source_path, feedback=None):
     source_path = Path(source_path)
     started_at = time.monotonic()
+    processing_started_at = datetime.now(timezone.utc).isoformat()
     prepared_paths = []
     try:
         prepared_path = source_path.with_suffix(".prepared.png")
         prepared_paths.append(prepared_path)
         prepare_image(source_path, prepared_path, vertical_range=(0.0, 0.78), variant="contrast")
-        lines = run_paddle(prepared_path)
+        lines = run_paddle(prepared_path, "contrast")
         parsed = parse_receipt_with_rules(lines)
         if MAX_OCR_ATTEMPTS > 1 and (parsed.get("total_amount") is None or parsed.get("needs_review")):
             band_path = source_path.with_suffix(".total-band.png")
             prepared_paths.append(band_path)
             prepare_image(source_path, band_path, vertical_range=(0.42, 0.98), variant="contrast")
-            band_lines = run_paddle(band_path)
+            band_lines = run_paddle(band_path, "total-band")
             parsed = merge_receipt_results(parsed, parse_receipt_with_rules(band_lines))
             lines.extend(band_lines)
-        for variant in ("clahe", "adaptive")[: max(0, MAX_OCR_ATTEMPTS - 2)]:
+        variants = preprocessing_order(feedback, "store_name", TEXT_REC_MODEL, ("clahe", "adaptive"))
+        for variant in variants[: max(0, MAX_OCR_ATTEMPTS - 2)]:
             if not parsed.get("needs_review"):
                 break
             variant_path = source_path.with_suffix(f".{variant}.png")
             prepared_paths.append(variant_path)
             prepare_image(source_path, variant_path, vertical_range=(0.0, 0.98), variant=variant)
-            variant_lines = run_paddle(variant_path)
+            variant_lines = run_paddle(variant_path, variant)
             parsed = select_better_result(parsed, parse_receipt_with_rules(variant_lines))
             lines.extend(variant_lines)
+        parsed = apply_feedback(parsed, feedback)
+        parsed = apply_text_correction(parsed, feedback or {}, max(0.0, TOTAL_OCR_TIMEOUT - (time.monotonic() - started_at)))
+        parsed = apply_vision_reread(parsed, source_path, max(0.0, TOTAL_OCR_TIMEOUT - (time.monotonic() - started_at)))
+        parsed["ocr_result_id"] = f"ocr_{uuid.uuid4().hex}"
+        parsed["ocr_engine_version"] = f"{TEXT_DET_MODEL}+{TEXT_REC_MODEL}"
+        parsed["rule_engine_version"] = "receipt-rules-2"
+        parsed["processing_started_at"] = processing_started_at
         parsed["model"] = "paddleocr-onnxruntime"
         parsed["processing_time_ms"] = round((time.monotonic() - started_at) * 1000)
         parsed["ocr_lines"] = [
@@ -264,7 +295,7 @@ def get_ocr():
     return _OCR
 
 
-def run_paddle(image_path):
+def run_paddle(image_path, preprocessing="contrast"):
     detector, recognizer = get_ocr()
     detection = next(detector.predict(str(image_path)))
     image = Image.open(image_path).convert("RGB")
@@ -282,7 +313,18 @@ def run_paddle(image_path):
             continue
         rec_score = float(recognized.get("rec_score", 0.0))
         det_score = float(detection_scores[index]) if index < len(detection_scores) else rec_score
-        lines.append(OcrLine(text=text, confidence=min(rec_score, det_score), x=x, y=y, w=w, h=h))
+        lines.append(OcrLine(
+            text=text,
+            confidence=min(rec_score, det_score),
+            x=x,
+            y=y,
+            w=w,
+            h=h,
+            source_id=f"{preprocessing}:{index}",
+            preprocessing=preprocessing,
+            image_width=float(image.width),
+            image_height=float(image.height),
+        ))
     return sorted(lines, key=lambda line: (line.y, line.x))
 
 
@@ -347,6 +389,8 @@ def merge_receipt_results(primary, fallback):
         fallback_score = fallback.get("field_confidence", {}).get(field_key, 0)
         if fallback.get(key) is not None and (merged.get(key) is None or fallback_score > primary_score):
             merged[key] = fallback[key]
+            if fallback.get("field_evidence", {}).get(key):
+                merged.setdefault("field_evidence", {})[key] = fallback["field_evidence"][key]
     if not merged.get("items") and fallback.get("items"):
         merged["items"] = fallback["items"]
     if fallback.get("confidence", 0) > primary.get("confidence", 0):

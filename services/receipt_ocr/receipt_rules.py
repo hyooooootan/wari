@@ -47,7 +47,9 @@ def parse_receipt(lines):
     if date_warning:
         warnings.append(date_warning)
     items = guess_items(lines)
-    field_confidence = field_confidences(total, subtotal, paid_at, items, validations)
+    store_name = guess_store_name(lines)
+    field_evidence = build_field_evidence(lines, store_name, total, subtotal, tax, paid_at, paid_time)
+    field_confidence = field_confidences(store_name, total, subtotal, paid_at, paid_time, items, validations, field_evidence)
     confidence = round(sum(field_confidence.values()) / len(field_confidence), 3)
     if total is None:
         warnings.append("合計金額を特定できませんでした。")
@@ -60,7 +62,7 @@ def parse_receipt(lines):
     needs_review = confidence < REVIEW_THRESHOLD or bool(warnings)
     notes = " ".join(warnings)
     result = {
-        "store_name": guess_store_name(lines),
+        "store_name": store_name,
         "total_amount": total.value if total else None,
         "subtotal_amount": subtotal.value if subtotal else None,
         "tax_amount": tax.value if tax else None,
@@ -69,6 +71,14 @@ def parse_receipt(lines):
         "items": items,
         "confidence": confidence,
         "field_confidence": field_confidence,
+        "field_evidence": field_evidence,
+        "field_sources": {
+            "store_name": "paddleocr_rule",
+            "total_amount": "paddleocr_rule",
+            "paid_at": "paddleocr_rule",
+            "paid_time": "paddleocr_rule",
+        },
+        "total_candidates": [amount_candidate_evidence(candidate, lines) for candidate in ranked if candidate.kind in ("total", "subtotal", "tax", "discount", "deposit", "change", "unknown")][:20],
         "needs_review": needs_review,
         "warnings": warnings,
         "validations": validations,
@@ -229,16 +239,76 @@ def select_amount(candidates, kind):
     return None
 
 
-def field_confidences(total, subtotal, paid_at, items, validations):
+def field_confidences(store_name, total, subtotal, paid_at, paid_time, items, validations, evidence):
     total_score = total.score if total else 0.0
     if validations["deposit_change_total"] is False or validations["subtotal_tax_discount_total"] is False:
         total_score *= 0.65
     return {
+        "store_name": round(evidence.get("store_name", {}).get("confidence", 0.0) if store_name else 0.0, 3),
         "total_amount": round(total_score, 3),
         "subtotal_amount": round(subtotal.score if subtotal else 0.0, 3),
         "paid_at": 0.85 if paid_at else 0.0,
+        "paid_time": 0.85 if paid_time else 0.0,
         "items": round(min(0.9, 0.2 + len(items) * 0.12), 3),
     }
+
+
+def build_field_evidence(lines, store_name, total, subtotal, tax, paid_at, paid_time):
+    evidence = {}
+    store_lines = matching_store_lines(lines, store_name)
+    if store_lines:
+        evidence["store_name"] = lines_evidence("store_name", store_name, store_lines, "store_region", "store_rule")
+    for field, candidate in (("total_amount", total), ("subtotal_amount", subtotal), ("tax_amount", tax)):
+        if candidate is not None and 0 <= candidate.source_index < len(lines):
+            evidence[field] = lines_evidence(field, candidate.value, [lines[candidate.source_index]], candidate.kind, "label_and_rule_score")
+    date_lines = [line for line in lines if re.search(r"20\d{2}.?\d{1,2}.?\d{1,2}|R\s*\d{1,2}.?\d{1,2}.?\d{1,2}|\d{1,2}[:：]\d{2}", line.text, re.I)]
+    if paid_at and date_lines:
+        evidence["paid_at"] = lines_evidence("paid_at", paid_at, [date_lines[0]], "datetime", "valid_date_pattern")
+    if paid_time and date_lines:
+        evidence["paid_time"] = lines_evidence("paid_time", paid_time, [date_lines[0]], "datetime", "valid_time_pattern")
+    return evidence
+
+
+def matching_store_lines(lines, store_name):
+    if not store_name:
+        return []
+    compact = re.sub(r"\s+", "", store_name)
+    matches = []
+    for line in lines[:12]:
+        text = re.sub(r"\s+", "", line.text)
+        if text and len(text) >= 2 and (text in compact or compact in text):
+            matches.append(line)
+    return matches
+
+
+def lines_evidence(field, value, source_lines, candidate_type, selection_reason):
+    left = min(line.x for line in source_lines)
+    top = min(line.y for line in source_lines)
+    right = max(line.x + line.w for line in source_lines)
+    bottom = max(line.y + line.h for line in source_lines)
+    width = max(1.0, max(float(getattr(line, "image_width", line.x + line.w or 1.0)) for line in source_lines))
+    height = max(1.0, max(float(getattr(line, "image_height", line.y + line.h or 1.0)) for line in source_lines))
+    return {
+        "field": field,
+        "value": value,
+        "source_text": " ".join(line.text for line in source_lines)[:500],
+        "source_line_ids": [getattr(line, "source_id", "") or str(index) for index, line in enumerate(source_lines)],
+        "source_id": getattr(source_lines[0], "source_id", "") or "0",
+        "bounding_box": [round(max(0.0, min(1.0, left / width)), 5), round(max(0.0, min(1.0, top / height)), 5), round(max(0.0, min(1.0, right / width)), 5), round(max(0.0, min(1.0, bottom / height)), 5)],
+        "confidence": round(sum(float(line.confidence) for line in source_lines) / len(source_lines), 3),
+        "ocr_model": os.environ.get("LOCAL_OCR_REC_MODEL", "PP-OCRv6_small_rec"),
+        "preprocessing": getattr(source_lines[0], "preprocessing", "default"),
+        "candidate_type": candidate_type,
+        "selection_reason": selection_reason,
+    }
+
+
+def amount_candidate_evidence(candidate, lines):
+    result = candidate.public()
+    if 0 <= candidate.source_index < len(lines):
+        evidence = lines_evidence("total_amount", candidate.value, [lines[candidate.source_index]], candidate.kind, "amount_candidate")
+        result.update({key: evidence[key] for key in ("source_line_ids", "source_id", "bounding_box", "ocr_model", "preprocessing")})
+    return result
 
 
 def guess_datetime(text):
