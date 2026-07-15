@@ -127,6 +127,35 @@ test("registering feedback stores changed fields, outcomes, and remains idempote
   assert.deepEqual(JSON.parse(stored.bounding_box_json), [0.1, 0.02, 0.8, 0.12]);
 });
 
+test("a retry with different correction content is rejected without changing stored feedback", async (t) => {
+  const db = new Database();
+  t.after(() => db.close());
+  seed(db);
+  const { claims, input } = await signedInput("ocr_conflicting_retry");
+  await registerOcrCorrections(db, { id: "user-a" }, input, claims);
+
+  await assert.rejects(
+    () => registerOcrCorrections(db, { id: "user-a" }, {
+      ...input,
+      confirmed: { ...input.confirmed, store_name: "別の店" },
+    }, claims),
+    (error) => error?.status === 409 && error?.code === "ocr_feedback_conflict",
+  );
+  await assert.rejects(
+    () => registerOcrCorrections(db, { id: "user-a" }, {
+      ...input,
+      confirmed: { ...input.confirmed, total_amount: 5332 },
+    }, claims),
+    (error) => error?.status === 409 && error?.code === "ocr_feedback_conflict",
+  );
+
+  assert.equal(db.database.prepare("SELECT COUNT(*) AS count FROM receipt_ocr_field_outcomes").get().count, 6);
+  assert.equal(db.database.prepare("SELECT COUNT(*) AS count FROM receipt_ocr_correction_events").get().count, 1);
+  assert.equal(db.database.prepare("SELECT corrected_value FROM receipt_ocr_correction_events").get().corrected_value, input.confirmed.store_name);
+  assert.equal(db.database.prepare("SELECT was_corrected FROM receipt_ocr_field_outcomes WHERE field_name = 'total_amount'").get().was_corrected, 0);
+  assert.deepEqual(db.database.prepare("PRAGMA foreign_key_check").all(), []);
+});
+
 test("amount, date, time, item, and previously missing values are recorded from signed originals", async (t) => {
   const db = new Database();
   t.after(() => db.close());

@@ -58,6 +58,7 @@ class D1Database {
     const isHouseholdBatch=statements.some((statement)=>statement.sql.includes("household_sync_guards"));
     const isOcrFeedbackBatch=statements.some((statement)=>statement.sql.includes("receipt_ocr_field_outcomes"));
     const isTransactionCreateBatch=statements.some((statement)=>statement.sql.includes("INSERT INTO transactions"));
+    const isTransactionUpdateBatch=statements.some((statement)=>statement.sql.includes("UPDATE transactions"));
     this.database.exec("BEGIN IMMEDIATE");
     try {
       const results = [];
@@ -65,6 +66,7 @@ class D1Database {
         if(this.failHouseholdBatchAt===index&&isHouseholdBatch)throw new Error("injected_household_sync_failure");
         if(this.failOcrFeedbackBatches>0&&isOcrFeedbackBatch){this.failOcrFeedbackBatches-=1;throw new Error("injected_ocr_feedback_failure");}
         if(this.failTransactionCreateBatch&&isTransactionCreateBatch)throw new Error("injected_transaction_create_failure");
+        if(this.failTransactionUpdateBatch&&isTransactionUpdateBatch)throw new Error("injected_transaction_update_failure");
         if(this.failBatchAt===index)throw new Error("injected_batch_failure");
         results.push(await statements[index].run());
       }
@@ -76,6 +78,7 @@ class D1Database {
     } finally {
       this.failBatchAt=undefined;
       if(isTransactionCreateBatch)this.failTransactionCreateBatch=undefined;
+      if(isTransactionUpdateBatch)this.failTransactionUpdateBatch=undefined;
       if(isHouseholdBatch)this.failHouseholdBatchAt=undefined;
     }
   }
@@ -975,6 +978,66 @@ test("account deletion remains untouched when the OCR feedback migration is miss
   assert.equal(user.deleted_at, null);
 });
 
+test("link reconciliation does not persist OCR feedback when the transaction update fails", async (t) => {
+  const db = new D1Database();
+  const originalFetch = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+    db.close();
+  });
+  await createProject(db, { id: "ocr-failed-link", name: "OCR failed link", project_type: "split" });
+  await request(db, "POST", "/api/projects/ocr-failed-link/transactions", {
+    id: "ocr-failed-link-transaction",
+    merchant_name: "更新前店舗",
+    paid_amount: 100,
+    occurred_at: "2026-07-01",
+  });
+  globalThis.fetch = async () => new Response(JSON.stringify({
+    ocr_result_id: "ocr_failed_link_result",
+    ocr_engine_version: "PP-OCRv6_small_rec",
+    store_name: "訂正前店舗",
+    total_amount: 5382,
+    paid_at: "2026-07-11",
+    paid_time: "13:16",
+    items: [],
+    confidence: 0.8,
+    field_evidence: {
+      store_name: { source_id: "store:0", source_text: "訂正前店舗", bounding_box: [0.1, 0.02, 0.8, 0.12], confidence: 0.64, preprocessing: "adaptive" },
+      total_amount: { source_id: "total:0", source_text: "合計 5,382", bounding_box: [0.5, 0.7, 0.9, 0.8], confidence: 0.95, preprocessing: "contrast" },
+      paid_at: { source_id: "date:0", source_text: "2026-07-11", bounding_box: [0.1, 0.2, 0.8, 0.25], confidence: 0.9, preprocessing: "contrast" },
+      paid_time: { source_id: "date:0", source_text: "13:16", bounding_box: [0.6, 0.2, 0.8, 0.25], confidence: 0.9, preprocessing: "contrast" },
+    },
+  }), { status: 200, headers: { "content-type": "application/json" } });
+  const feedbackEnv = {
+    OCR_BACKEND: "remote",
+    RECEIPT_OCR_API_URL: "https://ocr.example.test",
+    RECEIPT_OCR_SHARED_SECRET: "remote-secret",
+    RECEIPT_OCR_ENABLE_FEEDBACK_WRITE: "true",
+    OCR_FEEDBACK_TOKEN_KEY_V1: "k".repeat(48),
+  };
+  const ocr = await request(db, "POST", "/api/ocr-receipt", { project_id: "ocr-failed-link", image_data_url: "data:image/png;base64,AA==" }, feedbackEnv);
+  const receiptImport = await request(db, "POST", "/api/projects/ocr-failed-link/imports/receipt", {
+    source_record_id: `receipt:${ocr.body.ocr_result_id}`,
+    merchant_raw: ocr.body.store_name,
+    paid_amount_raw: ocr.body.total_amount,
+    occurred_at_raw: ocr.body.paid_at,
+    raw_payload: { ocr: { ocr_result_id: ocr.body.ocr_result_id } },
+  });
+  db.failTransactionUpdateBatch = true;
+  const failedLink = await request(db, "POST", `/api/imports/${receiptImport.body.import.id}/reconcile`, {
+    action: "link",
+    transaction_id: "ocr-failed-link-transaction",
+    feedback_token: ocr.body.feedback_token,
+    confirmed: { store_name: "訂正後店舗", total_amount: 5500, paid_at: "2026-07-13", paid_time: "13:17", items: [] },
+  }, feedbackEnv);
+
+  assert.equal(failedLink.response.status, 500);
+  const transaction = await db.prepare("SELECT merchant_name, paid_amount, occurred_at FROM transactions WHERE id = ?").bind("ocr-failed-link-transaction").first();
+  assert.deepEqual({ ...transaction }, { merchant_name: "更新前店舗", paid_amount: 100, occurred_at: "2026-07-01" });
+  assert.equal(db.database.prepare("SELECT COUNT(*) AS count FROM receipt_ocr_correction_events WHERE ocr_result_id = ?").get(ocr.body.ocr_result_id).count, 0);
+  assert.equal(db.database.prepare("SELECT COUNT(*) AS count FROM receipt_ocr_feedback_pending WHERE import_id = ?").get(receiptImport.body.import.id).count, 0);
+});
+
 test("OCR correction routes sign originals, isolate users, and send bounded feedback upstream", async (t) => {
   const db = new D1Database();
   const originalFetch = globalThis.fetch;
@@ -1064,18 +1127,19 @@ test("OCR correction routes sign originals, isolate users, and send bounded feed
     paid_amount: 100,
     occurred_at: "2026-07-01",
   });
+  const linkedOcr = await request(db, "POST", "/api/ocr-receipt", { project_id: "ocr-feedback", image_data_url: "data:image/png;base64,AA==" }, feedbackEnv);
   const linkedReceiptImport = await request(db, "POST", "/api/projects/ocr-feedback/imports/receipt", {
-    source_record_id: `receipt:link:${ocr.body.ocr_result_id}`,
-    merchant_raw: ocr.body.store_name,
-    paid_amount_raw: ocr.body.total_amount,
-    occurred_at_raw: ocr.body.paid_at,
-    raw_payload: { ocr: { ocr_result_id: ocr.body.ocr_result_id } },
+    source_record_id: `receipt:link:${linkedOcr.body.ocr_result_id}`,
+    merchant_raw: linkedOcr.body.store_name,
+    paid_amount_raw: linkedOcr.body.total_amount,
+    occurred_at_raw: linkedOcr.body.paid_at,
+    raw_payload: { ocr: { ocr_result_id: linkedOcr.body.ocr_result_id } },
   });
   const linkedConfirmation = { ...correctedConfirmation, total_amount: 5500, paid_at: "2026-07-13" };
   const linkedReconcile = await request(db, "POST", `/api/imports/${linkedReceiptImport.body.import.id}/reconcile`, {
     action: "link",
     transaction_id: "ocr-linked-transaction",
-    feedback_token: ocr.body.feedback_token,
+    feedback_token: linkedOcr.body.feedback_token,
     confirmed: linkedConfirmation,
   }, feedbackEnv);
   assert.equal(linkedReconcile.response.status, 200);
@@ -1085,15 +1149,16 @@ test("OCR correction routes sign originals, isolate users, and send bounded feed
   assert.equal(linkedTransaction.paid_amount, linkedConfirmation.total_amount);
   assert.equal(linkedTransaction.occurred_at, linkedConfirmation.paid_at);
 
+  const missingValueOcr = await request(db, "POST", "/api/ocr-receipt", { project_id: "ocr-feedback", image_data_url: "data:image/png;base64,AA==" }, feedbackEnv);
   const missingValueImport = await request(db, "POST", "/api/projects/ocr-feedback/imports/receipt", {
-    source_record_id: `receipt:missing-values:${ocr.body.ocr_result_id}`,
-    merchant_raw: ocr.body.store_name,
-    raw_payload: { ocr: { ocr_result_id: ocr.body.ocr_result_id } },
+    source_record_id: `receipt:missing-values:${missingValueOcr.body.ocr_result_id}`,
+    merchant_raw: missingValueOcr.body.store_name,
+    raw_payload: { ocr: { ocr_result_id: missingValueOcr.body.ocr_result_id } },
   });
   const filledMissingValues = await request(db, "POST", `/api/imports/${missingValueImport.body.import.id}/reconcile`, {
     action: "create",
     new_transaction_id: "ocr-filled-missing-transaction",
-    feedback_token: ocr.body.feedback_token,
+    feedback_token: missingValueOcr.body.feedback_token,
     confirmed: correctedConfirmation,
   }, feedbackEnv);
   assert.equal(filledMissingValues.response.status, 200);
@@ -1101,8 +1166,8 @@ test("OCR correction routes sign originals, isolate users, and send bounded feed
   assert.equal(filledMissingValues.body.transaction.occurred_at, correctedConfirmation.paid_at);
 
   const secondOcr = await request(db, "POST", "/api/ocr-receipt", { project_id: "ocr-feedback", image_data_url: "data:image/png;base64,AA==" }, feedbackEnv);
-  assert.equal(upstreamBodies[1].feedback.store_corrections[0].corrected, "たまや 浜見平店");
-  assert.equal(new TextEncoder().encode(JSON.stringify(upstreamBodies[1].feedback)).byteLength <= 32 * 1024, true);
+  assert.equal(upstreamBodies[3].feedback.store_corrections[0].corrected, "たまや 浜見平店");
+  assert.equal(new TextEncoder().encode(JSON.stringify(upstreamBodies[3].feedback)).byteLength <= 32 * 1024, true);
   const directFeedbackImport = await request(db, "POST", "/api/projects/ocr-feedback/imports/receipt", {
     source_record_id: `receipt:direct:${secondOcr.body.ocr_result_id}`,
     merchant_raw: secondOcr.body.store_name,
@@ -1187,7 +1252,7 @@ test("OCR correction routes sign originals, isolate users, and send bounded feed
   assert.equal(db.database.prepare("SELECT COUNT(*) AS count FROM receipt_ocr_feedback_pending WHERE import_id = ?").get(failedFeedbackImport.body.import.id).count, 0);
 
   const count = await request(db, "GET", "/api/ocr-corrections", undefined, feedbackEnv);
-  assert.equal(count.body.correction_count, 9);
+  assert.equal(count.body.correction_count, 17);
 
   const other = await request(db, "POST", "/api/ocr-corrections", {
     import_id: directFeedbackImport.body.import.id,
@@ -1200,11 +1265,11 @@ test("OCR correction routes sign originals, isolate users, and send bounded feed
   assert.equal(otherCount.body.correction_count, 0);
   const otherDeleted = await request(db, "DELETE", "/api/ocr-corrections", undefined, feedbackEnv, { session: otherSession });
   assert.deepEqual(otherDeleted.body, { deleted_pending: 0, deleted_corrections: 0, deleted_outcomes: 0 });
-  assert.equal((await request(db, "GET", "/api/ocr-corrections", undefined, feedbackEnv)).body.correction_count, 9);
+  assert.equal((await request(db, "GET", "/api/ocr-corrections", undefined, feedbackEnv)).body.correction_count, 17);
 
   const deleted = await request(db, "DELETE", "/api/ocr-corrections", undefined, feedbackEnv);
   assert.equal(deleted.body.deleted_pending, 0);
-  assert.equal(deleted.body.deleted_corrections, 9);
+  assert.equal(deleted.body.deleted_corrections, 17);
   assert.equal((await request(db, "GET", "/api/ocr-corrections", undefined, feedbackEnv)).body.correction_count, 0);
 
   const disabledEnv = {

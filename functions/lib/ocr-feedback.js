@@ -8,11 +8,22 @@ const encoder = new TextEncoder();
 
 export async function registerOcrCorrections(db, user, input, claims, timestamp = new Date().toISOString()) {
   assertObject(input);
-  assertAllowed(input, ["transaction_id", "feedback_token", "confirmed"]);
+  assertAllowed(input, ["import_id", "transaction_id", "feedback_token", "confirmed"]);
   const transactionId = patternText(input.transaction_id, "transaction_id", /^[A-Za-z0-9_.:-]{1,128}$/u);
   const transaction = await db.prepare("SELECT id, project_id FROM transactions WHERE id = ?").bind(transactionId).first();
   if (!transaction || transaction.project_id !== claims.project_id) throw new ApiError(404, "not_found");
   const confirmed = confirmedValues(input.confirmed);
+  const submissionStatements = [];
+  if (input.import_id !== undefined) {
+    const importId = patternText(input.import_id, "import_id", /^[A-Za-z0-9_.:-]{1,128}$/u);
+    submissionStatements.push(db.prepare(`INSERT INTO receipt_ocr_feedback_submissions (
+      import_id, user_id, project_id, transaction_id, ocr_result_id, confirmed_json, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(import_id) DO NOTHING`).bind(
+      importId, user.id, claims.project_id, transactionId, claims.ocr_result_id,
+      serializeConfirmedOcrValues(confirmed), timestamp,
+    ));
+  }
   const records = compareSignedValues(claims, confirmed);
   if (records.length === 0) throw new ApiError(400, "empty_ocr_feedback");
 
@@ -37,15 +48,90 @@ export async function registerOcrCorrections(db, user, input, claims, timestamp 
     record.normalized_original_value, record.normalized_corrected_value, claims.ocr_model,
     record.preprocessing, record.confidence, record.bounding_box_json, record.source_text, timestamp,
   ));
-  const results = await db.batch([...outcomeStatements, ...correctionStatements]);
+  let results;
+  try {
+    results = await db.batch([...submissionStatements, ...outcomeStatements, ...correctionStatements]);
+  } catch (error) {
+    if (String(error?.message || error).includes("ocr_feedback_content_conflict")) {
+      throw new ApiError(409, "ocr_feedback_conflict");
+    }
+    throw error;
+  }
+  const outcomeOffset = submissionStatements.length;
   return {
-    accepted_outcomes: changedCount(results.slice(0, outcomeStatements.length)),
-    accepted_events: changedCount(results.slice(outcomeStatements.length)),
+    accepted_outcomes: changedCount(results.slice(outcomeOffset, outcomeOffset + outcomeStatements.length)),
+    accepted_events: changedCount(results.slice(outcomeOffset + outcomeStatements.length)),
   };
 }
 
 export function validateConfirmedOcrValues(value) {
   return confirmedValues(value);
+}
+
+export function serializeConfirmedOcrValues(value) {
+  const confirmed = confirmedValues(value);
+  return JSON.stringify({
+    store_name: confirmed.store_name,
+    total_amount: confirmed.total_amount,
+    paid_at: confirmed.paid_at,
+    paid_time: confirmed.paid_time,
+    items: confirmed.items.map((item) => ({ source_id: item.source_id, name: item.name, amount: item.amount })),
+  });
+}
+
+export async function assertOcrFeedbackSubmission(db, user, input, claims) {
+  const importId = patternText(input.import_id, "import_id", /^[A-Za-z0-9_.:-]{1,128}$/u);
+  const transactionId = input.transaction_id == null
+    ? null
+    : patternText(input.transaction_id, "transaction_id", /^[A-Za-z0-9_.:-]{1,128}$/u);
+  const confirmedJson = serializeConfirmedOcrValues(input.confirmed);
+  const submission = await db.prepare(`SELECT user_id, project_id, transaction_id, ocr_result_id, confirmed_json
+    FROM receipt_ocr_feedback_submissions WHERE import_id = ?`).bind(importId).first();
+  const pending = submission ? null : await db.prepare(`SELECT user_id, project_id, transaction_id, ocr_result_id, confirmed_json
+    FROM receipt_ocr_feedback_pending WHERE import_id = ?`).bind(importId).first();
+  const existing = submission || pending;
+  if (existing && (
+    existing.user_id !== user.id
+    || existing.project_id !== claims.project_id
+    || existing.ocr_result_id !== claims.ocr_result_id
+    || existing.confirmed_json !== confirmedJson
+    || (transactionId !== null && existing.transaction_id !== transactionId)
+  )) {
+    throw new ApiError(409, "ocr_feedback_conflict");
+  }
+  return { confirmed_json: confirmedJson, transaction_id: existing?.transaction_id || transactionId };
+}
+
+export async function assertConfirmedOcrTransaction(db, transactionIdValue, confirmedValue, importIdValue = null) {
+  const transactionId = patternText(transactionIdValue, "transaction_id", /^[A-Za-z0-9_.:-]{1,128}$/u);
+  const confirmed = confirmedValues(confirmedValue);
+  const transaction = await db.prepare(`SELECT merchant_name, paid_amount, occurred_at
+    FROM transactions WHERE id = ?`).bind(transactionId).first();
+  if (!transaction
+    || (confirmed.store_name !== null && transaction.merchant_name !== confirmed.store_name)
+    || (confirmed.total_amount !== null && Number(transaction.paid_amount) !== confirmed.total_amount)
+    || (confirmed.paid_at !== null && transaction.occurred_at !== confirmed.paid_at)) {
+    throw new ApiError(409, "ocr_feedback_transaction_mismatch");
+  }
+  if (importIdValue !== null) {
+    const importId = patternText(importIdValue, "import_id", /^[A-Za-z0-9_.:-]{1,128}$/u);
+    const importRecord = await db.prepare("SELECT transaction_id, raw_payload FROM import_records WHERE id = ?").bind(importId).first();
+    let payload;
+    try {
+      payload = JSON.parse(importRecord?.raw_payload || "{}");
+    } catch {
+      payload = null;
+    }
+    const ocr = payload?.ocr;
+    const storedItems = Array.isArray(ocr?.confirmed_items) ? ocr.confirmed_items : null;
+    if (!importRecord
+      || importRecord.transaction_id !== transactionId
+      || (confirmed.paid_time !== null && ocr?.confirmed_paid_time !== confirmed.paid_time)
+      || storedItems === null
+      || JSON.stringify(storedItems) !== JSON.stringify(confirmed.items)) {
+      throw new ApiError(409, "ocr_feedback_transaction_mismatch");
+    }
+  }
 }
 
 export async function countOcrCorrections(db, user) {
@@ -57,10 +143,11 @@ export async function countOcrCorrections(db, user) {
 export async function deleteOcrCorrections(db, user) {
   const results = await db.batch([
     db.prepare("DELETE FROM receipt_ocr_feedback_pending WHERE user_id = ?").bind(user.id),
+    db.prepare("DELETE FROM receipt_ocr_feedback_submissions WHERE user_id = ?").bind(user.id),
     db.prepare("DELETE FROM receipt_ocr_correction_events WHERE user_id = ?").bind(user.id),
     db.prepare("DELETE FROM receipt_ocr_field_outcomes WHERE user_id = ?").bind(user.id),
   ]);
-  return { deleted_pending: resultChanges(results[0]), deleted_corrections: resultChanges(results[1]), deleted_outcomes: resultChanges(results[2]) };
+  return { deleted_pending: resultChanges(results[0]), deleted_corrections: resultChanges(results[2]), deleted_outcomes: resultChanges(results[3]) };
 }
 
 export async function buildReceiptFeedback(db, userId) {
