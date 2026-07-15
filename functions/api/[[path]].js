@@ -68,6 +68,14 @@ import {
 } from "../lib/imports.js";
 import { handleReceiptOcr } from "../lib/ocr.js";
 import {
+  buildReceiptFeedback,
+  countOcrCorrections,
+  deleteOcrCorrections,
+  registerOcrCorrections,
+  validateConfirmedOcrValues,
+} from "../lib/ocr-feedback.js";
+import { createOcrFeedbackToken, verifyOcrFeedbackToken } from "../lib/ocr-feedback-token.js";
+import {
   disconnectGmail,
   disconnectAllGmail,
   finishGmailOAuth,
@@ -144,7 +152,16 @@ async function dispatchReceiptOcr(request, db, env, url) {
       assertCsrf(request, user);
       try {
         await requireProjectRole(db, user, projectId, "editor");
-        return handleReceiptOcr(request, env, body);
+        let feedback = null;
+        if (feedbackReadEnabled(env)) {
+          try {
+            feedback = await buildReceiptFeedback(db, user.id);
+          } catch {
+            feedback = null;
+          }
+        }
+        const response = await handleReceiptOcr(request, env, body, feedback);
+        return addOcrFeedbackToken(response, env, user.id, projectId);
       } catch (error) {
         if (!(error instanceof ApiError) || error.code !== "not_found") throw error;
       }
@@ -168,6 +185,7 @@ async function dispatch(request, db, env, url, path) {
   const user = await requireUser(db, request);
   assertCsrf(request, user);
   if (path[0] === "gmail") return dispatchGmail(request, db, env, url, path, user);
+  if (path[0] === "ocr-corrections" && path.length === 1) return dispatchOcrCorrections(request, db, env, user);
   if (path[0] === "household-sync-jobs" && path.length === 3 && path[2] === "retry") {
     return invoke(request, ["POST"], async () => {
       assertOrigin(request, env, { requireOrigin: true, requireJson: true });
@@ -192,7 +210,7 @@ async function dispatch(request, db, env, url, path) {
   if (path[0] === "imports" && path.length === 3 && path[2] === "reconcile") {
     return invoke(request, ["POST"], async () => {
       await requireProjectRole(db, user, await projectIdForImport(db, path[1]), "editor");
-      return handleReconcile(request, db, path[1], user);
+      return handleReconcile(request, db, env, path[1], user);
     });
   }
   return json({ error: "not_found" }, 404);
@@ -244,6 +262,9 @@ async function dispatchAccount(request, db, env) {
   return invoke(request, ["DELETE"], async () => {
     const user = await requireAccountDeletionUser(db, request);
     assertCsrf(request, user);
+    const migration = await db.prepare(`SELECT COUNT(*) AS table_count FROM sqlite_master
+      WHERE type = 'table' AND name IN ('receipt_ocr_correction_events', 'receipt_ocr_field_outcomes')`).first();
+    if (Number(migration?.table_count || 0) !== 2) throw new ApiError(503, "database_migration_required");
     const startedAt = user.deletion_started_at || new Date().toISOString();
     const started = await db.prepare(`UPDATE users SET deletion_started_at = COALESCE(deletion_started_at, ?), updated_at = ?
       WHERE id = ? AND deleted_at IS NULL`).bind(startedAt, startedAt, user.id).run();
@@ -254,12 +275,48 @@ async function dispatchAccount(request, db, env) {
       db.prepare("UPDATE users SET deleted_at = ?, updated_at = ? WHERE id = ?").bind(timestamp, timestamp, user.id),
       db.prepare("UPDATE sessions SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL").bind(timestamp, user.id),
       db.prepare("UPDATE project_user_roles SET revoked_at = ?, updated_at = ? WHERE user_id = ? AND revoked_at IS NULL").bind(timestamp, timestamp, user.id),
+      db.prepare("DELETE FROM receipt_ocr_correction_events WHERE user_id = ?").bind(user.id),
+      db.prepare("DELETE FROM receipt_ocr_field_outcomes WHERE user_id = ?").bind(user.id),
     ]);
     const headers = new Headers();
     headers.append("set-cookie", clearCookieHeader("wari_session"));
     headers.append("set-cookie", clearCookieHeader(CSRF_COOKIE));
     return json({ ok: true }, 200, headers);
   });
+}
+
+async function dispatchOcrCorrections(request, db, env, user) {
+  if (request.method === "GET") return json(await countOcrCorrections(db, user));
+  if (request.method === "POST") {
+    if (!feedbackWriteEnabled(env)) throw new ApiError(503, "ocr_feedback_unavailable");
+    const input = await readJson(request);
+    const claims = await verifyOcrFeedbackToken(env, input.feedback_token, user.id);
+    await requireProjectRole(db, user, claims.project_id, "editor");
+    return json(await registerOcrCorrections(db, user, input, claims), 201);
+  }
+  if (request.method === "DELETE") return json(await deleteOcrCorrections(db, user));
+  return methodNotAllowed(["GET", "POST", "DELETE"]);
+}
+
+async function addOcrFeedbackToken(response, env, userId, projectId) {
+  if (!response.ok) return response;
+  let data;
+  try {
+    data = await response.clone().json();
+  } catch {
+    return response;
+  }
+  if (!data || typeof data !== "object" || Array.isArray(data) || !data.ocr_result_id) return response;
+  const token = await createOcrFeedbackToken(env, userId, projectId, data);
+  return token ? json({ ...data, feedback_token: token, feedback_write_enabled: feedbackWriteEnabled(env) }, response.status) : response;
+}
+
+function feedbackReadEnabled(env) {
+  return String(env.RECEIPT_OCR_ENABLE_FEEDBACK_READ || "").toLowerCase() === "true";
+}
+
+function feedbackWriteEnabled(env) {
+  return String(env.RECEIPT_OCR_ENABLE_FEEDBACK_WRITE || "").toLowerCase() === "true";
 }
 
 async function dispatchGmail(request, db, env, url, path, user) {
@@ -628,12 +685,24 @@ function publicUser(user) {
   return { id: user.id, email: user.email, name: user.name };
 }
 
-async function handleReconcile(request, db, importId, user) {
+async function handleReconcile(request, db, env, importId, user) {
   const body = await readJson(request);
   validateReconcileInput(body);
   const record = await db.prepare("SELECT * FROM import_records WHERE id = ?").bind(importId).first();
   if (!record) throw new ApiError(404, "not_found");
   await requireOpenProject(db, record.project_id);
+  const hasOcrConfirmation = body.feedback_token !== undefined || body.confirmed !== undefined;
+  if (hasOcrConfirmation) {
+    if (body.action !== "create" && body.action !== "link") throw new ApiError(400, "invalid_ocr_confirmation");
+    if (record.source_type !== "receipt" || typeof body.feedback_token !== "string" || body.confirmed === undefined) {
+      throw new ApiError(400, "invalid_ocr_confirmation");
+    }
+    const claims = await verifyOcrFeedbackToken(env, body.feedback_token, user.id);
+    if (claims.project_id !== record.project_id || !matchesReceiptOcrResult(record, claims.ocr_result_id)) {
+      throw new ApiError(403, "ocr_feedback_token_mismatch");
+    }
+    body.confirmed_ocr = validateConfirmedOcrValues(body.confirmed);
+  }
   if (body.action === "link") {
     const transactionId = requiredBodyString(body, "transaction_id", 128);
     await assertTransactionProject(db, transactionId, record.project_id);
@@ -832,7 +901,7 @@ function validateImportInput(body, kind) {
 }
 
 function validateReconcileInput(body) {
-  assertAllowedBody(body, new Set(["action", "transaction_id", "new_transaction_id", "match_score", "match_reason_json"]));
+  assertAllowedBody(body, new Set(["action", "transaction_id", "new_transaction_id", "match_score", "match_reason_json", "feedback_token", "confirmed"]));
   if (typeof body.action !== "string" || !RECONCILE_ACTIONS.has(body.action)) throw new ApiError(400, "invalid_field", { field: "action" });
   if (body.transaction_id !== undefined) bodyString(body.transaction_id, "transaction_id", 128);
   if (body.new_transaction_id !== undefined) bodyString(body.new_transaction_id, "new_transaction_id", 128);
@@ -842,6 +911,15 @@ function validateReconcileInput(body) {
     if (value.length > 20_000) throw new ApiError(400, "invalid_field", { field: "match_reason_json" });
   }
   if (body.action === "link" && body.transaction_id === undefined) throw new ApiError(400, "missing_field", { field: "transaction_id" });
+}
+
+function matchesReceiptOcrResult(record, resultId) {
+  try {
+    const payload = JSON.parse(record.raw_payload || "{}");
+    return payload?.ocr?.ocr_result_id === resultId;
+  } catch {
+    return false;
+  }
 }
 
 async function importCall(callback) {

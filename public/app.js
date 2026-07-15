@@ -100,7 +100,9 @@ const ui = {
     createSplit: { status: "", type: "", items: [] },
     split: { status: "", type: "", items: [] },
   },
+  ocrFeedback: { count: null, loading: false },
 };
+const ocrFeedbackTokens = new Map();
 
 function now() {
   return new Date().toISOString();
@@ -851,6 +853,21 @@ function renderCsvPreview() {
   return `<div class="csv-preview"><div class="inline-heading"><strong>${esc(ui.csvPreview.name)}</strong><span>${ui.csvPreview.totalRows}行</span></div><div class="table-scroll"><table><tbody>${rows.map((row, rowIndex) => `<tr>${Array.from({ length: width }, (_, index) => `<${rowIndex === 0 ? "th" : "td"}>${esc(row[index] || "")}</${rowIndex === 0 ? "th" : "td"}>`).join("")}</tr>`).join("")}</tbody></table></div><button class="button household-button full-width" type="button" data-import-csv>確認へ追加</button></div>`;
 }
 
+function receiptOcrPayload(record) {
+  try {
+    const payload = JSON.parse(record?.raw_payload || "null");
+    return payload?.ocr && typeof payload.ocr === "object" ? payload.ocr : null;
+  } catch {
+    return null;
+  }
+}
+
+function renderOcrItemFields(ocr, recordId) {
+  const items = Array.isArray(ocr?.confirmed_items) ? ocr.confirmed_items : ocr?.original?.items;
+  if (!Array.isArray(items) || items.length === 0) return "";
+  return `<details class="ocr-item-review"><summary>商品明細 ${items.length}件</summary><div class="form-stack">${items.map((item, index) => `<div class="field-grid"><div class="field"><label>商品名 ${index + 1}</label><input class="input" value="${esc(item.name || "")}" data-import-ocr-field="item_name:${index}" data-import-ocr-id="${esc(recordId)}"></div><div class="field"><label>金額</label><input class="input" type="number" inputmode="numeric" min="1" value="${esc(item.amount || "")}" data-import-ocr-field="item_amount:${index}" data-import-ocr-id="${esc(recordId)}"></div></div>`).join("")}</div></details>`;
+}
+
 function renderImportReview(project, projectIds = new Set([project.id]), includeGmail = true) {
   const records = state.import_records
     .filter((row) => projectIds.has(row.project_id) && ["received", "parsed", "review"].includes(row.source_status))
@@ -859,13 +876,24 @@ function renderImportReview(project, projectIds = new Set([project.id]), include
   if (!records.length) return `${gmail}<div class="empty-state compact-empty">確認待ちはありません</div>`;
   return gmail + records.map((record) => {
     const transactions = transactionsFor(record.project_id).filter((row) => !["cancelled", "refunded"].includes(row.status));
-    return `<div class="review-row"><div class="review-row-head"><span class="source-type">${esc(SOURCE_TYPES[record.source_type] || record.source_type)}</span><span>${esc(formatDate(record.occurred_at_raw || record.created_at))}</span></div><div class="review-row-value"><strong>${esc(record.merchant_raw || "店名未設定")}</strong><strong>${esc(yen(record.paid_amount_raw ?? record.gross_amount_raw))}</strong></div><div class="review-actions"><button class="small-button household-small" type="button" data-create-from-import="${esc(record.id)}">取引にする</button><select data-import-link-select="${esc(record.id)}" aria-label="既存の取引"><option value="">既存の取引</option>${transactions.map((transaction) => `<option value="${esc(transaction.id)}">${esc(dateValue(transaction.occurred_at))} ${esc(transaction.merchant_name)} ${esc(yen(transaction.paid_amount))}</option>`).join("")}</select><button class="small-button" type="button" data-link-import="${esc(record.id)}">紐付け</button><button class="icon-button quiet" type="button" data-reject-import="${esc(record.id)}" aria-label="却下">×</button></div></div>`;
+    const ocr = receiptOcrPayload(record);
+    const editable = record.source_type === "receipt" && ocr?.ocr_result_id && ocrFeedbackTokens.has(ocr.ocr_result_id);
+    const values = editable
+      ? `<div class="field-grid"><div class="field"><label>店名</label><input class="input" value="${esc(record.merchant_raw || "")}" data-import-ocr-field="merchant_raw" data-import-ocr-id="${esc(record.id)}"></div><div class="field"><label>金額</label><input class="input" type="number" inputmode="numeric" min="1" value="${esc(record.paid_amount_raw ?? record.gross_amount_raw ?? "")}" data-import-ocr-field="paid_amount_raw" data-import-ocr-id="${esc(record.id)}"></div></div><div class="field-grid"><div class="field"><label>日付</label><input class="input" type="date" value="${esc(dateValue(record.occurred_at_raw))}" data-import-ocr-field="occurred_at_raw" data-import-ocr-id="${esc(record.id)}"></div><div class="field"><label>時刻</label><input class="input" type="time" value="${esc(ocr.confirmed_paid_time || ocr.original?.paid_time || "")}" data-import-ocr-field="paid_time" data-import-ocr-id="${esc(record.id)}"></div></div>`
+      : `<div class="review-row-value"><strong>${esc(record.merchant_raw || "店名未設定")}</strong><strong>${esc(yen(record.paid_amount_raw ?? record.gross_amount_raw))}</strong></div>`;
+    return `<div class="review-row"><div class="review-row-head"><span class="source-type">${esc(SOURCE_TYPES[record.source_type] || record.source_type)}</span><span>${esc(formatDate(record.occurred_at_raw || record.created_at))}</span></div>${values}${editable ? renderOcrItemFields(ocr, record.id) : ""}<div class="review-actions"><button class="small-button household-small" type="button" data-create-from-import="${esc(record.id)}">取引にする</button><select data-import-link-select="${esc(record.id)}" aria-label="既存の取引"><option value="">既存の取引</option>${transactions.map((transaction) => `<option value="${esc(transaction.id)}">${esc(dateValue(transaction.occurred_at))} ${esc(transaction.merchant_name)} ${esc(yen(transaction.paid_amount))}</option>`).join("")}</select><button class="small-button" type="button" data-link-import="${esc(record.id)}">紐付け</button><button class="icon-button quiet" type="button" data-reject-import="${esc(record.id)}" aria-label="却下">×</button></div>${editable ? `<p class="field-note">修正した内容は、次回以降の読み取り候補の改善に使用されます</p>` : ""}</div>`;
   }).join("");
+}
+
+function renderOcrFeedbackSettings() {
+  if (!isCloud || cloudSession.status !== "authenticated") return "";
+  const count = ui.ocrFeedback.count == null ? "未取得" : `${ui.ocrFeedback.count}件`;
+  return `<section class="ocr-feedback-settings" aria-labelledby="ocr-feedback-title"><div class="inline-heading"><h3 id="ocr-feedback-title">OCR修正履歴</h3><span>${esc(count)}</span></div><p class="field-note">修正履歴はログイン中の利用者ごとに保存されます</p><div class="review-actions"><button class="small-button" type="button" data-load-ocr-feedback ${ui.ocrFeedback.loading ? "disabled" : ""}>件数を更新</button><button class="small-button danger-text" type="button" data-delete-ocr-feedback ${ui.ocrFeedback.count ? "" : "disabled"}>履歴を削除</button></div></section>`;
 }
 
 function renderHouseholdImports(project, projectIds = new Set([project.id])) {
   const includeGmail = primaryHouseholdProject()?.id === project.id;
-  return `<section aria-labelledby="imports-title"><div class="section-heading"><div><h2 id="imports-title">取込</h2><span>${state.import_records.filter((row) => projectIds.has(row.project_id)).length}件</span></div></div><div class="import-tools"><section class="import-section"><div class="inline-heading"><h3>レシート</h3></div><div class="file-actions"><label class="file-button household-file"><input type="file" accept="image/jpeg,image/png,image/webp,image/heic,image/heif" data-household-receipt="${esc(project.id)}"><span>画像を選ぶ</span></label><label class="file-button secondary-button"><input type="file" accept="image/*" capture="environment" data-household-receipt="${esc(project.id)}"><span>撮影する</span></label></div></section><section class="import-section"><div class="inline-heading"><h3>CSV</h3></div><div class="csv-controls"><select data-csv-source aria-label="CSVの種類"><option value="">自動判定</option><option value="card_csv" ${ui.csvSourceType === "card_csv" ? "selected" : ""}>カード</option><option value="paypay_csv" ${ui.csvSourceType === "paypay_csv" ? "selected" : ""}>PayPay</option><option value="bank_csv" ${ui.csvSourceType === "bank_csv" ? "selected" : ""}>銀行</option><option value="manual" ${ui.csvSourceType === "manual" ? "selected" : ""}>その他</option></select><label class="file-button household-file"><input type="file" accept=".csv,text/csv" data-csv-file="${esc(project.id)}"><span>CSVを選ぶ</span></label></div>${renderCsvPreview()}</section><section class="import-section"><div class="inline-heading"><h3>通知</h3></div><form id="notification-import-form" class="form-stack"><textarea class="textarea" name="raw_text" rows="4" placeholder="通知本文" required></textarea><button class="button secondary-button" type="submit">確認へ追加</button></form></section></div><section class="review-section" aria-labelledby="review-title"><div class="inline-heading"><h3 id="review-title">確認待ち</h3></div><div class="review-list">${renderImportReview(project, projectIds, includeGmail)}</div></section></section>`;
+  return `<section aria-labelledby="imports-title"><div class="section-heading"><div><h2 id="imports-title">取込</h2><span>${state.import_records.filter((row) => projectIds.has(row.project_id)).length}件</span></div></div><div class="import-tools"><section class="import-section"><div class="inline-heading"><h3>レシート</h3></div><div class="file-actions"><label class="file-button household-file"><input type="file" accept="image/jpeg,image/png,image/webp,image/heic,image/heif" data-household-receipt="${esc(project.id)}"><span>画像を選ぶ</span></label><label class="file-button secondary-button"><input type="file" accept="image/*" capture="environment" data-household-receipt="${esc(project.id)}"><span>撮影する</span></label></div></section><section class="import-section"><div class="inline-heading"><h3>CSV</h3></div><div class="csv-controls"><select data-csv-source aria-label="CSVの種類"><option value="">自動判定</option><option value="card_csv" ${ui.csvSourceType === "card_csv" ? "selected" : ""}>カード</option><option value="paypay_csv" ${ui.csvSourceType === "paypay_csv" ? "selected" : ""}>PayPay</option><option value="bank_csv" ${ui.csvSourceType === "bank_csv" ? "selected" : ""}>銀行</option><option value="manual" ${ui.csvSourceType === "manual" ? "selected" : ""}>その他</option></select><label class="file-button household-file"><input type="file" accept=".csv,text/csv" data-csv-file="${esc(project.id)}"><span>CSVを選ぶ</span></label></div>${renderCsvPreview()}</section><section class="import-section"><div class="inline-heading"><h3>通知</h3></div><form id="notification-import-form" class="form-stack"><textarea class="textarea" name="raw_text" rows="4" placeholder="通知本文" required></textarea><button class="button secondary-button" type="submit">確認へ追加</button></form></section></div><section class="review-section" aria-labelledby="review-title"><div class="inline-heading"><h3 id="review-title">確認待ち</h3></div><div class="review-list">${renderImportReview(project, projectIds, includeGmail)}</div></section>${renderOcrFeedbackSettings()}</section>`;
 }
 
 function renderCalendarImports() {
@@ -1697,6 +1725,44 @@ function sourceProfile(sourceType) {
   return "generic";
 }
 
+function safeOcrEvidence(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const box = Array.isArray(value.bounding_box) && value.bounding_box.length === 4
+    ? value.bounding_box.map(Number).filter((entry) => Number.isFinite(entry) && entry >= 0 && entry <= 1)
+    : [];
+  return {
+    source_id: String(value.source_id ?? value.source_line_ids?.[0] ?? "").slice(0, 64),
+    source_text: String(value.source_text || "").slice(0, 500),
+    bounding_box: box.length === 4 ? box : null,
+    confidence: Math.max(0, Math.min(1, Number(value.confidence) || 0)),
+    preprocessing: String(value.preprocessing || "default").slice(0, 100),
+  };
+}
+
+function receiptOcrMetadata(result) {
+  const evidence = {};
+  for (const field of ["store_name", "total_amount", "paid_at", "paid_time"]) {
+    const safe = safeOcrEvidence(result.field_evidence?.[field]);
+    if (safe) evidence[field] = safe;
+  }
+  return {
+    ocr_result_id: String(result.ocr_result_id || "").slice(0, 128),
+    feedback_write_enabled: result.feedback_write_enabled !== false,
+    ocr_model: String(result.ocr_engine_version || result.model || "receipt-ocr").slice(0, 100),
+    rule_engine_version: String(result.rule_engine_version || "").slice(0, 100),
+    original: {
+      store_name: result.store_name || null,
+      total_amount: Number.isSafeInteger(Number(result.total_amount)) ? Number(result.total_amount) : null,
+      paid_at: result.paid_at || result.occurred_at || null,
+      paid_time: result.paid_time || null,
+      items: (result.items || []).slice(0, 30).map((item, index) => ({ source_id: String(item.source_id || `item:${index}`).slice(0, 64), name: String(item.name || "").slice(0, 200), amount: integer(item.amount) })),
+    },
+    confirmed_items: (result.items || []).slice(0, 30).map((item, index) => ({ source_id: String(item.source_id || `item:${index}`).slice(0, 64), name: String(item.name || "").slice(0, 200), amount: integer(item.amount) })),
+    confirmed_paid_time: result.paid_time || null,
+    field_evidence: evidence,
+  };
+}
+
 function addCsvImports(project) {
   const preview = ui.csvPreview;
   if (!preview) return;
@@ -1721,24 +1787,25 @@ function addCsvImports(project) {
 
 function importRecordFromReceipt(projectId, result) {
   const timestamp = now();
+  const ocr = receiptOcrMetadata(result);
   return {
     id: makeId("imp"),
     project_id: projectId,
     transaction_id: null,
     source_type: "receipt",
-    source_record_id: `receipt:${stableHash(`${result.store_name}:${result.total_amount}:${timestamp}`)}`,
+    source_record_id: ocr.ocr_result_id ? `receipt:${ocr.ocr_result_id}` : `receipt:${stableHash(`${result.store_name}:${result.total_amount}:${timestamp}`)}`,
     source_status: "review",
     merchant_raw: result.store_name || "レシート",
     merchant_normalized: normalizeMerchant(result.store_name || "レシート"),
     gross_amount_raw: integer(result.total_amount),
     paid_amount_raw: integer(result.total_amount),
-    occurred_at_raw: result.occurred_at || today(),
+    occurred_at_raw: result.paid_at || result.occurred_at || today(),
     settled_at_raw: null,
     payment_method_raw: result.payment_method || null,
     external_transaction_id: null,
     image_url: null,
-    raw_text: result.raw_text || null,
-    raw_payload: JSON.stringify({ items: result.items || [], notes: result.notes || null }),
+    raw_text: null,
+    raw_payload: JSON.stringify({ items: result.items || [], notes: result.notes || null, ocr }),
     parse_confidence: Number.isFinite(result.confidence) ? result.confidence : null,
     parser_version: result.model || "receipt-ocr",
     match_score: null,
@@ -1750,6 +1817,9 @@ function importRecordFromReceipt(projectId, result) {
 
 function addReceiptImport(project, result) {
   const record = importRecordFromReceipt(project.id, result);
+  const resultId = receiptOcrPayload(record)?.ocr_result_id;
+  const feedbackToken = String(result.feedback_token || "");
+  if (resultId && /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/u.test(feedbackToken)) ocrFeedbackTokens.set(resultId, feedbackToken);
   const next = cloneState();
   next.import_records.push(record);
   touchProject(next, project.id);
@@ -1763,7 +1833,7 @@ function addReceiptImport(project, result) {
         paid_amount_raw: record.paid_amount_raw,
         gross_amount_raw: record.gross_amount_raw,
         occurred_at_raw: record.occurred_at_raw,
-        raw_payload: { items: result.items || [], notes: result.notes || null },
+        raw_payload: JSON.parse(record.raw_payload),
         parse_confidence: record.parse_confidence,
         parser_version: record.parser_version,
       });
@@ -1841,8 +1911,72 @@ function paymentMethodFromImport(record) {
         : record.source_type === "bank_csv" ? "bank" : "other";
 }
 
+function ocrFeedbackFromRecord(record, transactionIdValue) {
+  const ocr = receiptOcrPayload(record);
+  const feedbackToken = ocrFeedbackTokens.get(ocr?.ocr_result_id);
+  if (!feedbackToken || !ocr?.original) return null;
+  return {
+    transaction_id: transactionIdValue,
+    feedback_token: feedbackToken,
+    confirmed: {
+      store_name: record.merchant_raw || null,
+      total_amount: integer(record.paid_amount_raw ?? record.gross_amount_raw) || null,
+      paid_at: record.occurred_at_raw || null,
+      paid_time: ocr.confirmed_paid_time || null,
+      items: (Array.isArray(ocr.confirmed_items) ? ocr.confirmed_items : ocr.original.items || []).map((item, index) => ({
+        source_id: item.source_id || `item:${index}`,
+        name: item.name,
+        amount: item.amount,
+      })),
+    },
+  };
+}
+
+function updateOcrImportField(recordId, field, value) {
+  const record = state.import_records.find((row) => row.id === recordId && row.source_type === "receipt");
+  if (!record) return;
+  if (field === "merchant_raw") {
+    record.merchant_raw = String(value).slice(0, 200);
+    record.merchant_normalized = normalizeMerchant(record.merchant_raw);
+  } else if (field === "paid_amount_raw") {
+    record.paid_amount_raw = integer(value);
+    record.gross_amount_raw = integer(value);
+  } else if (field === "occurred_at_raw") {
+    record.occurred_at_raw = String(value).slice(0, 10);
+  } else if (field === "paid_time") {
+    const payload = JSON.parse(record.raw_payload || "{}");
+    if (payload.ocr) payload.ocr.confirmed_paid_time = String(value).slice(0, 5);
+    record.raw_payload = JSON.stringify(payload);
+  } else if (/^item_(name|amount):\d+$/u.test(field)) {
+    const payload = JSON.parse(record.raw_payload || "{}");
+    const [kind, indexText] = field.split(":");
+    const item = payload.ocr?.confirmed_items?.[Number(indexText)];
+    if (item) item[kind === "item_name" ? "name" : "amount"] = kind === "item_name" ? String(value).slice(0, 200) : integer(value);
+    record.raw_payload = JSON.stringify(payload);
+  }
+  record.updated_at = now();
+  saveLocal();
+}
+
+async function loadOcrFeedbackCount() {
+  if (!isCloud || ui.ocrFeedback.loading) return;
+  ui.ocrFeedback.loading = true;
+  render();
+  try {
+    const result = await Api.getOcrCorrectionCount();
+    ui.ocrFeedback.count = integer(result.correction_count);
+  } catch (error) {
+    toast(`OCR修正履歴を取得できませんでした: ${error.message}`);
+  } finally {
+    ui.ocrFeedback.loading = false;
+    render();
+  }
+}
+
 function createFromImport(project, record) {
   const transactionIdValue = makeId("txn");
+  const feedback = ocrFeedbackFromRecord(record, transactionIdValue);
+  const saveFeedback = receiptOcrPayload(record)?.feedback_write_enabled !== false;
   let next = Household.createManualHouseholdTransaction(state, project.id, {
     id: transactionIdValue,
     merchant_name: record.merchant_raw || "取込取引",
@@ -1862,7 +1996,20 @@ function createFromImport(project, record) {
   commitState(next, "仮の取引を作成しました", {
     remoteFilter: () => false,
     remoteAction: async () => {
-      await Api.reconcileImport(record.id, { action: "create", new_transaction_id: transactionIdValue });
+      await Api.reconcileImport(record.id, {
+        action: "create",
+        new_transaction_id: transactionIdValue,
+        ...(feedback ? { feedback_token: feedback.feedback_token, confirmed: feedback.confirmed } : {}),
+      });
+      if (feedback && saveFeedback) {
+        try {
+          await Api.saveOcrCorrections(feedback);
+          ocrFeedbackTokens.delete(receiptOcrPayload(record)?.ocr_result_id);
+          ui.ocrFeedback.count = null;
+        } catch {
+          toast("取引は保存されましたが、OCR修正履歴の保存に失敗しました");
+        }
+      }
       await refreshCloudProject(project.id);
     },
   });
@@ -1873,6 +2020,8 @@ function linkImport(project, record, transactionIdValue) {
     toast("既存の取引を選択してください");
     return;
   }
+  const feedback = ocrFeedbackFromRecord(record, transactionIdValue);
+  const saveFeedback = receiptOcrPayload(record)?.feedback_write_enabled !== false;
   const next = cloneState();
   const row = next.import_records.find((value) => value.id === record.id);
   row.transaction_id = transactionIdValue;
@@ -1882,7 +2031,20 @@ function linkImport(project, record, transactionIdValue) {
   commitState(next, "取引へ紐付けました", {
     remoteFilter: () => false,
     remoteAction: async () => {
-      await Api.reconcileImport(record.id, { action: "link", transaction_id: transactionIdValue });
+      await Api.reconcileImport(record.id, {
+        action: "link",
+        transaction_id: transactionIdValue,
+        ...(feedback ? { feedback_token: feedback.feedback_token, confirmed: feedback.confirmed } : {}),
+      });
+      if (feedback && saveFeedback) {
+        try {
+          await Api.saveOcrCorrections(feedback);
+          ocrFeedbackTokens.delete(receiptOcrPayload(record)?.ocr_result_id);
+          ui.ocrFeedback.count = null;
+        } catch {
+          toast("取引は保存されましたが、OCR修正履歴の保存に失敗しました");
+        }
+      }
       await refreshCloudProject(project.id);
     },
   });
@@ -2121,6 +2283,9 @@ document.addEventListener("input", (event) => {
   if (target.dataset.ocrAmount) {
     const [ocrTarget, index] = target.dataset.ocrAmount.split(":");
     if (ui.ocr[ocrTarget]?.items[index]) ui.ocr[ocrTarget].items[index].amount = integer(target.value);
+  }
+  if (target.dataset.importOcrId && target.dataset.importOcrField) {
+    updateOcrImportField(target.dataset.importOcrId, target.dataset.importOcrField, target.value);
   }
 });
 
@@ -2393,6 +2558,21 @@ document.addEventListener("click", async (event) => {
   }
   if (button.dataset.importCsv !== undefined && project) {
     addCsvImports(project);
+    return;
+  }
+  if (button.dataset.loadOcrFeedback !== undefined) {
+    await loadOcrFeedbackCount();
+    return;
+  }
+  if (button.dataset.deleteOcrFeedback !== undefined && confirm("自分のOCR修正履歴をすべて削除しますか？")) {
+    try {
+      await Api.deleteOcrCorrections();
+      ui.ocrFeedback.count = 0;
+      toast("OCR修正履歴を削除しました");
+      render();
+    } catch (error) {
+      toast(`OCR修正履歴を削除できませんでした: ${error.message}`);
+    }
     return;
   }
   if (button.dataset.createFromImport && project) {

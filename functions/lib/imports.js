@@ -452,6 +452,7 @@ async function insertImport(db, record) {
 }
 
 async function linkImport(db, importRecord, details) {
+  importRecord = confirmedOcrImportRecord(importRecord, details);
   const transactionId = requiredString(details.transaction_id ?? details.transactionId, "transactionId");
   const transaction = await firstRow(db, "SELECT * FROM transactions WHERE id = ?", [transactionId]);
   if (!transaction) throw new Error("Transaction not found");
@@ -461,10 +462,18 @@ async function linkImport(db, importRecord, details) {
   await runStatement(
     db,
     `UPDATE import_records
-     SET transaction_id = ?, source_status = 'linked', match_score = ?, match_reason_json = ?, updated_at = ?
+     SET transaction_id = ?, source_status = 'linked', merchant_raw = ?, merchant_normalized = ?,
+         gross_amount_raw = ?, paid_amount_raw = ?, occurred_at_raw = ?, raw_payload = ?,
+         match_score = ?, match_reason_json = ?, updated_at = ?
      WHERE id = ?`,
     [
       transactionId,
+      importRecord.merchant_raw,
+      importRecord.merchant_normalized,
+      importRecord.gross_amount_raw,
+      importRecord.paid_amount_raw,
+      importRecord.occurred_at_raw,
+      importRecord.raw_payload,
       integerValue(details.match_score ?? details.matchScore, importRecord.match_score),
       reason,
       currentTime(details),
@@ -486,6 +495,7 @@ async function linkImport(db, importRecord, details) {
 }
 
 async function createTransactionForImport(db, importRecord, details) {
+  importRecord = confirmedOcrImportRecord(importRecord, details);
   if (importRecord.transaction_id) {
     const transaction = await firstRow(db, "SELECT * FROM transactions WHERE id = ?", [importRecord.transaction_id]);
     return importResult(importRecord, {
@@ -591,10 +601,18 @@ async function createTransactionForImport(db, importRecord, details) {
     boundStatement(
       db,
       `UPDATE import_records
-       SET transaction_id = ?, source_status = 'linked', match_score = ?, match_reason_json = ?, updated_at = ?
+       SET transaction_id = ?, source_status = 'linked', merchant_raw = ?, merchant_normalized = ?,
+           gross_amount_raw = ?, paid_amount_raw = ?, occurred_at_raw = ?, raw_payload = ?,
+           match_score = ?, match_reason_json = ?, updated_at = ?
        WHERE id = ?`,
       [
         transactionId,
+        importRecord.merchant_raw,
+        importRecord.merchant_normalized,
+        importRecord.gross_amount_raw,
+        importRecord.paid_amount_raw,
+        importRecord.occurred_at_raw,
+        importRecord.raw_payload,
         integerValue(details.match_score, null),
         jsonValue(details.match_reason_json, null),
         now,
@@ -612,6 +630,27 @@ async function createTransactionForImport(db, importRecord, details) {
     candidates: details.candidates || [],
     transaction: createdTransaction,
   });
+}
+
+function confirmedOcrImportRecord(importRecord, details) {
+  const confirmed = details?.confirmed_ocr;
+  if (!confirmed || importRecord.source_type !== "receipt") return importRecord;
+  const merchantRaw = optionalString(confirmed.store_name) || importRecord.merchant_raw;
+  const paidAmount = integerAmount(confirmed.total_amount) ?? importRecord.paid_amount_raw;
+  const occurredAt = normalizeDate(confirmed.paid_at) || importRecord.occurred_at_raw;
+  const payload = payloadObject(importRecord.raw_payload);
+  const ocr = payload.ocr && typeof payload.ocr === "object" && !Array.isArray(payload.ocr) ? { ...payload.ocr } : {};
+  if (confirmed.paid_time) ocr.confirmed_paid_time = confirmed.paid_time;
+  if (Array.isArray(confirmed.items)) ocr.confirmed_items = confirmed.items;
+  return {
+    ...importRecord,
+    merchant_raw: merchantRaw,
+    merchant_normalized: normalizeMerchantName(merchantRaw),
+    gross_amount_raw: paidAmount,
+    paid_amount_raw: paidAmount,
+    occurred_at_raw: occurredAt,
+    raw_payload: JSON.stringify({ ...payload, ocr }),
+  };
 }
 
 async function detachImport(db, importRecord, sourceStatus, details) {

@@ -522,6 +522,9 @@ function createApiClient(options = {}) {
   const startGoogleLogin = () => request("/auth/google/start", { method: "POST" });
   const logout = () => request("/auth/logout", { method: "POST" });
   const deleteAccount = () => request("/account", { method: "DELETE" });
+  const getOcrCorrectionCount = () => request("/ocr-corrections");
+  const saveOcrCorrections = (payload) => request("/ocr-corrections", { method: "POST", json: payload });
+  const deleteOcrCorrections = () => request("/ocr-corrections", { method: "DELETE" });
   const readReceipt = (imageDataUrl) => request("/ocr-receipt", {
     method: "POST",
     json: typeof imageDataUrl === "object" ? imageDataUrl : { image_data_url: imageDataUrl },
@@ -699,6 +702,9 @@ function createApiClient(options = {}) {
     startGoogleLogin,
     logout,
     deleteAccount,
+    getOcrCorrectionCount,
+    saveOcrCorrections,
+    deleteOcrCorrections,
     readReceipt,
     mutateRow,
     applyRowMutation: mutateRow,
