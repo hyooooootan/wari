@@ -495,7 +495,15 @@ function createApiClient(options = {}) {
     const options = limitOrOptions && typeof limitOrOptions === "object" ? limitOrOptions : { limit: limitOrOptions };
     return request(`/gmail/connections/${encoded(connectionId)}/sync`, { method: "POST", json: { days, ...options } });
   };
-  const listGmailCandidates = (status) => request("/gmail/candidates", { query: status ? { status } : undefined });
+  const listGmailCandidates = (status, range = {}) => request("/gmail/candidates", { query: {
+    ...(status ? { status } : {}),
+    ...(range.from_date ? { from_date: range.from_date } : {}),
+    ...(range.to_date ? { to_date: range.to_date } : {}),
+  } });
+  const bulkGmailCandidates = (action, candidateIds) => request("/gmail/candidates/bulk", {
+    method: "POST",
+    json: { action, candidate_ids: candidateIds },
+  });
   const updateGmailCandidate = (candidateId, values) => request(`/gmail/candidates/${encoded(candidateId)}`, { method: "PATCH", json: values });
   const importGmailCandidate = (candidateId) => request(`/gmail/candidates/${encoded(candidateId)}/import`, { method: "POST", json: {} });
   const updateImportRecord = (importId, row = {}) => {
@@ -522,10 +530,6 @@ function createApiClient(options = {}) {
   const startGoogleLogin = () => request("/auth/google/start", { method: "POST" });
   const logout = () => request("/auth/logout", { method: "POST" });
   const deleteAccount = () => request("/account", { method: "DELETE" });
-  const getOcrCorrectionCount = () => request("/ocr-corrections");
-  const saveOcrCorrections = (payload) => request("/ocr-corrections", { method: "POST", json: payload });
-  const retryOcrCorrections = (importId) => request("/ocr-corrections", { method: "POST", json: { retry_pending: true, import_id: importId } });
-  const deleteOcrCorrections = () => request("/ocr-corrections", { method: "DELETE" });
   const readReceipt = (imageDataUrl) => request("/ocr-receipt", {
     method: "POST",
     json: typeof imageDataUrl === "object" ? imageDataUrl : { image_data_url: imageDataUrl },
@@ -688,6 +692,7 @@ function createApiClient(options = {}) {
     disconnectGmail,
     syncGmail,
     listGmailCandidates,
+    bulkGmailCandidates,
     updateGmailCandidate,
     importGmailCandidate,
     getProjectSummaries,
@@ -703,10 +708,6 @@ function createApiClient(options = {}) {
     startGoogleLogin,
     logout,
     deleteAccount,
-    getOcrCorrectionCount,
-    saveOcrCorrections,
-    retryOcrCorrections,
-    deleteOcrCorrections,
     readReceipt,
     mutateRow,
     applyRowMutation: mutateRow,

@@ -70,9 +70,10 @@ let savingCount = 0;
 let activeProjectId = null;
 let lastToastTimer = 0;
 let remoteSyncQueue = Promise.resolve();
-const gmailUi = { connections: [], candidates: [] };
+const gmailUi = { connections: [], candidates: [], total_count: 0, has_more: false, from_date: gmailDefaultFromDate(), to_date: gmailDefaultToDate() };
 const gmailSyncing = new Set();
 const gmailSyncProgress = new Map();
+const gmailSelected = new Set();
 const shareTokensByProject = new Map();
 const ui = {
   createMode: null,
@@ -100,9 +101,7 @@ const ui = {
     createSplit: { status: "", type: "", items: [] },
     split: { status: "", type: "", items: [] },
   },
-  ocrFeedback: { count: null, loading: false },
 };
-const ocrFeedbackTokens = new Map();
 
 function now() {
   return new Date().toISOString();
@@ -131,6 +130,24 @@ function esc(value) {
 function integer(value) {
   const number = Number(value ?? 0);
   return Number.isFinite(number) ? Math.round(number) : 0;
+}
+
+function entryTypeForAmount(amount, currentType = "purchase") {
+  if (!["purchase", "refund"].includes(currentType)) return currentType;
+  return integer(amount) < 0 ? "refund" : "purchase";
+}
+
+function includedLedgerTransaction(transaction) {
+  const status = String(transaction?.status || "").toLowerCase();
+  if (status === "cancelled") return false;
+  return status !== "refunded" || transaction?.entry_type === "refund";
+}
+
+function confirmedLedgerTransaction(transaction) {
+  const status = String(transaction?.status || "").toLowerCase();
+  const type = String(transaction?.entry_type || "").toLowerCase();
+  const includedStatus = status === "confirmed" || status === "corrected" || status === "refunded" && type === "refund";
+  return includedStatus && ["purchase", "split_expense", "refund", "adjustment"].includes(type);
 }
 
 function yen(value) {
@@ -207,7 +224,7 @@ function gmailSyncTotalsMessage(totals) {
 }
 
 function renderGmailProgress() {
-  const section = document.querySelector(".import-section");
+  const section = [...document.querySelectorAll(".import-section")].find((row) => row.querySelector("[data-gmail-sync],[data-gmail-candidate-form],[data-gmail-connect]"));
   if (!section) return;
   let element = section.querySelector("[data-gmail-progress]");
   if (!element) {
@@ -223,8 +240,63 @@ function renderGmailProgress() {
     : "Gmail取込対象: 三井住友カード";
 }
 
+function renderGmailCandidateControls() {
+  const section = [...document.querySelectorAll(".import-section")].find((row) => row.querySelector("[data-gmail-sync],[data-gmail-candidate-form],[data-gmail-connect]"));
+  if (!section) return;
+  let controls = section.querySelector("[data-gmail-period-controls]");
+  if (!controls) {
+    controls = document.createElement("div");
+    controls.dataset.gmailPeriodControls = "true";
+    controls.className = "form-panel form-stack";
+    controls.innerHTML = '<div class="field-grid"><label class="field">開始日<input class="input" type="date" data-gmail-from-date></label><label class="field">終了日<input class="input" type="date" data-gmail-to-date></label></div><p>取引日時はメール受信時刻を使用します</p><p>検索対象: 三井住友カード</p>';
+    section.prepend(controls);
+  }
+  controls.querySelector("[data-gmail-from-date]").value = gmailUi.from_date;
+  controls.querySelector("[data-gmail-to-date]").value = gmailUi.to_date;
+  let toolbar = section.querySelector("[data-gmail-candidate-toolbar]");
+  if (!toolbar) {
+    toolbar = document.createElement("div");
+    toolbar.dataset.gmailCandidateToolbar = "true";
+    toolbar.className = "review-actions";
+    section.insertBefore(toolbar, section.querySelector("[data-gmail-period-controls]").nextSibling);
+  }
+  const selected = gmailUi.candidates.filter((row) => gmailSelected.has(row.id));
+  const applicable = selected.filter((row) => row.status === "ready" && String(row.merchant_name || "").trim() && Number.isSafeInteger(row.amount) && row.amount !== 0 && row.occurred_at);
+  const needsReview = selected.length - applicable.length;
+  const amount = applicable.reduce((sum, row) => sum + Number(row.amount), 0);
+  toolbar.innerHTML = `<span>選択: ${selected.length}件 / ${yen(amount)}、適用可能: ${applicable.length}件、確認が必要: ${needsReview}件</span><button class="small-button" type="button" data-gmail-select-all>表示中をすべて選択</button><button class="small-button" type="button" data-gmail-clear-selection>選択解除</button><button class="small-button household-small" type="button" data-gmail-bulk-import ${applicable.length ? "" : "disabled"}>一括適用</button><button class="small-button" type="button" data-gmail-bulk-ignore ${selected.length ? "" : "disabled"}>一括破棄</button><span>表示: ${gmailUi.candidates.length} / ${gmailUi.total_count}${gmailUi.has_more ? "（続きあり）" : ""}</span>`;
+  for (const form of section.querySelectorAll("[data-gmail-candidate-form]")) {
+    const id = form.dataset.gmailCandidateForm;
+    let checkbox = form.querySelector("[data-gmail-select]");
+    if (!checkbox) {
+      checkbox = document.createElement("input");
+      checkbox.type = "checkbox";
+      checkbox.dataset.gmailSelect = id;
+      checkbox.setAttribute("aria-label", "候補を選択");
+      form.prepend(checkbox);
+    }
+    checkbox.checked = gmailSelected.has(id);
+  }
+}
+
+function gmailDefaultToDate() {
+  return new Date().toLocaleDateString("sv-SE", { timeZone: "Asia/Tokyo" });
+}
+
+function gmailDefaultFromDate() {
+  return `${gmailDefaultToDate().slice(0, 8)}01`;
+}
+
+function validGmailDateRange(fromDate, toDate) {
+  if (!/^\d{4}-\d{2}-\d{2}$/u.test(fromDate) || !/^\d{4}-\d{2}-\d{2}$/u.test(toDate)) return false;
+  const start = Date.parse(`${fromDate}T00:00:00+09:00`);
+  const end = Date.parse(`${toDate}T00:00:00+09:00`);
+  return Number.isFinite(start) && Number.isFinite(end) && end >= start && end - start <= 89 * 86400000;
+}
+
 async function syncGmailImport(connectionId, days) {
   if (gmailSyncing.has(connectionId)) return;
+  if (!validGmailDateRange(gmailUi.from_date, gmailUi.to_date)) { toast("Gmail同期期間は90日以内で、開始日を終了日以前にしてください"); return; }
   gmailSyncing.add(connectionId);
   render();
   const syncButton = document.querySelector(`[data-gmail-sync="${CSS.escape(connectionId)}"]`);
@@ -234,12 +306,14 @@ async function syncGmailImport(connectionId, days) {
   renderGmailProgress();
   let pageToken = null;
   let queryAfter = null;
+  let queryBefore = null;
   let lastRun = { status: "completed" };
   try {
     for (let page = 0; page < 25 && totals.listed_count < 1000; page += 1) {
-      const options = { batch_size: 40 };
+      const options = { batch_size: 40, from_date: gmailUi.from_date, to_date: gmailUi.to_date };
       if (pageToken) options.page_token = pageToken;
       if (queryAfter !== null) options.query_after = queryAfter;
+      if (queryBefore !== null) options.query_before = queryBefore;
       const result = await Api.syncGmail(connectionId, days, options);
       lastRun = result?.run || { status: "failed", error_code: "gmail_sync_error" };
       totals.listed_count += Number(result?.listed_count ?? lastRun.listed_count ?? 0);
@@ -250,6 +324,7 @@ async function syncGmailImport(connectionId, days) {
       totals.error_count += Number(result?.error_count ?? lastRun.error_count ?? 0);
       gmailSyncProgress.set(connectionId, { ...totals });
       if (queryAfter === null && result?.query_after !== undefined) queryAfter = result.query_after;
+      if (queryBefore === null && result?.query_before !== undefined) queryBefore = result.query_before;
       if (lastRun.status !== "completed") {
         toast(gmailSyncMessage(lastRun, totals));
         return;
@@ -269,6 +344,7 @@ async function syncGmailImport(connectionId, days) {
   } finally {
     gmailSyncing.delete(connectionId);
     gmailSyncProgress.delete(connectionId);
+    gmailSelected.clear();
     await refreshGmailImport();
     render();
     const refreshedButton = document.querySelector(`[data-gmail-sync="${CSS.escape(connectionId)}"]`);
@@ -541,7 +617,7 @@ function latestProjectUpdate(project) {
 }
 
 function projectSummary(project) {
-  const transactions = transactionsFor(project.id).filter((row) => !["cancelled", "refunded"].includes(row.status));
+  const transactions = transactionsFor(project.id).filter(includedLedgerTransaction);
   if (project.project_type === "split") {
     return {
       count: project.transaction_count ?? project.expense_count ?? transactions.length,
@@ -575,6 +651,11 @@ function statusTag(status) {
   return `<span class="status-tag status-${esc(normalized)}">${esc(STATUS_LABELS[normalized])}</span>`;
 }
 
+function transactionStatusTags(transaction) {
+  const refund = transaction?.entry_type === "refund" && transaction?.status !== "refunded" ? statusTag("refunded") : "";
+  return `${refund}${statusTag(transaction?.status)}`;
+}
+
 function projectRow(project) {
   const summary = projectSummary(project);
   const updated = latestProjectUpdate(project);
@@ -597,7 +678,7 @@ function calendarTransactions() {
   const projectIds = new Set(project ? [project.id] : []);
   return state.transactions
     .filter((transaction) => projectIds.has(transaction.project_id)
-      && !["cancelled", "refunded"].includes(transaction.status)
+      && includedLedgerTransaction(transaction)
       && ["purchase", "split_expense", "refund", "adjustment"].includes(transaction.entry_type))
     .sort((left, right) => String(right.occurred_at).localeCompare(String(left.occurred_at)) || String(right.created_at).localeCompare(String(left.created_at)));
 }
@@ -617,7 +698,7 @@ function calendarMonthLabel() {
 function renderCalendarTransactionRow(transaction) {
   const generated = transaction.generated_automatically === 1;
   const origin = generated ? `<span class="origin-label">割り勘から</span>` : "";
-  return `<button class="transaction-row" type="button" data-open-calendar-transaction="${esc(transaction.id)}"><span class="transaction-date">${esc(dateValue(transaction.occurred_at).slice(5).replace("-", "/"))}</span><span class="transaction-main"><span><strong>${esc(transaction.merchant_name)}</strong>${origin}${statusTag(transaction.status)}</span><small>${esc(transaction.category || "未分類")}</small></span><strong class="transaction-amount">${esc(yen(transaction.paid_amount))}</strong><span class="row-chevron" aria-hidden="true">›</span></button>`;
+  return `<button class="transaction-row" type="button" data-open-calendar-transaction="${esc(transaction.id)}"><span class="transaction-date">${esc(dateValue(transaction.occurred_at).slice(5).replace("-", "/"))}</span><span class="transaction-main"><span><strong>${esc(transaction.merchant_name)}</strong>${origin}${transactionStatusTags(transaction)}</span><small>${esc(transaction.category || "未分類")}</small></span><strong class="transaction-amount">${esc(yen(transaction.paid_amount))}</strong><span class="row-chevron" aria-hidden="true">›</span></button>`;
 }
 
 function renderCalendarTabs() {
@@ -627,7 +708,7 @@ function renderCalendarTabs() {
 function renderCalendarEntryForm(project) {
   if (!ui.calendarEntryOpen || !project) return "";
   const owner = membersFor(project.id, true)[0];
-  return `<form id="calendar-entry-form" class="form-panel form-stack calendar-entry-form"><div class="form-panel-head"><h3>支出を追加</h3><button class="icon-button" type="button" data-close-calendar-entry aria-label="閉じる">×</button></div><div class="field"><label for="calendar-merchant">店名</label><input id="calendar-merchant" class="input" name="merchant_name" placeholder="店名" required></div><div class="field-grid"><div class="field"><label for="calendar-amount">金額</label><input id="calendar-amount" class="input" name="paid_amount" type="number" inputmode="numeric" min="0" required></div><div class="field"><label for="calendar-date">日付</label><input id="calendar-date" class="input" name="occurred_at" type="date" value="${esc(ui.calendarDay)}" required></div></div><div class="field-grid"><div class="field"><label for="calendar-category">分類</label><input id="calendar-category" class="input" name="category" placeholder="食費"></div><div class="field"><label for="calendar-method">支払方法</label><select id="calendar-method" name="payment_method">${paymentMethodOptions()}</select></div></div><input type="hidden" name="payer_member_id" value="${esc(owner?.id || "")}"><div class="field-grid"><div class="field"><label for="calendar-status">状態</label><select id="calendar-status" name="status"><option value="confirmed">確定</option><option value="provisional">仮</option></select></div><div class="field"><label for="calendar-note">メモ</label><input id="calendar-note" class="input" name="note"></div></div><button class="button household-button" type="submit" ${owner ? "" : "disabled"}>追加</button></form>`;
+  return `<form id="calendar-entry-form" class="form-panel form-stack calendar-entry-form"><div class="form-panel-head"><h3>支出を追加</h3><button class="icon-button" type="button" data-close-calendar-entry aria-label="閉じる">×</button></div><div class="field"><label for="calendar-merchant">店名</label><input id="calendar-merchant" class="input" name="merchant_name" placeholder="店名" required></div><div class="field-grid"><div class="field"><label for="calendar-amount">金額</label><input id="calendar-amount" class="input" name="paid_amount" type="number" inputmode="numeric" step="1" required><small>返金はマイナスで入力</small></div><div class="field"><label for="calendar-date">日付</label><input id="calendar-date" class="input" name="occurred_at" type="date" value="${esc(ui.calendarDay)}" required></div></div><div class="field-grid"><div class="field"><label for="calendar-category">分類</label><input id="calendar-category" class="input" name="category" placeholder="食費"></div><div class="field"><label for="calendar-method">支払方法</label><select id="calendar-method" name="payment_method">${paymentMethodOptions()}</select></div></div><input type="hidden" name="payer_member_id" value="${esc(owner?.id || "")}"><div class="field-grid"><div class="field"><label for="calendar-status">状態</label><select id="calendar-status" name="status"><option value="confirmed">確定</option><option value="provisional">仮</option></select></div><div class="field"><label for="calendar-note">メモ</label><input id="calendar-note" class="input" name="note"></div></div><button class="button household-button" type="submit" ${owner ? "" : "disabled"}>追加</button></form>`;
 }
 
 function renderHouseholdCalendar() {
@@ -698,7 +779,7 @@ function renderCreateDialog() {
 
 function renderCreateSplitForm() {
   const payerOptions = ui.draftNames.map((name, index) => `<option value="${index}" ${String(index) === String(ui.drafts.createSplit.payer) ? "selected" : ""}>${esc(name)}</option>`).join("");
-  return `<form id="create-split-form" class="form-stack"><div class="field"><label for="new-split-name">名前</label><input id="new-split-name" class="input" name="name" data-draft-scope="createSplit" data-draft-field="name" value="${draftValue("createSplit", "name")}" placeholder="7月の旅行"></div><div class="field"><label for="draft-participant">参加者</label><div class="input-action"><input id="draft-participant" class="input" data-draft-scope="createSplit" data-draft-field="participant" value="${draftValue("createSplit", "participant")}" placeholder="名前" autocomplete="off"><button class="icon-button add-button" type="button" data-add-draft-name aria-label="参加者を追加">＋</button></div><div class="name-chips">${renderDraftNames()}</div></div><fieldset class="form-group"><legend>最初のお店</legend><div class="field-grid"><div class="field"><label for="new-split-store">店名</label><input id="new-split-store" class="input" name="store" data-draft-scope="createSplit" data-draft-field="store" value="${draftValue("createSplit", "store")}" placeholder="店名"></div><div class="field"><label for="new-split-amount">金額</label><input id="new-split-amount" class="input" name="amount" type="number" inputmode="numeric" min="1" data-draft-scope="createSplit" data-draft-field="amount" value="${draftValue("createSplit", "amount")}" placeholder="0"></div></div><div class="field-grid"><div class="field"><label for="new-split-date">日付</label><input id="new-split-date" class="input" name="occurred_at" type="date" data-draft-scope="createSplit" data-draft-field="occurred_at" value="${draftValue("createSplit", "occurred_at")}"></div><div class="field"><label for="new-split-payer">支払者</label><select id="new-split-payer" name="payer" data-draft-scope="createSplit" data-draft-field="payer" ${ui.draftNames.length ? "" : "disabled"}><option value="">選択</option>${payerOptions}</select></div></div>${renderOcrBox("createSplit")}</fieldset><button class="button primary-button" type="submit">作成</button></form>`;
+  return `<form id="create-split-form" class="form-stack"><div class="field"><label for="new-split-name">名前</label><input id="new-split-name" class="input" name="name" data-draft-scope="createSplit" data-draft-field="name" value="${draftValue("createSplit", "name")}" placeholder="7月の旅行"></div><div class="field"><label for="draft-participant">参加者</label><div class="input-action"><input id="draft-participant" class="input" data-draft-scope="createSplit" data-draft-field="participant" value="${draftValue("createSplit", "participant")}" placeholder="名前" autocomplete="off"><button class="icon-button add-button" type="button" data-add-draft-name aria-label="参加者を追加">＋</button></div><div class="name-chips">${renderDraftNames()}</div></div><fieldset class="form-group"><legend>最初のお店</legend><div class="field-grid"><div class="field"><label for="new-split-store">店名</label><input id="new-split-store" class="input" name="store" data-draft-scope="createSplit" data-draft-field="store" value="${draftValue("createSplit", "store")}" placeholder="店名"></div><div class="field"><label for="new-split-amount">金額</label><input id="new-split-amount" class="input" name="amount" type="number" inputmode="numeric" step="1" data-draft-scope="createSplit" data-draft-field="amount" value="${draftValue("createSplit", "amount")}" placeholder="0"><small>返金はマイナスで入力</small></div></div><div class="field-grid"><div class="field"><label for="new-split-date">日付</label><input id="new-split-date" class="input" name="occurred_at" type="date" data-draft-scope="createSplit" data-draft-field="occurred_at" value="${draftValue("createSplit", "occurred_at")}"></div><div class="field"><label for="new-split-payer">支払者</label><select id="new-split-payer" name="payer" data-draft-scope="createSplit" data-draft-field="payer" ${ui.draftNames.length ? "" : "disabled"}><option value="">選択</option>${payerOptions}</select></div></div>${renderOcrBox("createSplit")}</fieldset><button class="button primary-button" type="submit">作成</button></form>`;
 }
 
 function renderCreateHouseholdForm() {
@@ -753,22 +834,22 @@ function paymentMethodOptions(selected = "other") {
 function renderTransactionRow(transaction) {
   const generated = transaction.generated_automatically === 1;
   const origin = generated ? `<span class="origin-label">割り勘から</span>` : "";
-  return `<button class="transaction-row" type="button" data-open-transaction="${esc(transaction.id)}"><span class="transaction-date">${esc(dateValue(transaction.occurred_at).slice(5).replace("-", "/"))}</span><span class="transaction-main"><span><strong>${esc(transaction.merchant_name)}</strong>${origin}${statusTag(transaction.status)}</span><small>${esc(transaction.category || "未分類")}${generated ? ` ・ ${esc(projectName(transaction.origin_project_id))}` : ""}</small></span><strong class="transaction-amount">${esc(yen(transaction.paid_amount))}</strong><span class="row-chevron" aria-hidden="true">›</span></button>`;
+  return `<button class="transaction-row" type="button" data-open-transaction="${esc(transaction.id)}"><span class="transaction-date">${esc(dateValue(transaction.occurred_at).slice(5).replace("-", "/"))}</span><span class="transaction-main"><span><strong>${esc(transaction.merchant_name)}</strong>${origin}${transactionStatusTags(transaction)}</span><small>${esc(transaction.category || "未分類")}${generated ? ` ・ ${esc(projectName(transaction.origin_project_id))}` : ""}</small></span><strong class="transaction-amount">${esc(yen(transaction.paid_amount))}</strong><span class="row-chevron" aria-hidden="true">›</span></button>`;
 }
 
 function renderSplitTransactions(project) {
   const transactions = transactionsFor(project.id).sort((left, right) => String(right.occurred_at).localeCompare(String(left.occurred_at)));
   const activeMembers = membersFor(project.id, true);
   const form = project.finalized_at ? `<div class="notice">再開するとお店を変更できます</div>` : ui.showSplitForm
-    ? `<form id="add-split-transaction-form" class="form-panel form-stack"><div class="form-panel-head"><h3>お店を追加</h3><button class="icon-button" type="button" data-close-split-form aria-label="閉じる">×</button></div><div class="field"><label for="split-store">店名</label><input id="split-store" class="input" name="store" data-draft-scope="split" data-draft-field="store" value="${draftValue("split", "store")}" placeholder="店名" required></div><div class="field-grid"><div class="field"><label for="split-amount">金額</label><input id="split-amount" class="input" name="amount" type="number" inputmode="numeric" min="1" data-draft-scope="split" data-draft-field="amount" value="${draftValue("split", "amount")}" required></div><div class="field"><label for="split-date">日付</label><input id="split-date" class="input" name="occurred_at" type="date" data-draft-scope="split" data-draft-field="occurred_at" value="${draftValue("split", "occurred_at")}" required></div></div><div class="field-grid"><div class="field"><label for="split-payer">最初の支払者</label><select id="split-payer" name="payer" data-draft-scope="split" data-draft-field="payer" required><option value="">選択</option>${memberOptions(project.id, ui.drafts.split.payer, true)}</select></div><div class="field"><label for="split-status">状態</label><select id="split-status" name="status" data-draft-scope="split" data-draft-field="status"><option value="confirmed" ${ui.drafts.split.status === "confirmed" ? "selected" : ""}>確定</option><option value="provisional" ${ui.drafts.split.status === "provisional" ? "selected" : ""}>仮</option></select></div></div>${renderOcrBox("split")}<button class="button primary-button" type="submit" ${activeMembers.length ? "" : "disabled"}>追加</button></form>`
+    ? `<form id="add-split-transaction-form" class="form-panel form-stack"><div class="form-panel-head"><h3>お店を追加</h3><button class="icon-button" type="button" data-close-split-form aria-label="閉じる">×</button></div><div class="field"><label for="split-store">店名</label><input id="split-store" class="input" name="store" data-draft-scope="split" data-draft-field="store" value="${draftValue("split", "store")}" placeholder="店名" required></div><div class="field-grid"><div class="field"><label for="split-amount">金額</label><input id="split-amount" class="input" name="amount" type="number" inputmode="numeric" step="1" data-draft-scope="split" data-draft-field="amount" value="${draftValue("split", "amount")}" required><small>返金はマイナスで入力</small></div><div class="field"><label for="split-date">日付</label><input id="split-date" class="input" name="occurred_at" type="date" data-draft-scope="split" data-draft-field="occurred_at" value="${draftValue("split", "occurred_at")}" required></div></div><div class="field-grid"><div class="field"><label for="split-payer">最初の支払者</label><select id="split-payer" name="payer" data-draft-scope="split" data-draft-field="payer" required><option value="">選択</option>${memberOptions(project.id, ui.drafts.split.payer, true)}</select></div><div class="field"><label for="split-status">状態</label><select id="split-status" name="status" data-draft-scope="split" data-draft-field="status"><option value="confirmed" ${ui.drafts.split.status === "confirmed" ? "selected" : ""}>確定</option><option value="provisional" ${ui.drafts.split.status === "provisional" ? "selected" : ""}>仮</option></select></div></div>${renderOcrBox("split")}<button class="button primary-button" type="submit" ${activeMembers.length ? "" : "disabled"}>追加</button></form>`
     : `<button class="button primary-button section-action" type="button" data-show-split-form ${activeMembers.length ? "" : "disabled"}>お店を追加</button>`;
   return `<section aria-labelledby="transactions-title"><div class="section-heading"><div><h2 id="transactions-title">お店</h2><span>${transactions.length}件</span></div></div>${form}<div class="transaction-list">${transactions.length ? transactions.map(renderTransactionRow).join("") : `<div class="empty-state">お店はありません</div>`}</div></section>`;
 }
 
 function renderPaymentRows(project, transaction, locked) {
   const payments = paymentsFor(transaction.id);
-  const rows = payments.length ? payments.map((payment) => `<form class="payment-edit-row" data-payment-edit="${esc(payment.id)}"><select name="payer_member_id" aria-label="支払者" ${locked ? "disabled" : ""}>${memberOptions(project.id, payment.payer_member_id)}</select><input class="input amount-input" type="number" name="amount" inputmode="numeric" min="1" value="${integer(payment.amount)}" aria-label="支払額" required ${locked ? "disabled" : ""}><select name="payment_method" aria-label="支払方法" ${locked ? "disabled" : ""}>${paymentMethodOptions(payment.payment_method)}</select><button class="icon-button save-button" type="submit" aria-label="支払いを保存" ${locked ? "disabled" : ""}>✓</button><button class="icon-button quiet" type="button" data-delete-payment="${esc(payment.id)}" aria-label="支払いを削除" ${locked ? "disabled" : ""}>×</button></form>`).join("") : `<div class="empty-state compact-empty">支払いはありません</div>`;
-  const add = locked ? "" : `<form id="add-payment-form" class="payment-add-form"><select name="payer_member_id" aria-label="支払者" required><option value="">支払者</option>${memberOptions(project.id, "", true)}</select><input class="input amount-input" type="number" name="amount" inputmode="numeric" min="1" placeholder="金額" aria-label="支払額" required><select name="payment_method" aria-label="支払方法">${paymentMethodOptions()}</select><button class="icon-button add-button" type="submit" aria-label="支払いを追加">＋</button></form>`;
+  const rows = payments.length ? payments.map((payment) => `<form class="payment-edit-row" data-payment-edit="${esc(payment.id)}"><select name="payer_member_id" aria-label="支払者" ${locked ? "disabled" : ""}>${memberOptions(project.id, payment.payer_member_id)}</select><input class="input amount-input" type="number" name="amount" inputmode="numeric" step="1" value="${integer(payment.amount)}" aria-label="支払額" required ${locked ? "disabled" : ""}><select name="payment_method" aria-label="支払方法" ${locked ? "disabled" : ""}>${paymentMethodOptions(payment.payment_method)}</select><button class="icon-button save-button" type="submit" aria-label="支払いを保存" ${locked ? "disabled" : ""}>✓</button><button class="icon-button quiet" type="button" data-delete-payment="${esc(payment.id)}" aria-label="支払いを削除" ${locked ? "disabled" : ""}>×</button></form>`).join("") : `<div class="empty-state compact-empty">支払いはありません</div>`;
+  const add = locked ? "" : `<form id="add-payment-form" class="payment-add-form"><select name="payer_member_id" aria-label="支払者" required><option value="">支払者</option>${memberOptions(project.id, "", true)}</select><input class="input amount-input" type="number" name="amount" inputmode="numeric" step="1" placeholder="金額" aria-label="支払額" required><select name="payment_method" aria-label="支払方法">${paymentMethodOptions()}</select><button class="icon-button add-button" type="submit" aria-label="支払いを追加">＋</button></form>`;
   return `<section class="detail-section" aria-labelledby="payments-heading"><div class="inline-heading"><h3 id="payments-heading">支払い</h3><span>${esc(yen(payments.reduce((sum, row) => sum + integer(row.amount), 0)))}</span></div>${add}<div class="payment-list">${rows}</div></section>`;
 }
 
@@ -780,10 +861,10 @@ function allocationChecks(project, item, locked) {
 function renderItemRows(project, transaction, locked) {
   const visible = itemsFor(transaction.id, false);
   const adjustments = itemsFor(transaction.id).filter((row) => row.is_hidden === 1 || row.item_type === "adjustment");
-  const rows = visible.length ? visible.map((item) => `<form class="item-edit-row" data-item-edit="${esc(item.id)}"><div class="item-fields"><input class="plain-input" name="name" value="${esc(item.name)}" aria-label="品目名" required ${locked ? "disabled" : ""}><input class="input amount-input" type="number" name="amount" inputmode="numeric" min="0" value="${integer(item.amount)}" aria-label="品目金額" required ${locked ? "disabled" : ""}></div><div class="allocation-checks">${allocationChecks(project, item, locked)}</div><div class="row-actions"><span>${allocationsFor(item.id).length}人へ配分</span><button class="small-button" type="submit" ${locked ? "disabled" : ""}>保存</button>${item.item_type === "product" ? `<button class="small-button danger-button" type="button" data-delete-item="${esc(item.id)}" ${locked ? "disabled" : ""}>削除</button>` : ""}</div></form>`).join("") : `<div class="empty-state compact-empty">品目はありません</div>`;
+  const rows = visible.length ? visible.map((item) => `<form class="item-edit-row" data-item-edit="${esc(item.id)}"><div class="item-fields"><input class="plain-input" name="name" value="${esc(item.name)}" aria-label="品目名" required ${locked ? "disabled" : ""}><input class="input amount-input" type="number" name="amount" inputmode="numeric" step="1" value="${integer(item.amount)}" aria-label="品目金額" required ${locked ? "disabled" : ""}></div><div class="allocation-checks">${allocationChecks(project, item, locked)}</div><div class="row-actions"><span>${allocationsFor(item.id).length}人へ配分</span><button class="small-button" type="submit" ${locked ? "disabled" : ""}>保存</button>${item.item_type === "product" ? `<button class="small-button danger-button" type="button" data-delete-item="${esc(item.id)}" ${locked ? "disabled" : ""}>削除</button>` : ""}</div></form>`).join("") : `<div class="empty-state compact-empty">品目はありません</div>`;
   const adjustment = adjustments.reduce((sum, row) => sum + integer(row.amount), 0);
   const adjustmentRow = adjustments.length ? `<div class="adjustment-row"><span>差額調整</span><strong>${esc(yen(adjustment))}</strong></div>` : "";
-  const add = locked ? "" : `<form id="add-item-form" class="item-add-form"><div class="field-grid"><input class="input" name="name" placeholder="品目名" aria-label="品目名" required><input class="input amount-input" name="amount" type="number" inputmode="numeric" min="0" placeholder="金額" aria-label="品目金額" required></div><fieldset><legend>配分</legend><div class="allocation-checks">${membersFor(project.id, true).map((member) => `<label class="check-control"><input type="checkbox" name="allocation_members" value="${esc(member.id)}" checked><span>${esc(member.display_name)}</span></label>`).join("")}</div></fieldset><button class="button secondary-button" type="submit">品目を追加</button></form>`;
+  const add = locked ? "" : `<form id="add-item-form" class="item-add-form"><div class="field-grid"><input class="input" name="name" placeholder="品目名" aria-label="品目名" required><input class="input amount-input" name="amount" type="number" inputmode="numeric" step="1" placeholder="金額" aria-label="品目金額" required></div><fieldset><legend>配分</legend><div class="allocation-checks">${membersFor(project.id, true).map((member) => `<label class="check-control"><input type="checkbox" name="allocation_members" value="${esc(member.id)}" checked><span>${esc(member.display_name)}</span></label>`).join("")}</div></fieldset><button class="button secondary-button" type="submit">品目を追加</button></form>`;
   return `<section class="detail-section" aria-labelledby="items-heading"><div class="inline-heading"><h3 id="items-heading">品目と配分</h3><span>${visible.length}件</span></div><div class="item-list">${rows}${adjustmentRow}</div>${add}</section>`;
 }
 
@@ -808,8 +889,8 @@ function renderTransactionDetail(project, transaction, isSplit) {
   const origin = generated ? `<button class="origin-strip" type="button" data-open-origin-project="${esc(transaction.origin_project_id)}"><span>割り勘から生成</span><strong>${esc(projectName(transaction.origin_project_id))}</strong><span aria-hidden="true">›</span></button>` : "";
   const importSources = state.import_records.filter((row) => transactionId(row) === transaction.id);
   const sourceRows = !isSplit && importSources.length ? `<section class="detail-section"><div class="inline-heading"><h3>取込元</h3><span>${importSources.length}件</span></div><div class="source-list">${importSources.map((row) => `<div class="source-row"><span>${esc(SOURCE_TYPES[row.source_type] || row.source_type)}</span><span>${esc(formatDate(row.created_at))}</span></div>`).join("")}</div></section>` : "";
-  const editForm = `<form id="edit-transaction-form" class="form-panel form-stack"><div class="field"><label for="edit-merchant">店名</label><input id="edit-merchant" class="input" name="merchant_name" value="${esc(transaction.merchant_name)}" required ${locked ? "disabled" : ""}></div><div class="field-grid"><div class="field"><label for="edit-amount">金額</label><input id="edit-amount" class="input" name="paid_amount" type="number" inputmode="numeric" min="0" value="${integer(transaction.paid_amount)}" required ${locked ? "disabled" : ""}></div><div class="field"><label for="edit-date">日付</label><input id="edit-date" class="input" name="occurred_at" type="date" value="${esc(dateValue(transaction.occurred_at))}" required ${locked ? "disabled" : ""}></div></div><div class="field-grid"><div class="field"><label for="edit-category">分類</label><input id="edit-category" class="input" name="category" value="${esc(transaction.category || "")}" placeholder="食費" ${locked ? "disabled" : ""}></div><div class="field"><label for="edit-status">状態</label><select id="edit-status" name="status" ${locked ? "disabled" : ""}><option value="provisional" ${transaction.status === "provisional" ? "selected" : ""}>仮</option><option value="confirmed" ${transaction.status === "confirmed" ? "selected" : ""}>確定</option><option value="cancelled" ${transaction.status === "cancelled" ? "selected" : ""}>取消</option><option value="refunded" ${transaction.status === "refunded" ? "selected" : ""}>返金</option><option value="corrected" ${transaction.status === "corrected" ? "selected" : ""}>訂正</option></select></div></div><div class="field"><label for="edit-note">メモ</label><textarea id="edit-note" class="textarea" name="note" rows="2" ${locked ? "disabled" : ""}>${esc(transaction.note || "")}</textarea></div>${locked ? "" : `<button class="button primary-button" type="submit">取引を保存</button>`}</form>`;
-  return `<section class="transaction-detail"><button class="text-button back-to-list" type="button" data-close-transaction>← ${isSplit ? "お店" : "取引"}一覧</button><div class="transaction-detail-heading"><div><div class="detail-status">${statusTag(transaction.status)}${generated ? `<span class="origin-label">自動生成</span>` : ""}</div><h2>${esc(transaction.merchant_name)}</h2><span>${esc(formatDate(transaction.occurred_at))}</span></div><strong>${esc(yen(transaction.paid_amount))}</strong></div>${origin}${issues.length ? `<div class="notice error-notice">${[...new Set(issues.map((issue) => transactionIssueText(issue.code)))].map(esc).join("<br>")}</div>` : ""}${editForm}${renderPaymentRows(project, transaction, locked)}${isSplit ? renderItemRows(project, transaction, locked) : sourceRows}${locked ? "" : `<button class="button danger-button full-width" type="button" data-delete-transaction="${esc(transaction.id)}">取引を削除</button>`}</section>`;
+  const editForm = `<form id="edit-transaction-form" class="form-panel form-stack"><div class="field"><label for="edit-merchant">店名</label><input id="edit-merchant" class="input" name="merchant_name" value="${esc(transaction.merchant_name)}" required ${locked ? "disabled" : ""}></div><div class="field-grid"><div class="field"><label for="edit-amount">金額</label><input id="edit-amount" class="input" name="paid_amount" type="number" inputmode="numeric" step="1" value="${integer(transaction.paid_amount)}" required ${locked ? "disabled" : ""}><small>返金はマイナスで入力</small></div><div class="field"><label for="edit-date">日付</label><input id="edit-date" class="input" name="occurred_at" type="date" value="${esc(dateValue(transaction.occurred_at))}" required ${locked ? "disabled" : ""}></div></div><div class="field-grid"><div class="field"><label for="edit-category">分類</label><input id="edit-category" class="input" name="category" value="${esc(transaction.category || "")}" placeholder="食費" ${locked ? "disabled" : ""}></div><div class="field"><label for="edit-status">状態</label><select id="edit-status" name="status" ${locked ? "disabled" : ""}><option value="provisional" ${transaction.status === "provisional" ? "selected" : ""}>仮</option><option value="confirmed" ${transaction.status === "confirmed" ? "selected" : ""}>確定</option><option value="cancelled" ${transaction.status === "cancelled" ? "selected" : ""}>取消</option><option value="refunded" ${transaction.status === "refunded" ? "selected" : ""}>返金</option><option value="corrected" ${transaction.status === "corrected" ? "selected" : ""}>訂正</option></select></div></div><div class="field"><label for="edit-note">メモ</label><textarea id="edit-note" class="textarea" name="note" rows="2" ${locked ? "disabled" : ""}>${esc(transaction.note || "")}</textarea></div>${locked ? "" : `<button class="button primary-button" type="submit">取引を保存</button>`}</form>`;
+  return `<section class="transaction-detail"><button class="text-button back-to-list" type="button" data-close-transaction>← ${isSplit ? "お店" : "取引"}一覧</button><div class="transaction-detail-heading"><div><div class="detail-status">${transactionStatusTags(transaction)}${generated ? `<span class="origin-label">自動生成</span>` : ""}</div><h2>${esc(transaction.merchant_name)}</h2><span>${esc(formatDate(transaction.occurred_at))}</span></div><strong>${esc(yen(transaction.paid_amount))}</strong></div>${origin}${issues.length ? `<div class="notice error-notice">${[...new Set(issues.map((issue) => transactionIssueText(issue.code)))].map(esc).join("<br>")}</div>` : ""}${editForm}${renderPaymentRows(project, transaction, locked)}${isSplit ? renderItemRows(project, transaction, locked) : sourceRows}${locked ? "" : `<button class="button danger-button full-width" type="button" data-delete-transaction="${esc(transaction.id)}">取引を削除</button>`}</section>`;
 }
 
 function renderSplitSettlement(project) {
@@ -842,7 +923,7 @@ function renderHouseholdTransactions(project) {
   const transactions = transactionsFor(project.id)
     .filter((row) => !selectedMonth || String(row.occurred_at).slice(0, 7) === selectedMonth)
     .sort((left, right) => String(right.occurred_at).localeCompare(String(left.occurred_at)));
-  const form = ui.showHouseholdForm ? `<form id="add-household-transaction-form" class="form-panel form-stack"><div class="form-panel-head"><h3>手入力</h3><button class="icon-button" type="button" data-close-household-form aria-label="閉じる">×</button></div><div class="field"><label for="household-merchant">店名</label><input id="household-merchant" class="input" name="merchant_name" placeholder="店名" required></div><div class="field-grid"><div class="field"><label for="household-amount">金額</label><input id="household-amount" class="input" name="paid_amount" type="number" inputmode="numeric" min="0" required></div><div class="field"><label for="household-date">日付</label><input id="household-date" class="input" name="occurred_at" type="date" value="${today()}" required></div></div><div class="field-grid"><div class="field"><label for="household-category">分類</label><input id="household-category" class="input" name="category" placeholder="食費"></div><div class="field"><label for="household-method">支払方法</label><select id="household-method" name="payment_method">${paymentMethodOptions()}</select></div></div><div class="field-grid"><div class="field"><label for="household-payer">記録者</label><select id="household-payer" name="payer_member_id" required>${memberOptions(project.id, members[0]?.id, true)}</select></div><div class="field"><label for="household-status">状態</label><select id="household-status" name="status"><option value="confirmed">確定</option><option value="provisional">仮</option></select></div></div><div class="field"><label for="household-note">メモ</label><textarea id="household-note" class="textarea" name="note" rows="2"></textarea></div><button class="button household-button" type="submit">追加</button></form>` : `<button class="button household-button section-action" type="button" data-show-household-form>手入力</button>`;
+  const form = ui.showHouseholdForm ? `<form id="add-household-transaction-form" class="form-panel form-stack"><div class="form-panel-head"><h3>手入力</h3><button class="icon-button" type="button" data-close-household-form aria-label="閉じる">×</button></div><div class="field"><label for="household-merchant">店名</label><input id="household-merchant" class="input" name="merchant_name" placeholder="店名" required></div><div class="field-grid"><div class="field"><label for="household-amount">金額</label><input id="household-amount" class="input" name="paid_amount" type="number" inputmode="numeric" step="1" required><small>返金はマイナスで入力</small></div><div class="field"><label for="household-date">日付</label><input id="household-date" class="input" name="occurred_at" type="date" value="${today()}" required></div></div><div class="field-grid"><div class="field"><label for="household-category">分類</label><input id="household-category" class="input" name="category" placeholder="食費"></div><div class="field"><label for="household-method">支払方法</label><select id="household-method" name="payment_method">${paymentMethodOptions()}</select></div></div><div class="field-grid"><div class="field"><label for="household-payer">記録者</label><select id="household-payer" name="payer_member_id" required>${memberOptions(project.id, members[0]?.id, true)}</select></div><div class="field"><label for="household-status">状態</label><select id="household-status" name="status"><option value="confirmed">確定</option><option value="provisional">仮</option></select></div></div><div class="field"><label for="household-note">メモ</label><textarea id="household-note" class="textarea" name="note" rows="2"></textarea></div><button class="button household-button" type="submit">追加</button></form>` : `<button class="button household-button section-action" type="button" data-show-household-form>手入力</button>`;
   return `<section aria-labelledby="household-transactions-title"><div class="section-heading filter-heading"><div><h2 id="household-transactions-title">取引</h2><span>${transactions.length}件</span></div><label class="month-filter"><span>月</span><input type="month" value="${esc(selectedMonth)}" data-household-month></label></div>${form}<div class="transaction-list">${transactions.length ? transactions.map(renderTransactionRow).join("") : `<div class="empty-state">取引はありません</div>`}</div></section>`;
 }
 
@@ -853,21 +934,6 @@ function renderCsvPreview() {
   return `<div class="csv-preview"><div class="inline-heading"><strong>${esc(ui.csvPreview.name)}</strong><span>${ui.csvPreview.totalRows}行</span></div><div class="table-scroll"><table><tbody>${rows.map((row, rowIndex) => `<tr>${Array.from({ length: width }, (_, index) => `<${rowIndex === 0 ? "th" : "td"}>${esc(row[index] || "")}</${rowIndex === 0 ? "th" : "td"}>`).join("")}</tr>`).join("")}</tbody></table></div><button class="button household-button full-width" type="button" data-import-csv>確認へ追加</button></div>`;
 }
 
-function receiptOcrPayload(record) {
-  try {
-    const payload = JSON.parse(record?.raw_payload || "null");
-    return payload?.ocr && typeof payload.ocr === "object" ? payload.ocr : null;
-  } catch {
-    return null;
-  }
-}
-
-function renderOcrItemFields(ocr, recordId) {
-  const items = Array.isArray(ocr?.confirmed_items) ? ocr.confirmed_items : ocr?.original?.items;
-  if (!Array.isArray(items) || items.length === 0) return "";
-  return `<details class="ocr-item-review"><summary>商品明細 ${items.length}件</summary><div class="form-stack">${items.map((item, index) => `<div class="field-grid"><div class="field"><label>商品名 ${index + 1}</label><input class="input" value="${esc(item.name || "")}" data-import-ocr-field="item_name:${index}" data-import-ocr-id="${esc(recordId)}"></div><div class="field"><label>金額</label><input class="input" type="number" inputmode="numeric" min="1" value="${esc(item.amount || "")}" data-import-ocr-field="item_amount:${index}" data-import-ocr-id="${esc(recordId)}"></div></div>`).join("")}</div></details>`;
-}
-
 function renderImportReview(project, projectIds = new Set([project.id]), includeGmail = true) {
   const records = state.import_records
     .filter((row) => projectIds.has(row.project_id) && ["received", "parsed", "review"].includes(row.source_status))
@@ -876,27 +942,13 @@ function renderImportReview(project, projectIds = new Set([project.id]), include
   if (!records.length) return `${gmail}<div class="empty-state compact-empty">確認待ちはありません</div>`;
   return gmail + records.map((record) => {
     const transactions = transactionsFor(record.project_id).filter((row) => !["cancelled", "refunded"].includes(row.status));
-    const ocr = receiptOcrPayload(record);
-    const editable = record.source_type === "receipt" && ocr?.ocr_result_id && ocrFeedbackTokens.has(ocr.ocr_result_id);
-    const values = editable
-      ? `<div class="field-grid"><div class="field"><label>店名</label><input class="input" value="${esc(record.merchant_raw || "")}" data-import-ocr-field="merchant_raw" data-import-ocr-id="${esc(record.id)}"></div><div class="field"><label>金額</label><input class="input" type="number" inputmode="numeric" min="1" value="${esc(record.paid_amount_raw ?? record.gross_amount_raw ?? "")}" data-import-ocr-field="paid_amount_raw" data-import-ocr-id="${esc(record.id)}"></div></div><div class="field-grid"><div class="field"><label>日付</label><input class="input" type="date" value="${esc(dateValue(record.occurred_at_raw))}" data-import-ocr-field="occurred_at_raw" data-import-ocr-id="${esc(record.id)}"></div><div class="field"><label>時刻</label><input class="input" type="time" value="${esc(ocr.confirmed_paid_time || ocr.original?.paid_time || "")}" data-import-ocr-field="paid_time" data-import-ocr-id="${esc(record.id)}"></div></div>`
-      : `<div class="review-row-value"><strong>${esc(record.merchant_raw || "店名未設定")}</strong><strong>${esc(yen(record.paid_amount_raw ?? record.gross_amount_raw))}</strong></div>`;
-    const feedbackNote = ocr?.feedback_write_enabled === false
-      ? "修正は取引へ反映されます。OCR修正履歴の保存は現在停止中です"
-      : "修正した内容は、次回以降の読み取り候補の改善に使用されます";
-    return `<div class="review-row"><div class="review-row-head"><span class="source-type">${esc(SOURCE_TYPES[record.source_type] || record.source_type)}</span><span>${esc(formatDate(record.occurred_at_raw || record.created_at))}</span></div>${values}${editable ? renderOcrItemFields(ocr, record.id) : ""}<div class="review-actions"><button class="small-button household-small" type="button" data-create-from-import="${esc(record.id)}">取引にする</button><select data-import-link-select="${esc(record.id)}" aria-label="既存の取引"><option value="">既存の取引</option>${transactions.map((transaction) => `<option value="${esc(transaction.id)}">${esc(dateValue(transaction.occurred_at))} ${esc(transaction.merchant_name)} ${esc(yen(transaction.paid_amount))}</option>`).join("")}</select><button class="small-button" type="button" data-link-import="${esc(record.id)}">紐付け</button><button class="icon-button quiet" type="button" data-reject-import="${esc(record.id)}" aria-label="却下">×</button></div>${editable ? `<p class="field-note">${feedbackNote}</p>` : ""}</div>`;
+    return `<div class="review-row"><div class="review-row-head"><span class="source-type">${esc(SOURCE_TYPES[record.source_type] || record.source_type)}</span><span>${esc(formatDate(record.occurred_at_raw || record.created_at))}</span></div><div class="review-row-value"><strong>${esc(record.merchant_raw || "店名未設定")}</strong><strong>${esc(yen(record.paid_amount_raw ?? record.gross_amount_raw))}</strong></div><div class="review-actions"><button class="small-button household-small" type="button" data-create-from-import="${esc(record.id)}">取引にする</button><select data-import-link-select="${esc(record.id)}" aria-label="既存の取引"><option value="">既存の取引</option>${transactions.map((transaction) => `<option value="${esc(transaction.id)}">${esc(dateValue(transaction.occurred_at))} ${esc(transaction.merchant_name)} ${esc(yen(transaction.paid_amount))}</option>`).join("")}</select><button class="small-button" type="button" data-link-import="${esc(record.id)}">紐付け</button><button class="icon-button quiet" type="button" data-reject-import="${esc(record.id)}" aria-label="却下">×</button></div></div>`;
   }).join("");
-}
-
-function renderOcrFeedbackSettings() {
-  if (!isCloud || cloudSession.status !== "authenticated") return "";
-  const count = ui.ocrFeedback.count == null ? "未取得" : `${ui.ocrFeedback.count}件`;
-  return `<section class="ocr-feedback-settings" aria-labelledby="ocr-feedback-title"><div class="inline-heading"><h3 id="ocr-feedback-title">OCR修正履歴</h3><span>${esc(count)}</span></div><p class="field-note">修正履歴はログイン中の利用者ごとに保存されます</p><div class="review-actions"><button class="small-button" type="button" data-load-ocr-feedback ${ui.ocrFeedback.loading ? "disabled" : ""}>件数を更新</button><button class="small-button danger-text" type="button" data-delete-ocr-feedback ${ui.ocrFeedback.count ? "" : "disabled"}>履歴を削除</button></div></section>`;
 }
 
 function renderHouseholdImports(project, projectIds = new Set([project.id])) {
   const includeGmail = primaryHouseholdProject()?.id === project.id;
-  return `<section aria-labelledby="imports-title"><div class="section-heading"><div><h2 id="imports-title">取込</h2><span>${state.import_records.filter((row) => projectIds.has(row.project_id)).length}件</span></div></div><div class="import-tools"><section class="import-section"><div class="inline-heading"><h3>レシート</h3></div><div class="file-actions"><label class="file-button household-file"><input type="file" accept="image/jpeg,image/png,image/webp,image/heic,image/heif" data-household-receipt="${esc(project.id)}"><span>画像を選ぶ</span></label><label class="file-button secondary-button"><input type="file" accept="image/*" capture="environment" data-household-receipt="${esc(project.id)}"><span>撮影する</span></label></div></section><section class="import-section"><div class="inline-heading"><h3>CSV</h3></div><div class="csv-controls"><select data-csv-source aria-label="CSVの種類"><option value="">自動判定</option><option value="card_csv" ${ui.csvSourceType === "card_csv" ? "selected" : ""}>カード</option><option value="paypay_csv" ${ui.csvSourceType === "paypay_csv" ? "selected" : ""}>PayPay</option><option value="bank_csv" ${ui.csvSourceType === "bank_csv" ? "selected" : ""}>銀行</option><option value="manual" ${ui.csvSourceType === "manual" ? "selected" : ""}>その他</option></select><label class="file-button household-file"><input type="file" accept=".csv,text/csv" data-csv-file="${esc(project.id)}"><span>CSVを選ぶ</span></label></div>${renderCsvPreview()}</section><section class="import-section"><div class="inline-heading"><h3>通知</h3></div><form id="notification-import-form" class="form-stack"><textarea class="textarea" name="raw_text" rows="4" placeholder="通知本文" required></textarea><button class="button secondary-button" type="submit">確認へ追加</button></form></section></div><section class="review-section" aria-labelledby="review-title"><div class="inline-heading"><h3 id="review-title">確認待ち</h3></div><div class="review-list">${renderImportReview(project, projectIds, includeGmail)}</div></section>${renderOcrFeedbackSettings()}</section>`;
+  return `<section aria-labelledby="imports-title"><div class="section-heading"><div><h2 id="imports-title">取込</h2><span>${state.import_records.filter((row) => projectIds.has(row.project_id)).length}件</span></div></div><div class="import-tools"><section class="import-section"><div class="inline-heading"><h3>レシート</h3></div><div class="file-actions"><label class="file-button household-file"><input type="file" accept="image/jpeg,image/png,image/webp,image/heic,image/heif" data-household-receipt="${esc(project.id)}"><span>画像を選ぶ</span></label><label class="file-button secondary-button"><input type="file" accept="image/*" capture="environment" data-household-receipt="${esc(project.id)}"><span>撮影する</span></label></div></section><section class="import-section"><div class="inline-heading"><h3>CSV</h3></div><div class="csv-controls"><select data-csv-source aria-label="CSVの種類"><option value="">自動判定</option><option value="card_csv" ${ui.csvSourceType === "card_csv" ? "selected" : ""}>カード</option><option value="paypay_csv" ${ui.csvSourceType === "paypay_csv" ? "selected" : ""}>PayPay</option><option value="bank_csv" ${ui.csvSourceType === "bank_csv" ? "selected" : ""}>銀行</option><option value="manual" ${ui.csvSourceType === "manual" ? "selected" : ""}>その他</option></select><label class="file-button household-file"><input type="file" accept=".csv,text/csv" data-csv-file="${esc(project.id)}"><span>CSVを選ぶ</span></label></div>${renderCsvPreview()}</section><section class="import-section"><div class="inline-heading"><h3>通知</h3></div><form id="notification-import-form" class="form-stack"><textarea class="textarea" name="raw_text" rows="4" placeholder="通知本文" required></textarea><button class="button secondary-button" type="submit">確認へ追加</button></form></section></div><section class="review-section" aria-labelledby="review-title"><div class="inline-heading"><h3 id="review-title">確認待ち</h3></div><div class="review-list">${renderImportReview(project, projectIds, includeGmail)}</div></section></section>`;
 }
 
 function renderCalendarImports() {
@@ -907,8 +959,9 @@ function renderCalendarImports() {
 }
 
 function householdSummaryGroups(projectId) {
-  const included = transactionsFor(projectId).filter((row) => row.status === "confirmed" && ["purchase", "split_expense"].includes(row.entry_type));
+  const included = transactionsFor(projectId).filter(confirmedLedgerTransaction);
   const ids = new Set(included.map((row) => row.id));
+  const includedById = new Map(included.map((row) => [row.id, row]));
   const monthly = new Map();
   const categories = new Map();
   const payments = new Map();
@@ -919,7 +972,9 @@ function householdSummaryGroups(projectId) {
     categories.set(category, (categories.get(category) || 0) + integer(transaction.paid_amount));
   }
   for (const payment of state.transaction_payments) {
-    if (!ids.has(transactionId(payment)) || ["cancelled", "refunded"].includes(payment.payment_status)) continue;
+    const relatedTransaction = includedById.get(transactionId(payment));
+    const refundedPayment = payment.payment_status === "refunded" && relatedTransaction?.entry_type === "refund";
+    if (!ids.has(transactionId(payment)) || payment.payment_status === "cancelled" || payment.payment_status === "refunded" && !refundedPayment) continue;
     const method = PAYMENT_METHODS[payment.payment_method] || "その他";
     payments.set(method, (payments.get(method) || 0) + integer(payment.amount));
   }
@@ -1182,11 +1237,11 @@ async function createSplitProject(form) {
   const data = new FormData(form);
   const store = String(data.get("store") || "").trim();
   const amount = integer(data.get("amount"));
-  if ((store && amount <= 0) || (!store && amount > 0)) {
+  if ((store && amount === 0) || (!store && amount !== 0)) {
     toast("最初のお店は店名と金額を入力してください");
     return;
   }
-  if (store && amount > 0) {
+  if (store && amount !== 0) {
     const payerIndex = Number(data.get("payer"));
     const payer = Number.isInteger(payerIndex) ? members[payerIndex] : null;
     if (!payer) {
@@ -1198,7 +1253,7 @@ async function createSplitProject(form) {
       amount,
       occurred_at: data.get("occurred_at") || today(),
       status: "confirmed",
-      entry_type: "purchase",
+      entry_type: entryTypeForAmount(amount),
       payer_member_id: payer.id,
       allocation_member_ids: members.map((row) => row.id),
       items: cleanReceiptItems("createSplit"),
@@ -1225,9 +1280,13 @@ function renderGmailImport(project) {
 async function refreshGmailImport(shouldRender = true) {
   if (!isCloud) return;
   try {
-    const [connections, candidates] = await Promise.all([Api.listGmailConnections(), Api.listGmailCandidates()]);
+    const [connections, candidates] = await Promise.all([Api.listGmailConnections(), Api.listGmailCandidates(undefined, { from_date: gmailUi.from_date, to_date: gmailUi.to_date })]);
     gmailUi.connections = connections.connections || [];
     gmailUi.candidates = candidates.candidates || [];
+    gmailUi.total_count = Number(candidates.total_count || gmailUi.candidates.length);
+    gmailUi.has_more = Boolean(candidates.has_more);
+    const visible = new Set(gmailUi.candidates.map((row) => row.id));
+    for (const id of gmailSelected) if (!visible.has(id)) gmailSelected.delete(id);
     if (shouldRender) render();
   } catch (error) {
     toast(`Gmail情報を読み込めませんでした: ${error.message || "取得に失敗しました"}`);
@@ -1314,14 +1373,19 @@ function updateMember(project, form) {
 
 function addSplitTransaction(project, form) {
   const data = new FormData(form);
+  const amount = integer(data.get("amount"));
+  if (amount === 0) {
+    toast("金額は0円以外で入力してください");
+    return;
+  }
   const activeIds = membersFor(project.id, true).map((row) => row.id);
   let next = cloneState();
   const transaction = appendTransactionBundle(next, project.id, {
     merchant_name: String(data.get("store") || "").trim(),
-    amount: integer(data.get("amount")),
+    amount,
     occurred_at: data.get("occurred_at") || today(),
     status: data.get("status") || "confirmed",
-    entry_type: "purchase",
+    entry_type: entryTypeForAmount(amount),
     payer_member_id: data.get("payer"),
     allocation_member_ids: activeIds,
     items: cleanReceiptItems("split"),
@@ -1338,8 +1402,13 @@ function updatePayment(project, form) {
   const payment = next.transaction_payments.find((row) => row.id === form.dataset.paymentEdit);
   if (!payment) return;
   const data = new FormData(form);
+  const amount = integer(data.get("amount"));
+  if (amount === 0) {
+    toast("支払額は0円以外で入力してください");
+    return;
+  }
   payment.payer_member_id = data.get("payer_member_id");
-  payment.amount = integer(data.get("amount"));
+  payment.amount = amount;
   payment.payment_method = data.get("payment_method") || "other";
   payment.updated_at = now();
   touchProject(next, project.id);
@@ -1348,13 +1417,18 @@ function updatePayment(project, form) {
 
 function addPayment(project, transaction, form) {
   const data = new FormData(form);
+  const amount = integer(data.get("amount"));
+  if (amount === 0) {
+    toast("支払額は0円以外で入力してください");
+    return;
+  }
   const timestamp = now();
   const next = cloneState();
   next.transaction_payments.push({
     id: makeId("pay"),
     transaction_id: transaction.id,
     payer_member_id: data.get("payer_member_id"),
-    amount: integer(data.get("amount")),
+    amount,
     payment_method: data.get("payment_method") || "other",
     provider: null,
     account_label: null,
@@ -1442,10 +1516,16 @@ function updateTransaction(project, transaction, form) {
   const row = next.transactions.find((value) => value.id === transaction.id);
   if (!row) return;
   const data = new FormData(form);
+  const amount = integer(data.get("paid_amount"));
+  if (amount === 0) {
+    toast("金額は0円以外で入力してください");
+    return;
+  }
   row.merchant_name = String(data.get("merchant_name") || "").trim();
   row.merchant_normalized = normalizeMerchant(row.merchant_name);
-  row.paid_amount = integer(data.get("paid_amount"));
+  row.paid_amount = amount;
   row.gross_amount = row.paid_amount;
+  row.entry_type = entryTypeForAmount(amount, row.entry_type);
   row.occurred_at = data.get("occurred_at") || today();
   row.category = String(data.get("category") || "").trim() || null;
   row.status = data.get("status") || "confirmed";
@@ -1486,9 +1566,15 @@ function deleteTransaction(project, transaction) {
 
 function addHouseholdTransaction(project, form) {
   const data = new FormData(form);
+  const amount = integer(data.get("paid_amount"));
+  if (amount === 0) {
+    toast("金額は0円以外で入力してください");
+    return;
+  }
   let next = Household.createManualHouseholdTransaction(state, project.id, {
     merchant_name: String(data.get("merchant_name") || "").trim(),
-    paid_amount: integer(data.get("paid_amount")),
+    paid_amount: amount,
+    entry_type: entryTypeForAmount(amount),
     occurred_at: data.get("occurred_at") || today(),
     category: String(data.get("category") || "").trim() || null,
     payment_method: data.get("payment_method") || "other",
@@ -1507,9 +1593,15 @@ function addCalendarTransaction(form) {
   const project = primaryHouseholdProject();
   if (!project) throw new Error("家計簿が見つかりません");
   const data = new FormData(form);
+  const amount = integer(data.get("paid_amount"));
+  if (amount === 0) {
+    toast("金額は0円以外で入力してください");
+    return;
+  }
   let next = Household.createManualHouseholdTransaction(state, project.id, {
     merchant_name: String(data.get("merchant_name") || "").trim(),
-    paid_amount: integer(data.get("paid_amount")),
+    paid_amount: amount,
+    entry_type: entryTypeForAmount(amount),
     occurred_at: data.get("occurred_at") || ui.calendarDay,
     category: String(data.get("category") || "").trim() || null,
     payment_method: data.get("payment_method") || "other",
@@ -1728,44 +1820,6 @@ function sourceProfile(sourceType) {
   return "generic";
 }
 
-function safeOcrEvidence(value) {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-  const box = Array.isArray(value.bounding_box) && value.bounding_box.length === 4
-    ? value.bounding_box.map(Number).filter((entry) => Number.isFinite(entry) && entry >= 0 && entry <= 1)
-    : [];
-  return {
-    source_id: String(value.source_id ?? value.source_line_ids?.[0] ?? "").slice(0, 64),
-    source_text: String(value.source_text || "").slice(0, 500),
-    bounding_box: box.length === 4 ? box : null,
-    confidence: Math.max(0, Math.min(1, Number(value.confidence) || 0)),
-    preprocessing: String(value.preprocessing || "default").slice(0, 100),
-  };
-}
-
-function receiptOcrMetadata(result) {
-  const evidence = {};
-  for (const field of ["store_name", "total_amount", "paid_at", "paid_time"]) {
-    const safe = safeOcrEvidence(result.field_evidence?.[field]);
-    if (safe) evidence[field] = safe;
-  }
-  return {
-    ocr_result_id: String(result.ocr_result_id || "").slice(0, 128),
-    feedback_write_enabled: result.feedback_write_enabled !== false,
-    ocr_model: String(result.ocr_engine_version || result.model || "receipt-ocr").slice(0, 100),
-    rule_engine_version: String(result.rule_engine_version || "").slice(0, 100),
-    original: {
-      store_name: result.store_name || null,
-      total_amount: Number.isSafeInteger(Number(result.total_amount)) ? Number(result.total_amount) : null,
-      paid_at: result.paid_at || result.occurred_at || null,
-      paid_time: result.paid_time || null,
-      items: (result.items || []).slice(0, 30).map((item, index) => ({ source_id: String(item.source_id || `item:${index}`).slice(0, 64), name: String(item.name || "").slice(0, 200), amount: integer(item.amount) })),
-    },
-    confirmed_items: (result.items || []).slice(0, 30).map((item, index) => ({ source_id: String(item.source_id || `item:${index}`).slice(0, 64), name: String(item.name || "").slice(0, 200), amount: integer(item.amount) })),
-    confirmed_paid_time: result.paid_time || null,
-    field_evidence: evidence,
-  };
-}
-
 function addCsvImports(project) {
   const preview = ui.csvPreview;
   if (!preview) return;
@@ -1790,25 +1844,24 @@ function addCsvImports(project) {
 
 function importRecordFromReceipt(projectId, result) {
   const timestamp = now();
-  const ocr = receiptOcrMetadata(result);
   return {
     id: makeId("imp"),
     project_id: projectId,
     transaction_id: null,
     source_type: "receipt",
-    source_record_id: ocr.ocr_result_id ? `receipt:${ocr.ocr_result_id}` : `receipt:${stableHash(`${result.store_name}:${result.total_amount}:${timestamp}`)}`,
+    source_record_id: `receipt:${stableHash(`${result.store_name}:${result.total_amount}:${timestamp}`)}`,
     source_status: "review",
     merchant_raw: result.store_name || "レシート",
     merchant_normalized: normalizeMerchant(result.store_name || "レシート"),
     gross_amount_raw: integer(result.total_amount),
     paid_amount_raw: integer(result.total_amount),
-    occurred_at_raw: result.paid_at || result.occurred_at || today(),
+    occurred_at_raw: result.occurred_at || today(),
     settled_at_raw: null,
     payment_method_raw: result.payment_method || null,
     external_transaction_id: null,
     image_url: null,
-    raw_text: null,
-    raw_payload: JSON.stringify({ items: result.items || [], notes: result.notes || null, ocr }),
+    raw_text: result.raw_text || null,
+    raw_payload: JSON.stringify({ items: result.items || [], notes: result.notes || null }),
     parse_confidence: Number.isFinite(result.confidence) ? result.confidence : null,
     parser_version: result.model || "receipt-ocr",
     match_score: null,
@@ -1820,9 +1873,6 @@ function importRecordFromReceipt(projectId, result) {
 
 function addReceiptImport(project, result) {
   const record = importRecordFromReceipt(project.id, result);
-  const resultId = receiptOcrPayload(record)?.ocr_result_id;
-  const feedbackToken = String(result.feedback_token || "");
-  if (resultId && /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/u.test(feedbackToken)) ocrFeedbackTokens.set(resultId, feedbackToken);
   const next = cloneState();
   next.import_records.push(record);
   touchProject(next, project.id);
@@ -1836,7 +1886,7 @@ function addReceiptImport(project, result) {
         paid_amount_raw: record.paid_amount_raw,
         gross_amount_raw: record.gross_amount_raw,
         occurred_at_raw: record.occurred_at_raw,
-        raw_payload: JSON.parse(record.raw_payload),
+        raw_payload: { items: result.items || [], notes: result.notes || null },
         parse_confidence: record.parse_confidence,
         parser_version: record.parser_version,
       });
@@ -1914,72 +1964,8 @@ function paymentMethodFromImport(record) {
         : record.source_type === "bank_csv" ? "bank" : "other";
 }
 
-function ocrFeedbackFromRecord(record, transactionIdValue) {
-  const ocr = receiptOcrPayload(record);
-  const feedbackToken = ocrFeedbackTokens.get(ocr?.ocr_result_id);
-  if (!feedbackToken || !ocr?.original) return null;
-  return {
-    import_id: record.id,
-    transaction_id: transactionIdValue,
-    feedback_token: feedbackToken,
-    confirmed: {
-      store_name: record.merchant_raw || null,
-      total_amount: integer(record.paid_amount_raw ?? record.gross_amount_raw) || null,
-      paid_at: record.occurred_at_raw || null,
-      paid_time: ocr.confirmed_paid_time || null,
-      items: (Array.isArray(ocr.confirmed_items) ? ocr.confirmed_items : ocr.original.items || []).map((item, index) => ({
-        source_id: item.source_id || `item:${index}`,
-        name: item.name,
-        amount: item.amount,
-      })),
-    },
-  };
-}
-
-function updateOcrImportField(recordId, field, value) {
-  const record = state.import_records.find((row) => row.id === recordId && row.source_type === "receipt");
-  if (!record) return;
-  if (field === "merchant_raw") {
-    record.merchant_raw = String(value).slice(0, 200);
-    record.merchant_normalized = normalizeMerchant(record.merchant_raw);
-  } else if (field === "paid_amount_raw") {
-    record.paid_amount_raw = integer(value);
-    record.gross_amount_raw = integer(value);
-  } else if (field === "occurred_at_raw") {
-    record.occurred_at_raw = String(value).slice(0, 10);
-  } else if (field === "paid_time") {
-    const payload = JSON.parse(record.raw_payload || "{}");
-    if (payload.ocr) payload.ocr.confirmed_paid_time = String(value).slice(0, 5);
-    record.raw_payload = JSON.stringify(payload);
-  } else if (/^item_(name|amount):\d+$/u.test(field)) {
-    const payload = JSON.parse(record.raw_payload || "{}");
-    const [kind, indexText] = field.split(":");
-    const item = payload.ocr?.confirmed_items?.[Number(indexText)];
-    if (item) item[kind === "item_name" ? "name" : "amount"] = kind === "item_name" ? String(value).slice(0, 200) : integer(value);
-    record.raw_payload = JSON.stringify(payload);
-  }
-  record.updated_at = now();
-  saveLocal();
-}
-
-async function loadOcrFeedbackCount() {
-  if (!isCloud || ui.ocrFeedback.loading) return;
-  ui.ocrFeedback.loading = true;
-  render();
-  try {
-    const result = await Api.getOcrCorrectionCount();
-    ui.ocrFeedback.count = integer(result.correction_count);
-  } catch (error) {
-    toast(`OCR修正履歴を取得できませんでした: ${error.message}`);
-  } finally {
-    ui.ocrFeedback.loading = false;
-    render();
-  }
-}
-
 function createFromImport(project, record) {
   const transactionIdValue = makeId("txn");
-  const feedback = ocrFeedbackFromRecord(record, transactionIdValue);
   let next = Household.createManualHouseholdTransaction(state, project.id, {
     id: transactionIdValue,
     merchant_name: record.merchant_raw || "取込取引",
@@ -1999,14 +1985,7 @@ function createFromImport(project, record) {
   commitState(next, "仮の取引を作成しました", {
     remoteFilter: () => false,
     remoteAction: async () => {
-      const reconciliation = await Api.reconcileImport(record.id, {
-        action: "create",
-        new_transaction_id: transactionIdValue,
-        ...(feedback ? { feedback_token: feedback.feedback_token, confirmed: feedback.confirmed } : {}),
-      });
-      if (feedback) {
-        await finishOcrFeedback(reconciliation, feedback, record.id, receiptOcrPayload(record)?.ocr_result_id);
-      }
+      await Api.reconcileImport(record.id, { action: "create", new_transaction_id: transactionIdValue });
       await refreshCloudProject(project.id);
     },
   });
@@ -2017,7 +1996,6 @@ function linkImport(project, record, transactionIdValue) {
     toast("既存の取引を選択してください");
     return;
   }
-  const feedback = ocrFeedbackFromRecord(record, transactionIdValue);
   const next = cloneState();
   const row = next.import_records.find((value) => value.id === record.id);
   row.transaction_id = transactionIdValue;
@@ -2027,32 +2005,10 @@ function linkImport(project, record, transactionIdValue) {
   commitState(next, "取引へ紐付けました", {
     remoteFilter: () => false,
     remoteAction: async () => {
-      const reconciliation = await Api.reconcileImport(record.id, {
-        action: "link",
-        transaction_id: transactionIdValue,
-        ...(feedback ? { feedback_token: feedback.feedback_token, confirmed: feedback.confirmed } : {}),
-      });
-      if (feedback) {
-        await finishOcrFeedback(reconciliation, feedback, record.id, receiptOcrPayload(record)?.ocr_result_id);
-      }
+      await Api.reconcileImport(record.id, { action: "link", transaction_id: transactionIdValue });
       await refreshCloudProject(project.id);
     },
   });
-}
-
-async function finishOcrFeedback(reconciliation, feedback, importId, resultId) {
-  let status = reconciliation.ocr_feedback?.status;
-  if (status === "failed" || !status) {
-    try {
-      await Api.retryOcrCorrections(importId);
-      status = "saved";
-    } catch {
-      toast("取引は保存されましたが、OCR修正履歴の保存に失敗しました");
-      return;
-    }
-  }
-  if (status === "saved") ui.ocrFeedback.count = null;
-  if (status === "saved" || status === "disabled") ocrFeedbackTokens.delete(resultId);
 }
 
 function rejectImport(project, record) {
@@ -2080,6 +2036,37 @@ async function readReceiptFile(file, projectId) {
   return requestApi("/api/ocr-receipt", { method: "POST", json: payload });
 }
 
+async function bulkGmailCandidates(action) {
+  const selected = gmailUi.candidates.filter((row) => gmailSelected.has(row.id));
+  const applicable = action === "import" ? selected.filter((row) => row.status === "ready" && String(row.merchant_name || "").trim() && Number.isSafeInteger(row.amount) && row.amount !== 0 && row.occurred_at) : selected.filter((row) => ["ready", "needs_review"].includes(row.status));
+  if (!applicable.length) { toast(action === "import" ? "適用できる候補がありません" : "破棄する候補を選択してください"); return; }
+  const total = applicable.reduce((sum, row) => sum + Number(row.amount || 0), 0);
+  const message = action === "import" ? `${applicable.length}件、合計${yen(total)}を家計簿へ登録します` : `${applicable.length}件を取込候補から破棄します\n破棄したメールは次回同期でも再解析されません`;
+  if (!globalThis.confirm?.(message)) return;
+  const aggregate = { imported_count: 0, already_imported_count: 0, skipped_count: 0, failed_count: 0 };
+  let processed = 0;
+  try {
+    for (let index = 0; index < applicable.length; index += 50) {
+      const chunk = applicable.slice(index, index + 50);
+      const result = await Api.bulkGmailCandidates(action, chunk.map((row) => row.id));
+      for (const key of Object.keys(aggregate)) aggregate[key] += Number(result?.[key] || 0);
+      processed += chunk.length;
+      toast(`${action === "import" ? "一括適用" : "一括破棄"}中: ${processed} / ${applicable.length}件`);
+    }
+    await refreshGmailImport(false);
+    const project = primaryHouseholdProject();
+    if (project) await refreshCloudProject(project.id, false);
+    await refreshCloudCalendar(false);
+    gmailSelected.clear();
+    render();
+    toast(`${action === "import" ? "一括適用完了" : "一括破棄完了"}: 登録${aggregate.imported_count}件、確認が必要${aggregate.skipped_count}件、登録済み${aggregate.already_imported_count}件、失敗${aggregate.failed_count}件`);
+  } catch (error) {
+    gmailSelected.clear();
+    await refreshGmailImport();
+    toast(error.message || "一括処理に失敗しました");
+  }
+}
+
 async function handleSplitReceipt(input) {
   const target = input.dataset.receiptTarget;
   const receipt = ui.ocr[target];
@@ -2092,16 +2079,13 @@ async function handleSplitReceipt(input) {
     if (!project) throw new Error("プロジェクトを選択してください");
     const result = await readReceiptFile(input.files[0], project.id);
     receipt.items = (result.items || []).map((item) => ({ name: String(item.name || "").trim(), amount: integer(item.amount) })).filter((item) => item.name && item.amount > 0);
-    const warnings = Array.isArray(result.warnings) ? result.warnings.filter(Boolean) : [];
-    receipt.status = result.needs_review
-      ? `${receipt.items.length}件を読み取りました。内容を確認してください。${warnings[0] ? ` ${warnings[0]}` : ""}`
-      : `${receipt.items.length}件を読み取りました`;
-    receipt.type = result.needs_review ? "warning" : "success";
+    receipt.status = `${receipt.items.length}件を読み取りました`;
+    receipt.type = "success";
     const scope = target === "createSplit" ? "createSplit" : "split";
     if (result.store_name) ui.drafts[scope].store = result.store_name;
     if (result.total_amount) ui.drafts[scope].amount = String(integer(result.total_amount));
     render();
-    toast(result.needs_review ? "レシートの読み取り結果を確認してください" : "レシートを読み取りました");
+    toast("レシートを読み取りました");
   } catch (error) {
     receipt.status = error.message || "読み取れませんでした";
     receipt.type = "error";
@@ -2158,6 +2142,7 @@ function render() {
   const root = document.querySelector("#app");
   if (root) root.innerHTML = currentProject() ? renderProject() : renderHome();
   renderGmailProgress();
+  renderGmailCandidateControls();
 }
 
 function mergeProjectSummaries(rows) {
@@ -2289,9 +2274,6 @@ document.addEventListener("input", (event) => {
     const [ocrTarget, index] = target.dataset.ocrAmount.split(":");
     if (ui.ocr[ocrTarget]?.items[index]) ui.ocr[ocrTarget].items[index].amount = integer(target.value);
   }
-  if (target.dataset.importOcrId && target.dataset.importOcrField) {
-    updateOcrImportField(target.dataset.importOcrId, target.dataset.importOcrField, target.value);
-  }
 });
 
 document.addEventListener("submit", async (event) => {
@@ -2351,6 +2333,24 @@ document.addEventListener("click", async (event) => {
       const result = await Api.startGmailConnection();
       if (!result?.url) throw new Error("Gmailの認可先を取得できませんでした");
       location.assign(result.url);
+      return;
+    }
+    if (button.dataset.gmailSelectAll !== undefined) {
+      gmailUi.candidates.forEach((row) => gmailSelected.add(row.id));
+      render();
+      return;
+    }
+    if (button.dataset.gmailClearSelection !== undefined) {
+      gmailSelected.clear();
+      render();
+      return;
+    }
+    if (button.dataset.gmailBulkImport !== undefined) {
+      await bulkGmailCandidates("import");
+      return;
+    }
+    if (button.dataset.gmailBulkIgnore !== undefined) {
+      await bulkGmailCandidates("ignore");
       return;
     }
     if (button.dataset.gmailSync) {
@@ -2565,21 +2565,6 @@ document.addEventListener("click", async (event) => {
     addCsvImports(project);
     return;
   }
-  if (button.dataset.loadOcrFeedback !== undefined) {
-    await loadOcrFeedbackCount();
-    return;
-  }
-  if (button.dataset.deleteOcrFeedback !== undefined && confirm("自分のOCR修正履歴をすべて削除しますか？")) {
-    try {
-      await Api.deleteOcrCorrections();
-      ui.ocrFeedback.count = 0;
-      toast("OCR修正履歴を削除しました");
-      render();
-    } catch (error) {
-      toast(`OCR修正履歴を削除できませんでした: ${error.message}`);
-    }
-    return;
-  }
   if (button.dataset.createFromImport && project) {
     const record = state.import_records.find((row) => row.id === button.dataset.createFromImport);
     if (record) createFromImport(projectById(record.project_id) || project, record);
@@ -2599,6 +2584,22 @@ document.addEventListener("click", async (event) => {
 
 document.addEventListener("change", (event) => {
   const target = event.target;
+  if (target.dataset.gmailSelect) {
+    if (target.checked) gmailSelected.add(target.dataset.gmailSelect);
+    else gmailSelected.delete(target.dataset.gmailSelect);
+    renderGmailCandidateControls();
+    return;
+  }
+  if (target.dataset.gmailFromDate || target.dataset.gmailToDate) {
+    const fromDate = document.querySelector("[data-gmail-from-date]")?.value || gmailUi.from_date;
+    const toDate = document.querySelector("[data-gmail-to-date]")?.value || gmailUi.to_date;
+    if (!validGmailDateRange(fromDate, toDate)) { toast("Gmail同期期間は90日以内で、開始日を終了日以前にしてください"); return; }
+    gmailUi.from_date = fromDate;
+    gmailUi.to_date = toDate;
+    gmailSelected.clear();
+    void refreshGmailImport();
+    return;
+  }
   const scope = target.dataset.draftScope;
   const field = target.dataset.draftField;
   if (scope && field && ui.drafts[scope]) ui.drafts[scope][field] = target.value;

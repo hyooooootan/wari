@@ -1,6 +1,11 @@
 const TERMINAL_SOURCE_STATUSES = new Set(["cancelled", "refunded"]);
 const INACTIVE_PAYMENT_STATUSES = new Set(["cancelled", "refunded"]);
 
+function terminalSourceTransaction(transaction) {
+  const status = String(transaction?.status || "").toLowerCase();
+  return TERMINAL_SOURCE_STATUSES.has(status) && !(status === "refunded" && transaction?.entry_type === "refund");
+}
+
 function rowsFrom(result) {
   if (Array.isArray(result)) return result;
   return Array.isArray(result?.results) ? result.results : [];
@@ -205,6 +210,21 @@ async function loadMemberAllocations(db, transactionId, memberId) {
   );
 }
 
+async function loadSourcePaymentMethod(db, transaction) {
+  const payment = await first(
+    db,
+    `SELECT payment_method
+     FROM transaction_payments
+     WHERE transaction_id = ?
+       AND payment_status <> 'cancelled'
+       AND (payment_status <> 'refunded' OR ? = 'refund')
+     ORDER BY created_at, id
+     LIMIT 1`,
+    [transaction.id, transaction.entry_type],
+  );
+  return payment?.payment_method || "other";
+}
+
 async function findGeneratedRows(db, sourceProjectId, sourceTransactionId) {
   return all(
     db,
@@ -304,7 +324,10 @@ export async function validateSplitProject(db, projectId) {
   for (const transaction of transactions) {
     const transactionIssues = [];
     const transactionPayments = paymentsByTransaction.get(transaction.id) || [];
-    const activePayments = transactionPayments.filter((payment) => !INACTIVE_PAYMENT_STATUSES.has(payment.payment_status));
+    const activePayments = transactionPayments.filter((payment) => {
+      if (!INACTIVE_PAYMENT_STATUSES.has(payment.payment_status)) return true;
+      return payment.payment_status === "refunded" && transaction.entry_type === "refund";
+    });
     const transactionItems = itemsByTransaction.get(transaction.id) || [];
     const transactionAllocations = allocationsByTransaction.get(transaction.id) || [];
     const expected = Number(transaction.paid_amount || 0);
@@ -383,6 +406,7 @@ async function resolveUpsertContext(db, input, sourceMemberInput, optionsInput) 
       householdProject,
       householdMember,
       allocations,
+      sourcePaymentMethod: input.sourcePaymentMethod || input.source_payment_method || await loadSourcePaymentMethod(db, sourceTransaction),
       now: input.now,
       user: optionsInput?.user,
       statementCollector: optionsInput?.statementCollector,
@@ -418,6 +442,7 @@ async function resolveUpsertContext(db, input, sourceMemberInput, optionsInput) 
     householdProject,
     householdMember,
     allocations,
+    sourcePaymentMethod: options.sourcePaymentMethod || options.source_payment_method || await loadSourcePaymentMethod(db, sourceTransaction),
     now: options.now,
     user: options.user,
     statementCollector: options.statementCollector,
@@ -430,7 +455,7 @@ export async function upsertGeneratedHouseholdTransaction(db, input, sourceMembe
   const context = await resolveUpsertContext(db, input, sourceMemberInput, optionsInput);
   if (!context?.sourceTransaction) return { status: "not_found", transaction_id: null };
 
-  const { sourceTransaction, sourceProject, sourceMember, householdProject, householdMember } = context;
+  const { sourceTransaction, sourceProject, sourceMember, householdProject, householdMember, sourcePaymentMethod } = context;
   if (Number(sourceTransaction.generated_automatically) === 1) {
     return { status: "skipped", reason: "generated_source", transaction_id: sourceTransaction.id };
   }
@@ -460,7 +485,7 @@ export async function upsertGeneratedHouseholdTransaction(db, input, sourceMembe
     .map((allocation) => ({ ...allocation, allocated_amount: Number(allocation.allocated_amount || 0) }))
     .filter((allocation) => allocation.allocated_amount !== 0);
   const burden = sum(allocations, "allocated_amount");
-  if (burden === 0 || TERMINAL_SOURCE_STATUSES.has(sourceTransaction.status)) {
+  if (burden === 0 || terminalSourceTransaction(sourceTransaction)) {
     const cancelled = await cancelForMember(db, sourceTransaction.project_id, sourceTransaction.id, sourceMember.id, context);
     return {
       status: "cancelled",
@@ -558,19 +583,19 @@ export async function upsertGeneratedHouseholdTransaction(db, input, sourceMembe
       `INSERT INTO transaction_payments (
          id, transaction_id, payer_member_id, amount, payment_method, provider, account_label,
          external_payment_id, payment_status, occurred_at, created_at, updated_at
-       ) VALUES (?, ?, ?, ?, 'other', NULL, NULL, NULL, ?, ?, ?, ?)
+       ) VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?, ?, ?)
        ON CONFLICT(id) DO UPDATE SET
          transaction_id = excluded.transaction_id,
          payer_member_id = excluded.payer_member_id,
          amount = excluded.amount,
-         payment_method = 'other',
+         payment_method = excluded.payment_method,
          provider = NULL,
          account_label = NULL,
          external_payment_id = NULL,
          payment_status = excluded.payment_status,
          occurred_at = excluded.occurred_at,
          updated_at = excluded.updated_at`,
-    ).bind(paymentId, transactionId, householdMember.id, burden, status, sourceTransaction.occurred_at || now, now, now),
+    ).bind(paymentId, transactionId, householdMember.id, burden, sourcePaymentMethod || "other", status, sourceTransaction.occurred_at || now, now, now),
   ];
 
   const placeholders = itemRows.map(() => "?").join(", ");
@@ -767,7 +792,7 @@ export async function syncSplitTransactionToHouseholds(db, transactionInput, opt
   const statementCollector = options.statementCollector || [];
   const targetProjectIds = options.targetProjectIds || new Set();
   const operationOptions = { ...options, statementCollector, targetProjectIds };
-  if (TERMINAL_SOURCE_STATUSES.has(sourceTransaction.status)) {
+  if (terminalSourceTransaction(sourceTransaction)) {
     const cancelled = [];
     for (const row of existingRows) {
       if (!await canWriteHousehold(db, options.user, row.project_id)) {
