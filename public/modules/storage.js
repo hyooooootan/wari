@@ -1,6 +1,9 @@
 (function () {
 const STORAGE_KEY = "wari-data-v3";
 const LEGACY_STORAGE_KEY = "wari-data-v2";
+const GUEST_STORAGE_KEY = "wari-guest-state-v1";
+const CLOUD_STORAGE_PREFIX = "wari-cloud-state-v1:";
+const PENDING_SYNC_PREFIX = "wari-cloud-sync-v1:";
 const MIGRATION_TIMESTAMP = "1970-01-01T00:00:00.000Z";
 const STATE_KEYS = [
   "projects",
@@ -397,6 +400,68 @@ function saveState(state, storage = defaultStorage()) {
   return normalized;
 }
 
+function loadGuestState(storage = defaultStorage()) {
+  if (!storageLike(storage)) return createEmptyState();
+  const stored = readStoredObject(storage, GUEST_STORAGE_KEY);
+  return stored ? copyState(stored) : createEmptyState();
+}
+
+function saveGuestState(state, storage = defaultStorage()) {
+  if (!storageLike(storage)) throw new TypeError("A Storage-like object is required");
+  const normalized = copyState(state);
+  storage.setItem(GUEST_STORAGE_KEY, JSON.stringify(normalized));
+  return normalized;
+}
+
+function clearLegacyState(storage = defaultStorage()) {
+  if (!storageLike(storage) || typeof storage.removeItem !== "function") return;
+  storage.removeItem(STORAGE_KEY);
+  storage.removeItem(LEGACY_STORAGE_KEY);
+}
+
+function scopedStorageKey(prefix, userId) {
+  if (userId === undefined || userId === null || String(userId).trim() === "") {
+    throw new TypeError("userId is required");
+  }
+  return `${prefix}${encodedId(String(userId))}`;
+}
+
+function loadCloudState(userId, storage = defaultStorage()) {
+  if (!storageLike(storage)) return createEmptyState();
+  const stored = readStoredObject(storage, scopedStorageKey(CLOUD_STORAGE_PREFIX, userId));
+  return stored ? copyState(stored) : createEmptyState();
+}
+
+function saveCloudState(userId, state, storage = defaultStorage()) {
+  if (!storageLike(storage)) throw new TypeError("A Storage-like object is required");
+  const normalized = copyState(state);
+  storage.setItem(scopedStorageKey(CLOUD_STORAGE_PREFIX, userId), JSON.stringify(normalized));
+  return normalized;
+}
+
+function loadPendingSyncOperations(userId, storage = defaultStorage()) {
+  if (!storageLike(storage)) return [];
+  const stored = readStoredObject(storage, scopedStorageKey(PENDING_SYNC_PREFIX, userId));
+  return Array.isArray(stored?.operations)
+    ? stored.operations.filter((operation) => operation && typeof operation === "object").map((operation) => ({ ...operation, row: operation.row && typeof operation.row === "object" ? { ...operation.row } : operation.row }))
+    : [];
+}
+
+function savePendingSyncOperations(userId, operations, storage = defaultStorage()) {
+  if (!storageLike(storage)) throw new TypeError("A Storage-like object is required");
+  const normalized = Array.isArray(operations)
+    ? operations.filter((operation) => operation && typeof operation === "object").map((operation) => ({ ...operation, row: operation.row && typeof operation.row === "object" ? { ...operation.row } : operation.row }))
+    : [];
+  storage.setItem(scopedStorageKey(PENDING_SYNC_PREFIX, userId), JSON.stringify({ operations: normalized }));
+  return normalized;
+}
+
+function clearCloudState(userId, storage = defaultStorage()) {
+  if (!storageLike(storage) || typeof storage.removeItem !== "function") return;
+  storage.removeItem(scopedStorageKey(CLOUD_STORAGE_PREFIX, userId));
+  storage.removeItem(scopedStorageKey(PENDING_SYNC_PREFIX, userId));
+}
+
 function graphReferences(state, projectId) {
   const transactionIds = new Set(
     state.transactions.filter((transaction) => transaction.project_id === projectId).map((transaction) => transaction.id),
@@ -452,10 +517,21 @@ function mergeProjectGraph(state, graph) {
 const api = {
   STORAGE_KEY,
   LEGACY_STORAGE_KEY,
+  GUEST_STORAGE_KEY,
+  CLOUD_STORAGE_PREFIX,
+  PENDING_SYNC_PREFIX,
   createEmptyState,
   migrateLegacyData,
   loadState,
   saveState,
+  loadGuestState,
+  saveGuestState,
+  clearLegacyState,
+  loadCloudState,
+  saveCloudState,
+  loadPendingSyncOperations,
+  savePendingSyncOperations,
+  clearCloudState,
   mergeProjectGraph,
 };
 

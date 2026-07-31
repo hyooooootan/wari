@@ -3,9 +3,10 @@ import { readFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import { decryptRefreshToken, disconnectGmail, encryptRefreshToken, finishGmailOAuth, importCandidate, retryGmailRevocations, startGmailOAuth, syncGmail, updateCandidate } from "../functions/lib/gmail.js";
+import { bulkCandidateAction, decryptRefreshToken, disconnectGmail, encryptRefreshToken, finishGmailOAuth, gmailPaymentSearchQuery, importCandidate, listCandidates, retryGmailRevocations, startGmailOAuth, syncGmail, updateCandidate } from "../functions/lib/gmail.js";
 import { extractGmailText } from "../functions/lib/gmail-mime.js";
-import { parsePaymentNotification } from "../functions/lib/gmail-parsers.js";
+import { parsePaymentNotification, parseTrustedGmailPaymentNotification, trustedGmailPaymentProvider } from "../functions/lib/gmail-parsers.js";
+import { getProjectSummaries } from "../functions/lib/api-data.js";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
 const schema = readFileSync(`${root}/db/schema.sql`, "utf8");
@@ -65,7 +66,7 @@ async function syncFixture(messageBodies, existing = [], options = {}) {
     }
     const id = decodeURIComponent(String(url).split("/messages/")[1].split("?")[0]);
     detailCalls += 1;
-    return Response.json({ internalDate: options.internalDate, payload: { mimeType: "text/plain", headers: [{ name: "From", value: "notice@example.test" }, { name: "Date", value: options.dateHeader || "Fri, 10 Jul 2026 12:30:00 +0900" }], body: { data: base64Url(messageBodies[id]) } } });
+    return Response.json({ internalDate: options.internalDate, payload: { mimeType: "text/plain", headers: [{ name: "From", value: options.fromHeader || "statement@vpass.ne.jp" }, { name: "Subject", value: options.subjectHeader || "ご利用のお知らせ" }, { name: "Date", value: options.dateHeader || "Fri, 10 Jul 2026 12:30:00 +0900" }], body: { data: base64Url(messageBodies[id]) } } });
   });
   const encrypted = await encryptRefreshToken(env, "sync-fixture-connection", "user-1", "refresh-secret");
   db.raw.prepare("INSERT INTO gmail_connections (id,user_id,household_project_id,gmail_email,refresh_token_ciphertext,refresh_token_iv,key_generation,aad_version,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,1,'active',?,?)").run("sync-fixture-connection", "user-1", "personal-home", "mail@example.test", encrypted.ciphertext, encrypted.iv, 1, now, now);
@@ -95,16 +96,17 @@ test("Gmail sync passes a stable query and page token across pages", async (t) =
       return Response.json(pageToken ? { messages: [{ id: "page-2" }] } : { messages: [{ id: "page-1" }], nextPageToken: "next-page" });
     }
     const id = decodeURIComponent(parsedUrl.pathname.split("/messages/")[1]);
-    return Response.json({ id, payload: { mimeType: "text/plain", headers: [{ name: "Date", value: "Fri, 10 Jul 2026 12:30:00 +0900" }], body: { data: base64Url("amount: 1200\ndate: 2026/07/10\nmerchant: Shop") } } });
+    return Response.json({ id, payload: { mimeType: "text/plain", headers: [{ name: "From", value: "statement@vpass.ne.jp" }, { name: "Date", value: "Fri, 10 Jul 2026 12:30:00 +0900" }], body: { data: base64Url("amount: 1200\ndate: 2026/07/10\nmerchant: Shop") } } });
   });
   const encrypted = await encryptRefreshToken(env, "page-connection", "user-1", "refresh-secret");
   db.raw.prepare("INSERT INTO gmail_connections (id,user_id,household_project_id,gmail_email,refresh_token_ciphertext,refresh_token_iv,key_generation,aad_version,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,1,'active',?,?)").run("page-connection", "user-1", "personal-home", "mail@example.test", encrypted.ciphertext, encrypted.iv, 1, now, now);
   const first = await syncGmail(db, env, { id: "user-1" }, "page-connection", { days: 7, batch_size: 40 });
-  const second = await syncGmail(db, env, { id: "user-1" }, "page-connection", { days: 7, batch_size: 40, page_token: first.next_page_token, query_after: first.query_after });
+  const second = await syncGmail(db, env, { id: "user-1" }, "page-connection", { days: 7, batch_size: 40, page_token: first.next_page_token, query_after: first.query_after, query_before: first.query_before });
   assert.equal(requests.length, 2);
   assert.equal(requests[0].searchParams.get("maxResults"), "40");
   assert.equal(requests[1].searchParams.get("maxResults"), "40");
-  assert.equal(requests[0].searchParams.get("q"), 'after:' + first.query_after + ' from:statement@vpass.ne.jp -subject:"一定金額到達のお知らせ"');
+  assert.equal(requests[0].searchParams.get("q"), gmailPaymentSearchQuery(first.query_after));
+  assert.match(requests[0].searchParams.get("q"), /from:statement@vpass\.ne\.jp OR \(from:mail\.rakuten-card\.co\.jp subject:"カード利用のお知らせ"\) OR \(from:qa\.jcb\.co\.jp subject:"JCBカード／ショッピングご利用のお知らせ"\)/);
   assert.equal(requests[0].searchParams.get("q"), requests[1].searchParams.get("q"));
   assert.equal(requests[1].searchParams.get("pageToken"), "next-page");
   assert.equal(first.has_more, true);
@@ -117,6 +119,42 @@ test("Gmail sync rejects a batch size above the external request budget", async 
   const fixture = await syncFixture({});
   t.after(() => fixture.db.close());
   await assert.rejects(() => syncGmail(fixture.db, fixture.env, { id: "user-1" }, "sync-fixture-connection", { days: 7, batch_size: 41 }), (error) => error.status === 400 && error.message === "invalid_field");
+});
+
+test("Gmail date ranges use JST boundaries and remain fixed across pages", async (t) => {
+  const requests = [];
+  const fixture = await syncFixture({ "date-message": "amount: 1200\nmerchant: Shop" }, [], { onList: (url) => requests.push(url), internalDate: "1783438800000" });
+  t.after(() => fixture.db.close());
+  const first = await syncGmail(fixture.db, fixture.env, { id: "user-1" }, "sync-fixture-connection", { from_date: "2026-07-01", to_date: "2026-07-31", batch_size: 40 });
+  await syncGmail(fixture.db, fixture.env, { id: "user-1" }, "sync-fixture-connection", { from_date: "2026-07-01", to_date: "2026-07-31", batch_size: 40, page_token: "next", query_after: first.query_after, query_before: first.query_before });
+  assert.equal(requests[0].searchParams.get("q"), gmailPaymentSearchQuery(first.query_after, first.query_before));
+  assert.equal(requests[0].searchParams.get("q"), requests[1].searchParams.get("q"));
+  assert.equal(first.query_after, 1782831600);
+  await assert.rejects(() => syncGmail(fixture.db, fixture.env, { id: "user-1" }, "sync-fixture-connection", { from_date: "2026-08-01", to_date: "2026-07-01" }), (error) => error.status === 400);
+  await assert.rejects(() => syncGmail(fixture.db, fixture.env, { id: "user-1" }, "sync-fixture-connection", { from_date: "2026-01-01", to_date: "2026-04-01" }), (error) => error.status === 400);
+});
+
+test("Gmail candidates support range filtering and bulk actions without duplicate imports", async (t) => {
+  const fixture = await syncFixture({ first: "amount: 1200\nmerchant: Shop", second: "amount: 800\nmerchant: Cafe" }, [], { internalDate: "1783438800000" });
+  t.after(() => fixture.db.close());
+  await syncGmail(fixture.db, fixture.env, { id: "user-1" }, "sync-fixture-connection", { days: 7, batch_size: 40 });
+  const listed = await listCandidates(fixture.db, { id: "user-1" }, undefined, "2026-07-01", "2026-07-31");
+  assert.equal(listed.candidates.length, 2);
+  const ids = listed.candidates.map((row) => row.id);
+  const first = await bulkCandidateAction(fixture.db, { id: "user-1" }, { action: "import", candidate_ids: ids });
+  assert.equal(first.imported_count, 2);
+  const second = await bulkCandidateAction(fixture.db, { id: "user-1" }, { action: "import", candidate_ids: ids });
+  assert.equal(second.already_imported_count, 2);
+  const needsReview = await syncFixture({ review: "amount: 500" }, [], { internalDate: "1783438800000" });
+  t.after(() => needsReview.db.close());
+  await syncGmail(needsReview.db, needsReview.env, { id: "user-1" }, "sync-fixture-connection", { days: 7, batch_size: 40 });
+  const review = needsReview.db.raw.prepare("SELECT id FROM gmail_import_candidates").get();
+  needsReview.db.raw.prepare("UPDATE gmail_import_candidates SET status='needs_review' WHERE id=?").run(review.id);
+  const ignored = await bulkCandidateAction(needsReview.db, { id: "user-1" }, { action: "ignore", candidate_ids: [review.id, review.id] });
+  assert.equal(ignored.requested_count, 1);
+  assert.equal(needsReview.db.raw.prepare("SELECT status FROM gmail_import_candidates WHERE id=?").get(review.id).status, "ignored");
+  await assert.rejects(() => bulkCandidateAction(fixture.db, { id: "user-1" }, { action: "import", candidate_ids: [] }), (error) => error.status === 400);
+  await assert.rejects(() => bulkCandidateAction(fixture.db, { id: "user-1" }, { action: "import", candidate_ids: Array.from({ length: 51 }, (_, index) => `id-${index}`) }), (error) => error.status === 400);
 });
 
 test("AES-GCM token storage uses a 12-byte IV and binds connection, user, and generation through AAD", async () => {
@@ -209,7 +247,7 @@ test("multiple message and candidate writes roll back together and permit a late
   const db=new Database();t.after(()=>db.close());seed(db);const env=environment(async(url)=>{
     if(String(url).includes("oauth2.googleapis.com/token"))return Response.json({access_token:"access-secret"});
     if(String(url).includes("/messages?"))return Response.json({messages:[{id:"retry-message-1"},{id:"retry-message-2"}]});
-    return Response.json({internalDate:"1760000000000",payload:{mimeType:"text/plain",headers:[{name:"From",value:"notice@jcb.co.jp"}],body:{data:base64Url("amount 1200 2026/07/10 shop")}}});
+    return Response.json({internalDate:"1760000000000",payload:{mimeType:"text/plain",headers:[{name:"From",value:"statement@vpass.ne.jp"}],body:{data:base64Url("amount 1200 2026/07/10 shop")}}});
   });
   const encrypted=await encryptRefreshToken(env,"retry-connection","user-1","refresh-secret");
   db.raw.prepare(`INSERT INTO gmail_connections (id,user_id,household_project_id,gmail_email,refresh_token_ciphertext,refresh_token_iv,key_generation,aad_version,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,1,'active',?,?)`).run("retry-connection","user-1","personal-home","retry@example.test",encrypted.ciphertext,encrypted.iv,1,"2026-07-12T00:00:00.000Z","2026-07-12T00:00:00.000Z");
@@ -230,7 +268,7 @@ test("sync revalidates its selected personal household against each sharing mech
     const env=environment(async(url)=>{
       if(String(url).includes("oauth2.googleapis.com/token"))return Response.json({access_token:"access-secret"});
       if(String(url).includes("/messages?"))return Response.json({messages:[{id:"race-message-1"},{id:"race-message-2"}]});
-      return Response.json({payload:{mimeType:"text/plain",headers:[{name:"From",value:"notice@jcb.co.jp"}],body:{data:base64Url("amount 1200 2026/07/10 shop")}}});
+      return Response.json({payload:{mimeType:"text/plain",headers:[{name:"From",value:"statement@vpass.ne.jp"}],body:{data:base64Url("amount 1200 2026/07/10 shop")}}});
     });
     const encrypted=await encryptRefreshToken(env,"sync-race-connection","user-1","refresh-secret");
     db.raw.prepare("INSERT INTO gmail_connections (id,user_id,household_project_id,gmail_email,refresh_token_ciphertext,refresh_token_iv,key_generation,aad_version,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,1,'active',?,?)").run("sync-race-connection","user-1","personal-home","race@example.test",encrypted.ciphertext,encrypted.iv,1,now,now);
@@ -247,7 +285,7 @@ test("sync revalidates its selected personal household against each sharing mech
 });
 
 test("sync batch leaves no message or candidate after account deletion starts", async (t) => {
-  const db=new Database();t.after(()=>db.close());seed(db);const now="2026-07-12T00:00:00.000Z";const env=environment(async(url)=>{if(String(url).includes("oauth2.googleapis.com/token"))return Response.json({access_token:"access-secret"});if(String(url).includes("/messages?"))return Response.json({messages:[{id:"deletion-message"}]});return Response.json({payload:{mimeType:"text/plain",headers:[{name:"From",value:"notice@jcb.co.jp"}],body:{data:base64Url("amount 1200 2026/07/10 shop")}}});});
+  const db=new Database();t.after(()=>db.close());seed(db);const now="2026-07-12T00:00:00.000Z";const env=environment(async(url)=>{if(String(url).includes("oauth2.googleapis.com/token"))return Response.json({access_token:"access-secret"});if(String(url).includes("/messages?"))return Response.json({messages:[{id:"deletion-message"}]});return Response.json({payload:{mimeType:"text/plain",headers:[{name:"From",value:"statement@vpass.ne.jp"}],body:{data:base64Url("amount 1200 2026/07/10 shop")}}});});
   const encrypted=await encryptRefreshToken(env,"deletion-sync","user-1","refresh-secret");db.raw.prepare("INSERT INTO gmail_connections (id,user_id,household_project_id,gmail_email,refresh_token_ciphertext,refresh_token_iv,key_generation,aad_version,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,1,'active',?,?)").run("deletion-sync","user-1","personal-home","deletion@example.test",encrypted.ciphertext,encrypted.iv,1,now,now);
   db.beforeBatch=async()=>db.raw.prepare("UPDATE users SET deletion_started_at=? WHERE id=?").run(now,"user-1");
   const result=await syncGmail(db,env,{id:"user-1"},"deletion-sync",{days:7,limit:1});assert.equal(result.run.status,"failed");assert.equal(result.run.candidate_count,0);assert.equal(db.raw.prepare("SELECT count(*) AS n FROM gmail_messages").get().n,0);assert.equal(db.raw.prepare("SELECT count(*) AS n FROM gmail_import_candidates").get().n,0);
@@ -380,7 +418,7 @@ test("sync stores structured candidates, deduplicates Gmail Message ID, and reta
     calls.push(String(url));
     if (String(url).includes("oauth2.googleapis.com/token")) return Response.json({ access_token:"access-secret" });
     if (String(url).includes("/messages?")) return Response.json({ messages:[{ id:"message-1" }] });
-    return Response.json({ id:"message-1", payload:{ mimeType:"text/plain", headers:[{name:"From",value:"notice@jcb.co.jp"},{name:"Date",value:"Fri, 10 Jul 2026 12:30:00 +0900"}], body:{data:base64Url("利用金額: 2,500円\n利用日時: 2026/07/10 12:30\n利用先: 安全商店")}} });
+    return Response.json({ id:"message-1", payload:{ mimeType:"text/plain", headers:[{name:"From",value:"notice@qa.jcb.co.jp"},{name:"Subject",value:"JCBカード／ショッピングご利用のお知らせ"},{name:"Date",value:"Fri, 10 Jul 2026 12:30:00 +0900"}], body:{data:base64Url("利用金額: 2,500円\n利用日時: 2026/07/10 12:30\n利用先: 安全商店")}} });
   };
   const env=environment(fetch); const encrypted=await encryptRefreshToken(env,"connection-1","user-1","refresh-secret");
   db.raw.prepare(`INSERT INTO gmail_connections (id,user_id,household_project_id,gmail_email,refresh_token_ciphertext,refresh_token_iv,key_generation,aad_version,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,1,'active',?,?)`).run("connection-1","user-1","personal-home","mail@example.test",encrypted.ciphertext,encrypted.iv,1,"2026-07-12T00:00:00.000Z","2026-07-12T00:00:00.000Z");
@@ -446,6 +484,29 @@ test("parallel candidate imports create one transaction and return the same resu
   db.raw.prepare("INSERT INTO gmail_import_candidates (id,connection_id,gmail_message_row_id,user_id,status,merchant_name,amount,occurred_at,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)").run("parallel-candidate","parallel-connection","parallel-message","user-1","ready","Shop",1000,now,now,now);
   const results=await Promise.all([importCandidate(db,{id:"user-1"},"parallel-candidate",{project_id:"personal-home"}),importCandidate(db,{id:"user-1"},"parallel-candidate",{project_id:"personal-home"})]);
   assert.equal(results[0].import.id,results[1].import.id);assert.equal(results[0].transaction.id,results[1].transaction.id);assert.equal(db.raw.prepare("SELECT count(*) AS n FROM transactions").get().n,1);
+});
+
+test("Gmailのクレジットカード返金を負数で家計簿と集計へ登録する", async (t) => {
+  const db = new Database();
+  t.after(() => db.close());
+  seed(db);
+  const now = "2026-07-12T00:00:00.000Z";
+  db.raw.prepare("INSERT INTO project_members (id,project_id,display_name,role,is_active,created_at,updated_at) VALUES (?,?,?,?,?,?,?)").run("refund-member", "personal-home", "Owner", "owner", 1, now, now);
+  db.raw.prepare("INSERT INTO gmail_connections (id,user_id,household_project_id,gmail_email,refresh_token_ciphertext,refresh_token_iv,key_generation,aad_version,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,1,'active',?,?)").run("refund-connection", "user-1", "personal-home", "refund@example.test", "x", "y", 1, now, now);
+  db.raw.prepare("INSERT INTO gmail_sync_runs (id,connection_id,user_id,days,message_limit,status,started_at) VALUES (?,?,?,?,?,'completed',?)").run("refund-run", "refund-connection", "user-1", 7, 1, now);
+  db.raw.prepare("INSERT INTO gmail_messages (id,connection_id,gmail_message_id,sync_run_id,parse_status,created_at) VALUES (?,?,?,?,?,?)").run("refund-message", "refund-connection", "refund-gmail-id", "refund-run", "parsed", now);
+  db.raw.prepare("INSERT INTO gmail_import_candidates (id,connection_id,gmail_message_row_id,user_id,status,merchant_name,amount,occurred_at,payment_method,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)").run("refund-candidate", "refund-connection", "refund-message", "user-1", "ready", "Card refund", -1500, now, "credit_card", now, now);
+
+  const imported = await importCandidate(db, { id: "user-1" }, "refund-candidate");
+  assert.equal(imported.transaction.paid_amount, -1500);
+  assert.equal(imported.transaction.entry_type, "refund");
+  assert.equal(imported.transaction.status, "refunded");
+  const payment = db.raw.prepare("SELECT amount,payment_method,payment_status FROM transaction_payments WHERE transaction_id=?").get(imported.transaction.id);
+  assert.deepEqual({ ...payment }, { amount: -1500, payment_method: "credit_card", payment_status: "refunded" });
+  const summaries = await getProjectSummaries(db, "personal-home");
+  assert.equal(summaries.summary.confirmed_total, -1500);
+  assert.equal(summaries.summary.excluded_total, 0);
+  assert.deepEqual(summaries.by_payment_method.map((row) => ({ ...row })), [{ payment_method: "credit_card", transaction_count: 1, total_amount: -1500 }]);
 });
 
 test("payment parsing requires a nonzero body amount and distinguishes review states", () => {
@@ -548,4 +609,89 @@ test("payment amount parsing excludes billing and cumulative labels", () => {
   assert.equal(parsePaymentNotification("ご利用累計金額\n75,855円\n通知設定金額 70,000円", { received_at: "2026-07-10T00:00:00.000Z" }).parse_status, "ignored");
   assert.equal(parsePaymentNotification("請求金額: 75,855円", { received_at: "2026-07-10T00:00:00.000Z" }).parse_status, "parse_error");
   assert.equal(parsePaymentNotification("ご利用金額: 1,200円\n利用先: Shop", { received_at: "2026-07-10T00:00:00.000Z" }).parse_status, "parsed");
+});
+
+test("楽天カードとJCBの利用通知を候補へ変換する", () => {
+  const receivedAt = "2026-07-10T03:04:05.000Z";
+  const rakuten = parsePaymentNotification("ご利用金額：￥3,980円\nご利用店名：楽天市場", {
+    from: "楽天カード <info@mail.rakuten-card.co.jp>",
+    received_at: receivedAt,
+  });
+  assert.deepEqual({
+    provider: rakuten.provider,
+    amount: rakuten.amount,
+    merchant_name: rakuten.merchant_name,
+    parse_status: rakuten.parse_status,
+  }, {
+    provider: "rakuten_card",
+    amount: 3980,
+    merchant_name: "楽天市場",
+    parse_status: "parsed",
+  });
+
+  const jcb = parsePaymentNotification("ご利用額：2,500円\nご利用先：安全商店", {
+    from: "MyJCB <notice@qa.jcb.co.jp>",
+    received_at: receivedAt,
+  });
+  assert.deepEqual({
+    provider: jcb.provider,
+    amount: jcb.amount,
+    merchant_name: jcb.merchant_name,
+    parse_status: jcb.parse_status,
+  }, {
+    provider: "jcb",
+    amount: 2500,
+    merchant_name: "安全商店",
+    parse_status: "parsed",
+  });
+});
+
+test("他社の請求確定通知と使いすぎ通知を取引候補から除外する", () => {
+  const receivedAt = "2026-07-10T03:04:05.000Z";
+  assert.equal(parsePaymentNotification("ご請求金額のご案内\nご利用金額 75,855円", {
+    from: "info@mail.rakuten-card.co.jp",
+    subject: "ご請求金額のご案内",
+    received_at: receivedAt,
+  }).parse_status, "ignored");
+  assert.equal(parsePaymentNotification("使いすぎアラート\nご利用金額 70,000円", {
+    from: "notice@qa.jcb.co.jp",
+    subject: "使いすぎアラート",
+    received_at: receivedAt,
+  }).parse_status, "ignored");
+  assert.equal(parsePaymentNotification("ご利用額 2,500円\nご利用先 安全商店\n使いすぎアラートも設定できます", {
+    from: "notice@qa.jcb.co.jp",
+    subject: "JCBカード／ショッピングご利用のお知らせ",
+    received_at: receivedAt,
+  }).parse_status, "parsed");
+});
+
+test("同期対象の送信元と件名を厳密に検査する", async (t) => {
+  assert.equal(trustedGmailPaymentProvider("三井住友カード <statement@vpass.ne.jp>"), "smbc_card");
+  assert.equal(trustedGmailPaymentProvider("楽天カード <info@mail.rakuten-card.co.jp>"), "rakuten_card");
+  assert.equal(trustedGmailPaymentProvider("MyJCB <notice@qa.jcb.co.jp>"), "jcb");
+  assert.equal(trustedGmailPaymentProvider("mail.rakuten-card.co.jp <attacker@example.test>"), null);
+  assert.equal(trustedGmailPaymentProvider("notice@qa.jcb.co.jp.evil.test"), null);
+  assert.equal(trustedGmailPaymentProvider("\"mail <info@mail.rakuten-card.co.jp>\" <attacker@example.test>"), null);
+
+  const trusted = parseTrustedGmailPaymentNotification("ご利用金額: 2,500円\nご利用先: 安全商店", {
+    from: "MyJCB <notice@qa.jcb.co.jp>",
+    subject: "JCBカード／ショッピングご利用のお知らせ",
+    received_at: "2026-07-10T03:04:05.000Z",
+  });
+  assert.equal(trusted.parse_status, "parsed");
+  assert.equal(trusted.provider, "jcb");
+  assert.equal(parseTrustedGmailPaymentNotification("キャンペーン利用額: 2,500円\n対象店舗名: 安全商店", {
+    from: "MyJCB <notice@qa.jcb.co.jp>",
+    subject: "JCBキャンペーンのご案内",
+    received_at: "2026-07-10T03:04:05.000Z",
+  }).parse_status, "parse_error");
+
+  const spoofed = await syncFixture({ spoofed: "ご利用金額: 2,500円\nご利用先: 安全商店" }, [], {
+    fromHeader: "mail.rakuten-card.co.jp <attacker@example.test>",
+    subjectHeader: "カード利用のお知らせ",
+  });
+  t.after(() => spoofed.db.close());
+  const result = await syncGmail(spoofed.db, spoofed.env, { id: "user-1" }, "sync-fixture-connection", { days: 7, limit: 1 });
+  assert.equal(result.candidate_count, 0);
+  assert.equal(spoofed.db.raw.prepare("SELECT parse_status FROM gmail_messages").get().parse_status, "parse_error");
 });

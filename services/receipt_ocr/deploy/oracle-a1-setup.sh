@@ -41,4 +41,13 @@ tesseract --version
 tesseract --list-langs
 ollama list
 
-echo "Done. Copy deploy/wari-receipt-ocr.service to /etc/systemd/system/ after adjusting paths."
+ENV_FILE="${OCR_ENV_FILE:-/etc/wari-receipt-ocr.env}"
+sudo install -d -m 0755 "$(dirname "$ENV_FILE")"
+if [ ! -e "$ENV_FILE" ]; then
+  sudo install -o root -g root -m 0600 /dev/null "$ENV_FILE"
+else
+  sudo chown root:root "$ENV_FILE"
+  sudo chmod 0600 "$ENV_FILE"
+fi
+
+echo "Done. Set RECEIPT_OCR_SHARED_SECRET in $ENV_FILE, then copy deploy/wari-receipt-ocr.service to /etc/systemd/system/."

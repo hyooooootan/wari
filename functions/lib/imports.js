@@ -248,6 +248,26 @@ export async function reconcileImport(db, first, second, third = {}, fourth = {}
   return detachImport(db, importRecord, "parsed", parsed.details);
 }
 
+export async function updateImportReviewDate(db, projectId, importId, occurredAt) {
+  requireDb(db);
+  const resolvedProjectId = requiredString(projectId, "projectId");
+  const resolvedImportId = requiredString(importId, "importId");
+  const normalized = normalizeDate(occurredAt);
+  if (!normalized) throw new TypeError("occurred_at_raw is invalid");
+  const timestamp = new Date().toISOString();
+  const result = await boundStatement(
+    db,
+    `UPDATE import_records
+     SET occurred_at_raw = ?,
+         source_status = CASE WHEN source_status = 'error' THEN 'review' ELSE source_status END,
+         updated_at = ?
+     WHERE id = ? AND project_id = ? AND source_status IN ('received', 'parsed', 'review', 'error')`,
+    [normalized, timestamp, resolvedImportId, resolvedProjectId],
+  ).run();
+  if (!Number(result?.meta?.changes || 0)) throw new Error("Import record is not editable");
+  return { import: await firstRow(db, "SELECT * FROM import_records WHERE id = ? AND project_id = ?", [resolvedImportId, resolvedProjectId]) };
+}
+
 export async function applyResolvedTransactionFields(db, transactionId, options = {}) {
   requireDb(db);
   const resolvedTransactionId = requiredString(transactionId?.transaction_id ?? transactionId, "transactionId");

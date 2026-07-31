@@ -40,7 +40,7 @@ test("calendar entry keeps the selected local day and month in sync", () => {
 
   assert.match(
     dateSource,
-    /date\.getTime\(\) - date\.getTimezoneOffset\(\) \* 60_000\)\.toISOString\(\)\.slice\(0, 10\)/,
+    /japanDateParts\(new Date\(\)\)\.date/,
   );
   assert.match(entrySource, /occurred_at: data\.get\("occurred_at"\) \|\| ui\.calendarDay/);
   assert.match(entrySource, /ui\.calendarDay = String\(data\.get\("occurred_at"\) \|\| ui\.calendarDay\)/);
@@ -54,5 +54,19 @@ test("calendar totals include provisional transactions and retain status tags", 
   assert.match(calendarSource, /const monthTotal = monthTransactions\.reduce\(/);
   assert.match(appSource, /function statusTag\(status\)/);
   assert.match(appSource, /provisional: /);
-  assert.match(appSource, /statusTag\(transaction\.status\)/);
+  assert.match(appSource, /transactionStatusTags\(transaction\)/);
+});
+
+test("calendar includes negative refund transactions and amount fields accept refunds", () => {
+  const filterSource = functionSource("includedLedgerTransaction");
+  const calendarSource = functionSource("calendarTransactions");
+  const summarySource = functionSource("householdSummaryGroups");
+
+  assert.match(filterSource, /status !== "refunded" \|\| transaction\?\.entry_type === "refund"/);
+  assert.match(calendarSource, /includedLedgerTransaction\(transaction\)/);
+  assert.match(summarySource, /filter\(confirmedLedgerTransaction\)/);
+  assert.match(summarySource, /relatedTransaction\?\.entry_type === "refund"/);
+  assert.match(appSource, /返金はマイナスで入力/);
+  assert.doesNotMatch(appSource, /id="split-amount"[^>]*min="1"/);
+  assert.doesNotMatch(appSource, /id="calendar-amount"[^>]*min="0"/);
 });

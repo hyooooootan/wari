@@ -175,6 +175,7 @@ function createFetchClient(options = {}) {
   const baseUrl = values.baseUrl ?? values.baseURL ?? "/api";
   const defaultHeaders = { Accept: "application/json", ...(values.headers || {}) };
   let csrfToken = values.csrfToken || "";
+  let shareToken = values.shareToken || "";
 
   function cookieValue(name) {
     if (typeof document === "undefined") return "";
@@ -190,6 +191,7 @@ function createFetchClient(options = {}) {
     const url = `${joinUrl(baseUrl, path)}${queryString(requestOptions.query)}`;
     const headers = new Headers(defaultHeaders);
     for (const [key, value] of new Headers(requestOptions.headers || {})) headers.set(key, value);
+    if (shareToken && !headers.has("authorization")) headers.set("authorization", `Bearer ${shareToken}`);
     if (["POST", "PUT", "PATCH", "DELETE"].includes(method) && !headers.has("x-csrf-token")) {
       csrfToken = csrfToken || cookieValue("wari_csrf");
       if (csrfToken) headers.set("x-csrf-token", csrfToken);
@@ -251,7 +253,13 @@ function createFetchClient(options = {}) {
     return data;
   }
 
-  return { request, fetchJson: request, apiRequest: request, setCsrfToken: (value) => { csrfToken = String(value || ""); } };
+  return {
+    request,
+    fetchJson: request,
+    apiRequest: request,
+    setCsrfToken: (value) => { csrfToken = String(value || ""); },
+    setShareToken: (value) => { shareToken = String(value || ""); },
+  };
 }
 
 function routedRow(parentOrRow, maybeRow, parentField) {
@@ -495,10 +503,24 @@ function createApiClient(options = {}) {
     const options = limitOrOptions && typeof limitOrOptions === "object" ? limitOrOptions : { limit: limitOrOptions };
     return request(`/gmail/connections/${encoded(connectionId)}/sync`, { method: "POST", json: { days, ...options } });
   };
-  const listGmailCandidates = (status) => request("/gmail/candidates", { query: status ? { status } : undefined });
+  const listGmailCandidates = (status, range = {}) => request("/gmail/candidates", { query: {
+    ...(status ? { status } : {}),
+    ...(range.from_date ? { from_date: range.from_date } : {}),
+    ...(range.to_date ? { to_date: range.to_date } : {}),
+  } });
+  const bulkGmailCandidates = (action, candidateIds) => request("/gmail/candidates/bulk", {
+    method: "POST",
+    json: { action, candidate_ids: candidateIds },
+  });
   const updateGmailCandidate = (candidateId, values) => request(`/gmail/candidates/${encoded(candidateId)}`, { method: "PATCH", json: values });
   const importGmailCandidate = (candidateId) => request(`/gmail/candidates/${encoded(candidateId)}/import`, { method: "POST", json: {} });
   const updateImportRecord = (importId, row = {}) => {
+    if (row.occurred_at_raw !== undefined) {
+      return request(`/imports/${encoded(importId, "importId")}`, {
+        method: "PATCH",
+        json: { occurred_at_raw: row.occurred_at_raw },
+      });
+    }
     if (row.source_status === "linked" && row.transaction_id) {
       return reconcileImport(importId, { action: "link", transaction_id: row.transaction_id });
     }
@@ -517,6 +539,9 @@ function createApiClient(options = {}) {
     method: "POST",
     json: payload,
   });
+  const listProjectShares = (projectId) => request(`/projects/${encoded(projectId, "projectId")}/shares`);
+  const revokeProjectShare = (projectId, shareId) => request(`/projects/${encoded(projectId, "projectId")}/shares/${encoded(shareId, "shareId")}`, { method: "DELETE" });
+  const revokeAllProjectShares = (projectId) => request(`/projects/${encoded(projectId, "projectId")}/shares`, { method: "DELETE" });
   const getSharedProject = (token) => request(`/share/${encoded(token, "token")}`);
   const getSession = () => request("/auth/session");
   const startGoogleLogin = () => request("/auth/google/start", { method: "POST" });
@@ -684,6 +709,7 @@ function createApiClient(options = {}) {
     disconnectGmail,
     syncGmail,
     listGmailCandidates,
+    bulkGmailCandidates,
     updateGmailCandidate,
     importGmailCandidate,
     getProjectSummaries,
@@ -693,6 +719,12 @@ function createApiClient(options = {}) {
     reopenProject,
     createProjectShare,
     createShare: createProjectShare,
+    listProjectShares,
+    listShares: listProjectShares,
+    revokeProjectShare,
+    revokeShare: revokeProjectShare,
+    revokeAllProjectShares,
+    revokeAllShares: revokeAllProjectShares,
     getSharedProject,
     getShare: getSharedProject,
     getSession,
