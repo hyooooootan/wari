@@ -68,6 +68,7 @@ const GMAIL_PROVIDER_NAMES = {
   paypay: "PayPay",
 };
 const GMAIL_SUPPORTED_PROVIDERS = "三井住友カード、楽天カード、JCB";
+const PREVIEW_HOUSEHOLD = Object.freeze({ id: "", name: "家計簿", project_type: "household" });
 
 if (!Storage || !Split) throw new Error("WariStorage and WariSplit are required");
 
@@ -100,8 +101,6 @@ const ui = {
   calendarEntryOpen: false,
   calendarTransactionId: null,
   householdSummaries: {},
-  csvPreview: null,
-  csvSourceType: "",
   drafts: {
     createSplit: { name: "", participant: "", store: "", amount: "", payer: "", occurred_at: today() },
     createHousehold: { name: "", owner_name: "自分" },
@@ -350,6 +349,10 @@ function gmailSyncTotalsMessage(totals) {
 }
 
 function renderGmailProgress() {
+  if (cloudSession.status !== "authenticated") {
+    document.querySelector("[data-gmail-progress]")?.remove();
+    return;
+  }
   const section = [...document.querySelectorAll(".import-section")].find((row) => row.querySelector("[data-gmail-sync],[data-gmail-candidate-form],[data-gmail-connect]"));
   if (!section) return;
   let element = section.querySelector("[data-gmail-progress]");
@@ -1292,13 +1295,6 @@ function renderHouseholdTransactions(project) {
   return `<section aria-labelledby="household-transactions-title"><div class="section-heading filter-heading"><div><h2 id="household-transactions-title">取引</h2><span>${transactions.length}件</span></div><label class="month-filter"><span>月</span><input type="month" value="${esc(selectedMonth)}" data-household-month></label></div>${form}<div class="transaction-list">${transactions.length ? transactions.map(renderTransactionRow).join("") : `<div class="empty-state">取引はありません</div>`}</div></section>`;
 }
 
-function renderCsvPreview() {
-  if (!ui.csvPreview?.rows?.length) return "";
-  const rows = ui.csvPreview.rows.slice(0, 8);
-  const width = Math.max(...rows.map((row) => row.length), 0);
-  return `<div class="csv-preview"><div class="inline-heading"><strong>${esc(ui.csvPreview.name)}</strong><span>${ui.csvPreview.totalRows}行</span></div><div class="table-scroll"><table><tbody>${rows.map((row, rowIndex) => `<tr>${Array.from({ length: width }, (_, index) => `<${rowIndex === 0 ? "th" : "td"}>${esc(row[index] || "")}</${rowIndex === 0 ? "th" : "td"}>`).join("")}</tr>`).join("")}</tbody></table></div><button class="button household-button full-width" type="button" data-import-csv>確認へ追加</button></div>`;
-}
-
 function renderImportReview(project, projectIds = new Set([project.id]), includeGmail = true) {
   const records = state.import_records
     .filter((row) => projectIds.has(row.project_id) && ["received", "parsed", "review", "error"].includes(row.source_status))
@@ -1319,30 +1315,18 @@ function renderImportReview(project, projectIds = new Set([project.id]), include
 }
 
 function renderHouseholdImports(project, projectIds = new Set([project.id])) {
-  const includeGmail = primaryHouseholdProject()?.id === project.id;
-  const receipt = `<section class="import-section"><div class="inline-heading"><h3>レシート</h3></div><div class="file-actions"><label class="file-button household-file"><input type="file" accept="image/jpeg,image/png,image/webp" data-household-receipt="${esc(project.id)}"><span>画像を選ぶ</span></label><label class="file-button secondary-button"><input type="file" accept="image/jpeg,image/png,image/webp" capture="environment" data-household-receipt="${esc(project.id)}"><span>撮影する</span></label></div><small>JPEG、PNG、WebP・5MB以下</small></section>`;
-  const csv = `<section class="import-section"><div class="inline-heading"><h3>CSV</h3></div><div class="csv-controls"><select data-csv-source aria-label="CSVの種類"><option value="">自動判定</option><option value="card_csv" ${ui.csvSourceType === "card_csv" ? "selected" : ""}>カード</option><option value="paypay_csv" ${ui.csvSourceType === "paypay_csv" ? "selected" : ""}>PayPay</option><option value="bank_csv" ${ui.csvSourceType === "bank_csv" ? "selected" : ""}>銀行</option><option value="manual" ${ui.csvSourceType === "manual" ? "selected" : ""}>その他</option></select><label class="file-button household-file"><input type="file" accept=".csv,text/csv" data-csv-file="${esc(project.id)}"><span>CSVを選ぶ</span></label></div>${renderCsvPreview()}</section>`;
+  const includeGmail = cloudSession.status === "authenticated" && primaryHouseholdProject()?.id === project.id;
+  const receiptDisabled = cloudSession.status === "authenticated" ? "" : "disabled";
+  const receipt = `<section class="import-section"><div class="inline-heading"><h3>レシート</h3>${cloudSession.status === "authenticated" ? "" : `<button class="small-button" type="button" data-google-login>ログイン</button>`}</div><div class="file-actions"><label class="file-button household-file"><input type="file" accept="image/jpeg,image/png,image/webp,image/heic,image/heif" data-household-receipt="${esc(project.id)}" ${receiptDisabled}><span>画像を選ぶ</span></label><label class="file-button secondary-button"><input type="file" accept="image/*" capture="environment" data-household-receipt="${esc(project.id)}" ${receiptDisabled}><span>撮影する</span></label></div></section>`;
+  const csv = `<section class="import-section"><div class="inline-heading"><h3>CSV</h3></div><div class="csv-controls"><select data-csv-source aria-label="CSVの種類" ${receiptDisabled}><option value="">自動判定</option><option value="card_csv" ${ui.csvSourceType === "card_csv" ? "selected" : ""}>カード</option><option value="paypay_csv" ${ui.csvSourceType === "paypay_csv" ? "selected" : ""}>PayPay</option><option value="bank_csv" ${ui.csvSourceType === "bank_csv" ? "selected" : ""}>銀行</option><option value="manual" ${ui.csvSourceType === "manual" ? "selected" : ""}>その他</option></select><label class="file-button household-file"><input type="file" accept=".csv,text/csv" data-csv-file="${esc(project.id)}" ${receiptDisabled}><span>CSVを選ぶ</span></label></div>${renderCsvPreview()}</section>`;
   const notification = `<section class="import-section"><div class="inline-heading"><h3>通知</h3></div><form id="notification-import-form" class="form-stack"><textarea class="textarea" name="raw_text" rows="4" placeholder="通知本文" required></textarea><button class="button secondary-button" type="submit">確認へ追加</button></form></section>`;
   return `<section aria-labelledby="imports-title"><div class="section-heading"><div><h2 id="imports-title">取込</h2><span>${state.import_records.filter((row) => projectIds.has(row.project_id)).length}件</span></div></div><div class="import-tools">${receipt}${csv}${notification}</div><section class="review-section" aria-labelledby="review-title"><div class="inline-heading"><h3 id="review-title">確認待ち</h3></div><div class="review-list">${renderImportReview(project, projectIds, includeGmail)}</div></section></section>`;
 }
 
-function renderLocalReceiptTrial() {
-  const result = ui.localReceipt;
-  const details = result
-    ? `<div class="review-row-value"><strong>${esc(result.store_name || "店名を確認してください")}</strong><span>${esc(result.paid_at || "購入日を確認してください")}</span><strong>${esc(result.total_amount == null ? "金額を確認してください" : yen(result.total_amount))}</strong></div>`
-    : "";
-  return `<section class="import-section"><div class="inline-heading"><h3>レシートの読取り</h3></div><p>ローカル確認用です。読取結果は保存されません。</p><div class="file-actions"><label class="file-button household-file"><input type="file" accept="image/jpeg,image/png,image/webp" data-local-receipt><span>画像を選ぶ</span></label><label class="file-button secondary-button"><input type="file" accept="image/jpeg,image/png,image/webp" capture="environment" data-local-receipt><span>撮影する</span></label></div><small>JPEG、PNG、WebP・5MB以下</small>${details}</section>`;
-}
-
 function renderCalendarImports() {
-  const project = primaryHouseholdProject();
-  if (!project) {
-    const content = localOcrProxy()
-      ? renderLocalReceiptTrial()
-      : `<div class="empty-state">レシートを保存するには、Googleでログインして家計簿を作成してください</div>`;
-    return `<section class="calendar-section" aria-labelledby="home-heading"><div class="page-heading"><h1 id="home-heading">家計簿</h1></div>${renderCalendarTabs()}${content}</section>`;
-  }
-  const projectIds = new Set([project.id]);
+  const savedProject = primaryHouseholdProject();
+  const project = savedProject || PREVIEW_HOUSEHOLD;
+  const projectIds = new Set(savedProject ? [savedProject.id] : []);
   return `<section class="calendar-section" aria-labelledby="home-heading"><div class="page-heading"><h1 id="home-heading">家計簿</h1></div>${renderCalendarTabs()}${renderHouseholdImports(project, projectIds)}</section>`;
 }
 
@@ -1656,6 +1640,9 @@ async function createSplitProject(form) {
 }
 
 function renderGmailImport(project) {
+  if (cloudSession.status !== "authenticated") {
+    return `<section class="import-section"><div class="inline-heading"><h3>Gmail支払い通知</h3><button class="button secondary-button" type="button" data-google-login>Googleでログイン</button></div><div class="empty-state compact-empty">接続はありません</div></section>`;
+  }
   const connections = gmailUi.connections.filter((row) => row.household_project_id === project.id).map((row) => `<div class="review-row"><div class="review-row-value"><strong>${esc(row.gmail_email)}</strong><span>${esc(row.status)}</span></div><div class="review-actions"><select data-gmail-days="${esc(row.id)}"><option value="7">7日</option><option value="30" selected>30日</option><option value="90">90日</option></select><button class="small-button household-small" type="button" data-gmail-sync="${esc(row.id)}">同期</button><button class="small-button" type="button" data-gmail-disconnect="${esc(row.id)}">解除</button></div></div>`).join("");
   const candidates = gmailUi.candidates.filter((row) => !["ignored", "imported", "parse_error"].includes(row.status)).map((row) => {
     const complete = String(row.merchant_name || "").trim() && Number.isSafeInteger(row.amount) && row.amount !== 0 && row.occurred_at;
@@ -2529,10 +2516,9 @@ async function handleSplitReceipt(input) {
 }
 
 async function handleHouseholdReceipt(input) {
-  const project = projectById(input.dataset.householdReceipt);
   if (!input.files?.[0]) return;
-  if (!project) {
-    if (!localOcrProxy() || input.dataset.localReceipt === undefined) return;
+  const selectedProject = projectById(input.dataset.householdReceipt);
+  if (!selectedProject && input.dataset.localReceipt !== undefined && localOcrProxy()) {
     toast("レシートを読み取っています");
     try {
       ui.localReceipt = await readReceiptFile(input.files[0]);
@@ -2543,30 +2529,18 @@ async function handleHouseholdReceipt(input) {
     }
     return;
   }
+  if (cloudSession.status !== "authenticated") {
+    input.value = "";
+    toast("レシート読み取りにはログインが必要です");
+    return;
+  }
+  const project = selectedProject || await ensureHouseholdCalendar();
   toast("レシートを読み取っています");
   try {
     const result = await readReceiptFile(input.files[0], project.id);
     addReceiptImport(project, result);
   } catch (error) {
     toast(receiptOcrErrorMessage(error));
-  }
-}
-
-async function handleCsvFile(input) {
-  const file = input.files?.[0];
-  if (!file) return;
-  try {
-    const text = Imports.decodeCsvArrayBuffer(await file.arrayBuffer());
-    const rows = Imports.parseCsvRows(text, { maxRows: 5001 });
-    if (rows.length < 2) throw new Error("CSVに取引行がありません");
-    const sourceType = Imports.selectCsvSourceType(ui.csvSourceType, file.name, rows.slice(0, 6));
-    ui.csvSourceType = sourceType;
-    ui.csvPreview = { name: file.name, text, rows, totalRows: rows.length - 1, sourceType };
-    render();
-  } catch (error) {
-    ui.csvPreview = null;
-    render();
-    toast(error.message || "CSVを読み込めませんでした");
   }
 }
 
@@ -2861,7 +2835,7 @@ document.addEventListener("submit", async (event) => {
     else if (form.id === "add-item-form" && project && transaction) addItem(project, transaction, form);
     else if (form.id === "edit-transaction-form" && project && transaction) updateTransaction(project, transaction, form);
     else if (form.id === "add-household-transaction-form" && project) addHouseholdTransaction(project, form);
-    else if (form.id === "notification-import-form" && project) addNotificationImport(project, String(new FormData(form).get("raw_text") || ""));
+    else if (form.id === "notification-import-form") addNotificationImport(project || await ensureHouseholdCalendar(), String(new FormData(form).get("raw_text") || ""));
   } catch (error) {
     toast(error.message || "保存できませんでした");
   }
@@ -2893,6 +2867,10 @@ document.addEventListener("click", async (event) => {
       return;
     }
     if (button.dataset.gmailConnect !== undefined) {
+      if (cloudSession.status !== "authenticated") {
+        await startGoogleLogin();
+        return;
+      }
       const result = await Api.startGmailConnection();
       if (!result?.url) throw new Error("Gmailの認可先を取得できませんでした");
       location.assign(result.url);
@@ -3141,10 +3119,6 @@ document.addEventListener("click", async (event) => {
     : "この家計簿データを削除しますか？ Gmail接続がある場合は、Google認可の取消後に削除します。取消に失敗した場合は家計簿を残し、削除操作を再試行できます。";
   if (button.dataset.deleteProject && project && confirm(deleteProjectMessage)) {
     await deleteProject(project);
-    return;
-  }
-  if (button.dataset.importCsv !== undefined && project) {
-    addCsvImports(project);
     return;
   }
   if (button.dataset.createFromImport && project) {
