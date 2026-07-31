@@ -322,6 +322,19 @@ export async function validateSplitProject(db, projectId) {
   const transactionResults = [];
 
   for (const transaction of transactions) {
+    if (terminalSourceTransaction(transaction)) {
+      transactionResults.push({
+        transaction_id: transaction.id,
+        valid: true,
+        excluded: true,
+        amount: Number(transaction.paid_amount || 0),
+        payment_total: 0,
+        item_total: 0,
+        allocation_total: 0,
+        issues: [],
+      });
+      continue;
+    }
     const transactionIssues = [];
     const transactionPayments = paymentsByTransaction.get(transaction.id) || [];
     const activePayments = transactionPayments.filter((payment) => {

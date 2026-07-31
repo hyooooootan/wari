@@ -1,3 +1,5 @@
+import base64
+import binascii
 import json
 import os
 import urllib.error
@@ -16,6 +18,8 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 GEMINI_OCR_MODEL = os.environ.get("GEMINI_OCR_MODEL", "gemini-2.5-flash")
 OCR_BACKEND = os.environ.get("OCR_BACKEND", "local").lower()
 MAX_BODY_SIZE = 8 * 1024 * 1024
+MAX_IMAGE_BYTES = 5 * 1024 * 1024
+IMAGE_MIME_TYPES = {"image/jpeg", "image/png", "image/webp"}
 
 
 class WariHandler(SimpleHTTPRequestHandler):
@@ -25,6 +29,13 @@ class WariHandler(SimpleHTTPRequestHandler):
     def end_headers(self):
         self.send_header("Cache-Control", "no-store")
         super().end_headers()
+
+    def do_GET(self):
+        if self.path == "/api/ocr-health":
+            status, payload = ocr_health()
+            self.send_json(status, payload)
+            return
+        super().do_GET()
 
     def do_POST(self):
         if self.path != "/api/ocr-receipt":
@@ -38,7 +49,7 @@ class WariHandler(SimpleHTTPRequestHandler):
             return
 
         if length <= 0 or length > MAX_BODY_SIZE:
-            self.send_json(413, {"error": "image_too_large", "message": "画像は8MB以下にしてください。"})
+            self.send_json(413, {"error": "image_too_large", "message": "JPEG、PNG、WebPで5MB以下の画像を選択してください。"})
             return
 
         try:
@@ -49,8 +60,8 @@ class WariHandler(SimpleHTTPRequestHandler):
             self.send_json(400, {"error": "invalid_request", "message": "画像データを読み取れませんでした。"})
             return
 
-        if not isinstance(image_data_url, str) or not image_data_url.startswith("data:image/"):
-            self.send_json(400, {"error": "invalid_image", "message": "画像ファイルを選択してください。"})
+        if not valid_image_data_url(image_data_url):
+            self.send_json(415, {"error": "unsupported_image_type", "message": "JPEG、PNG、WebPで5MB以下の画像を選択してください。"})
             return
 
         try:
@@ -58,8 +69,10 @@ class WariHandler(SimpleHTTPRequestHandler):
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
             self.send_json(502, {"error": "ocr_provider_error", "message": detail[:1000]})
+        except ModuleNotFoundError:
+            self.send_json(503, {"error": "ocr_dependencies_missing", "message": "ローカルOCRの依存関係がありません。services/receipt_ocr/requirements.txt を導入してください。"})
         except Exception as exc:
-            self.send_json(500, {"error": "server_error", "message": str(exc)})
+            self.send_json(502, {"error": "ocr_processing_failed", "message": "ローカルOCRの処理に失敗しました。"})
 
     def send_json(self, status, payload):
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -86,6 +99,36 @@ def read_receipt(image_data_url):
     from services.receipt_ocr.core import read_receipt_from_data_url
 
     return read_receipt_from_data_url(image_data_url)
+
+
+def valid_image_data_url(image_data_url):
+    if not isinstance(image_data_url, str):
+        return False
+    header, separator, encoded = image_data_url.partition(",")
+    if not separator or not encoded or not header.startswith("data:") or not header.endswith(";base64"):
+        return False
+    mime_type = header.removeprefix("data:").split(";")[0].lower()
+    if mime_type not in IMAGE_MIME_TYPES:
+        return False
+    padding = 2 if encoded.endswith("==") else 1 if encoded.endswith("=") else 0
+    if len(encoded) > ((MAX_IMAGE_BYTES + 2) // 3) * 4 or (len(encoded) * 3) // 4 - padding > MAX_IMAGE_BYTES:
+        return False
+    try:
+        base64.b64decode(encoded, validate=True)
+    except (ValueError, binascii.Error):
+        return False
+    return True
+
+
+def ocr_health():
+    if OCR_BACKEND not in {"local", "tesseract_ollama"}:
+        return 200, {"ok": True, "backend": OCR_BACKEND}
+    try:
+        from services.receipt_ocr import core
+
+        return 200, {"ok": callable(getattr(core, "read_receipt_from_data_url", None)), "backend": OCR_BACKEND}
+    except ModuleNotFoundError:
+        return 503, {"ok": False, "error": "ocr_dependencies_missing", "install": "pip install -r services/receipt_ocr/requirements.txt"}
 
 
 def openai_receipt_schema():

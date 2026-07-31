@@ -1,5 +1,5 @@
-import * as ApiModule from "./modules/api.js?v=20260713-personal-household";
-import * as ImportsModule from "./modules/imports.js?v=20260712-ledger6";
+import * as ApiModule from "./modules/api.js?v=20260726-issues-16-27";
+import * as ImportsModule from "./modules/imports.js?v=20260726-issues-16-27";
 import * as HouseholdModule from "./modules/household.js?v=20260713-personal-household";
 
 const Storage = globalThis.WariStorage;
@@ -60,16 +60,26 @@ const PROJECT_TYPES = {
   split: "割り勘",
   household: "家計簿",
 };
+const JAPAN_TIME_ZONE = "Asia/Tokyo";
+const GMAIL_PROVIDER_NAMES = {
+  smbc_card: "三井住友カード",
+  rakuten_card: "楽天カード",
+  jcb: "JCB",
+  paypay: "PayPay",
+};
+const GMAIL_SUPPORTED_PROVIDERS = "三井住友カード、楽天カード、JCB";
 
 if (!Storage || !Split) throw new Error("WariStorage and WariSplit are required");
 
-let state = Storage.loadState();
+let state = Storage.loadGuestState ? Storage.loadGuestState() : Storage.loadState();
 let isCloud = false;
 let cloudSession = { status: "checking", user: null };
 let savingCount = 0;
 let activeProjectId = null;
 let lastToastTimer = 0;
 let remoteSyncQueue = Promise.resolve();
+let cloudCacheUserId = null;
+let pendingSyncOperations = [];
 const gmailUi = { connections: [], candidates: [], total_count: 0, has_more: false, from_date: gmailDefaultFromDate(), to_date: gmailDefaultToDate() };
 const gmailSyncing = new Set();
 const gmailSyncProgress = new Map();
@@ -101,6 +111,10 @@ const ui = {
     createSplit: { status: "", type: "", items: [] },
     split: { status: "", type: "", items: [] },
   },
+  localReceipt: null,
+  share: { projectId: null, shares: [], lastUrl: "" },
+  accountDeletionFailed: false,
+  accountDeletionMessage: "",
 };
 
 function now() {
@@ -108,8 +122,7 @@ function now() {
 }
 
 function today() {
-  const date = new Date();
-  return new Date(date.getTime() - date.getTimezoneOffset() * 60_000).toISOString().slice(0, 10);
+  return japanDateParts(new Date()).date;
 }
 
 function makeId(prefix) {
@@ -159,12 +172,91 @@ function formatDate(value, withTime = false) {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return String(value).slice(0, 10);
   return new Intl.DateTimeFormat("ja-JP", withTime
-    ? { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" }
-    : { year: "numeric", month: "numeric", day: "numeric" }).format(date);
+    ? { timeZone: JAPAN_TIME_ZONE, month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" }
+    : { timeZone: JAPAN_TIME_ZONE, year: "numeric", month: "numeric", day: "numeric" }).format(date);
+}
+
+function normalizedDate(value) {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/u.exec(String(value || "").slice(0, 10));
+  if (!match) return null;
+  const [year, month, day] = match.slice(1).map(Number);
+  const probe = new Date(Date.UTC(year, month - 1, day));
+  if (probe.getUTCFullYear() !== year || probe.getUTCMonth() !== month - 1 || probe.getUTCDate() !== day) return null;
+  return `${match[1]}-${match[2]}-${match[3]}`;
+}
+
+function hasExplicitTimeZone(value) {
+  return /(?:Z|[+-]\d{2}:?\d{2})$/iu.test(String(value || "").trim());
+}
+
+function japanDateParts(value) {
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) return { date: null, time: null };
+  const values = Object.fromEntries(new Intl.DateTimeFormat("en-CA", {
+    timeZone: JAPAN_TIME_ZONE,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(date).filter((part) => part.type !== "literal").map((part) => [part.type, part.value]));
+  return {
+    date: `${values.year}-${values.month}-${values.day}`,
+    time: `${values.hour}:${values.minute}`,
+  };
 }
 
 function dateValue(value) {
-  return String(value || today()).slice(0, 10);
+  const text = String(value || "").trim();
+  const localDate = normalizedDate(text);
+  if (localDate && !hasExplicitTimeZone(text)) return localDate;
+  return japanDateParts(text).date || today();
+}
+
+function gmailDateTimeInputValue(value) {
+  const text = String(value || "").trim();
+  if (!text) return "";
+  const localDate = normalizedDate(text);
+  if (localDate && !hasExplicitTimeZone(text)) return text.slice(0, 16);
+  const parts = japanDateParts(text);
+  return parts.date && parts.time ? `${parts.date}T${parts.time}` : "";
+}
+
+function gmailDateTimeToUtc(value) {
+  const text = String(value || "").trim();
+  if (!text) return null;
+  const match = /^(\d{4}-\d{2}-\d{2})T([01]\d|2[0-3]):([0-5]\d)$/u.exec(text);
+  if (!match || !normalizedDate(match[1])) throw new Error("Gmail候補の日時を確認してください");
+  const timestamp = new Date(`${match[1]}T${match[2]}:${match[3]}:00+09:00`);
+  if (Number.isNaN(timestamp.getTime())) throw new Error("Gmail候補の日時を確認してください");
+  return timestamp.toISOString();
+}
+
+function receiptOccurredAt(result) {
+  const paidAt = normalizedDate(result?.paid_at);
+  if (!paidAt) return null;
+  const paidTime = String(result?.paid_time || "").trim();
+  if (!paidTime) return paidAt;
+  if (!/^([01]\d|2[0-3]):[0-5]\d(?::[0-5]\d)?$/u.test(paidTime)) return paidAt;
+  return `${paidAt}T${paidTime.length === 5 ? `${paidTime}:00` : paidTime}+09:00`;
+}
+
+function receiptOcrErrorMessage(error) {
+  if (error?.code === "ocr_upstream_unavailable") return "OCRサーバーへ接続できません。接続先の状態を確認してから再試行してください。";
+  if (error?.code === "ocr_timeout") return "OCRの応答が時間切れになりました。時間をおいて再試行してください。";
+  if (error?.code === "remote_ocr_unauthorized" || error?.code === "missing_receipt_ocr_shared_secret") {
+    return "OCRサーバーの認証設定を確認してください。";
+  }
+  if (error?.code === "missing_receipt_ocr_api_url" || error?.code === "invalid_receipt_ocr_api_url") {
+    return "OCRサーバーの接続先設定を確認してください。";
+  }
+  return error?.message || "レシートを読み取れませんでした";
+}
+
+function localOcrProxy() {
+  const host = String(globalThis.location?.hostname || "").toLowerCase();
+  return host === "127.0.0.1" || host === "localhost" || host === "::1";
 }
 
 function normalizeMerchant(value) {
@@ -177,8 +269,42 @@ function cloneState(source = state) {
   return next;
 }
 
+function stateWithoutSharedProjects(source = state) {
+  const next = cloneState(source);
+  const sharedProjectIds = new Set(shareTokensByProject.keys());
+  if (!sharedProjectIds.size) return next;
+  const transactionIds = new Set(next.transactions
+    .filter((row) => sharedProjectIds.has(row.project_id))
+    .map((row) => row.id));
+  const itemIds = new Set(next.transaction_items
+    .filter((row) => transactionIds.has(transactionId(row)))
+    .map((row) => row.id));
+  next.projects = next.projects.filter((row) => !sharedProjectIds.has(row.id));
+  next.project_members = next.project_members.filter((row) => !sharedProjectIds.has(row.project_id));
+  next.transactions = next.transactions.filter((row) => !transactionIds.has(row.id));
+  next.transaction_payments = next.transaction_payments.filter((row) => !transactionIds.has(transactionId(row)));
+  next.transaction_items = next.transaction_items.filter((row) => !transactionIds.has(transactionId(row)));
+  next.item_allocations = next.item_allocations.filter((row) => !itemIds.has(itemId(row)));
+  next.import_records = next.import_records.filter((row) => !sharedProjectIds.has(row.project_id));
+  return next;
+}
+
+function pendingSyncOperationsForCloudCache() {
+  const sharedProjectIds = new Set(shareTokensByProject.keys());
+  return pendingSyncOperations.filter((operation) => {
+    if (operation.table === "pending_action") return !sharedProjectIds.has(operation.pending_action?.project_id);
+    return !sharedProjectIds.has(projectIdForOperation(operation));
+  });
+}
+
 function saveLocal() {
-  state = Storage.saveState(state);
+  if (isCloud && cloudCacheUserId) {
+    Storage.saveCloudState(cloudCacheUserId, stateWithoutSharedProjects(state));
+    Storage.savePendingSyncOperations(cloudCacheUserId, pendingSyncOperationsForCloudCache());
+    return;
+  }
+  if (isCloud) return;
+  state = Storage.saveGuestState ? Storage.saveGuestState(state) : Storage.saveState(state);
 }
 
 function toast(message) {
@@ -236,8 +362,8 @@ function renderGmailProgress() {
   }
   const progress = [...gmailSyncProgress.values()][0];
   element.textContent = progress
-    ? `Gmail同期中\n確認済み: ${progress.listed_count} / 1000件\n新規候補: ${progress.candidate_count}件\n重複: ${progress.duplicate_count}件\n除外: ${progress.ignored_count}件\n取込対象: 三井住友カード`
-    : "Gmail取込対象: 三井住友カード";
+    ? `Gmail同期中\n確認済み: ${progress.listed_count} / 1000件\n新規候補: ${progress.candidate_count}件\n重複: ${progress.duplicate_count}件\n除外: ${progress.ignored_count}件\n取込対象: ${GMAIL_SUPPORTED_PROVIDERS}`
+    : `Gmail取込対象: ${GMAIL_SUPPORTED_PROVIDERS}`;
 }
 
 function renderGmailCandidateControls() {
@@ -248,7 +374,7 @@ function renderGmailCandidateControls() {
     controls = document.createElement("div");
     controls.dataset.gmailPeriodControls = "true";
     controls.className = "form-panel form-stack";
-    controls.innerHTML = '<div class="field-grid"><label class="field">開始日<input class="input" type="date" data-gmail-from-date></label><label class="field">終了日<input class="input" type="date" data-gmail-to-date></label></div><p>取引日時はメール受信時刻を使用します</p><p>検索対象: 三井住友カード</p>';
+    controls.innerHTML = `<div class="field-grid"><label class="field">開始日<input class="input" type="date" data-gmail-from-date></label><label class="field">終了日<input class="input" type="date" data-gmail-to-date></label></div><p>取引日時はメール受信時刻を使用します</p><p>検索対象: ${GMAIL_SUPPORTED_PROVIDERS}</p>`;
     section.prepend(controls);
   }
   controls.querySelector("[data-gmail-from-date]").value = gmailUi.from_date;
@@ -354,6 +480,7 @@ async function syncGmailImport(connectionId, days) {
 
 function statusText() {
   if (savingCount > 0) return "保存中";
+  if (isCloud && pendingSyncOperations.length) return `クラウド保存待ち: ${pendingSyncOperations.length}件`;
   return isCloud ? "クラウド" : "この端末";
 }
 
@@ -370,6 +497,14 @@ function diffStates(before, after) {
   const creates = [];
   const updates = [];
   const deletes = [];
+  const projectIdByTransaction = new Map([
+    ...(before.transactions || []),
+    ...(after.transactions || []),
+  ].map((row) => [row.id, row.project_id]));
+  const transactionIdByItem = new Map([
+    ...(before.transaction_items || []),
+    ...(after.transaction_items || []),
+  ].map((row) => [row.id, transactionId(row)]));
   const generatedTransactionIds = new Set([
     ...before.transactions.filter((row) => row.generated_automatically === 1).map((row) => row.id),
     ...after.transactions.filter((row) => row.generated_automatically === 1).map((row) => row.id),
@@ -384,15 +519,31 @@ function diffStates(before, after) {
     if (table === "item_allocations") return generatedItemIds.has(itemId(row));
     return false;
   };
+  const operationProjectId = (table, row) => {
+    if (table === "projects") return row.id;
+    if (table === "project_members" || table === "transactions" || table === "import_records") return row.project_id;
+    if (table === "transaction_payments" || table === "transaction_items") return projectIdByTransaction.get(transactionId(row)) || null;
+    if (table === "item_allocations") return projectIdByTransaction.get(transactionIdByItem.get(itemId(row))) || null;
+    return null;
+  };
+  const operation = (action, table, id, row, previous) => ({
+    action,
+    table,
+    id,
+    row,
+    previous,
+    project_id: operationProjectId(table, row),
+    generated: generatedOperation(table, row),
+  });
   for (const table of STATE_KEYS) {
     const oldRows = new Map((before[table] || []).map((row) => [row.id, row]));
     const newRows = new Map((after[table] || []).map((row) => [row.id, row]));
     for (const [id, row] of oldRows) {
-      if (!newRows.has(id)) deletes.push({ action: "delete", table, id, row, previous: row, generated: generatedOperation(table, row) });
+      if (!newRows.has(id)) deletes.push(operation("delete", table, id, row, row));
     }
     for (const [id, row] of newRows) {
-      if (!oldRows.has(id)) creates.push({ action: "create", table, id, row, previous: null, generated: generatedOperation(table, row) });
-      else if (rowChanged(oldRows.get(id), row)) updates.push({ action: "update", table, id, row, previous: oldRows.get(id), generated: generatedOperation(table, row) });
+      if (!oldRows.has(id)) creates.push(operation("create", table, id, row, null));
+      else if (rowChanged(oldRows.get(id), row)) updates.push(operation("update", table, id, row, oldRows.get(id)));
     }
   }
   creates.sort((left, right) => TABLE_ORDER[left.table] - TABLE_ORDER[right.table]);
@@ -410,6 +561,7 @@ function itemId(row) {
 }
 
 function projectIdForOperation(operation) {
+  if (operation.project_id) return operation.project_id;
   const row = operation.row || {};
   if (operation.table === "projects") return row.id;
   if (operation.table === "project_members" || operation.table === "transactions" || operation.table === "import_records") return row.project_id;
@@ -509,7 +661,7 @@ async function syncOperation(operation) {
 }
 
 async function syncOperations(operations, remoteAction = null) {
-  if (!isCloud || operations.length === 0 && typeof remoteAction !== "function") return;
+  if (!isCloud || operations.length === 0) return;
   savingCount += 1;
   renderStatus();
   try {
@@ -540,13 +692,208 @@ async function syncOperations(operations, remoteAction = null) {
       if (!item || generatedTransactionForItem(item)) continue;
       await Api.replaceItemAllocations(transactionItemId, allocationsFor(transactionItemId));
     }
-    if (typeof remoteAction === "function") await remoteAction();
   } catch (error) {
     toast(`端末へ保存しました。クラウド保存に失敗しました: ${error.message}`);
   } finally {
     savingCount -= 1;
     renderStatus();
   }
+}
+
+function queueSyncOperations(operations, pendingAction = null) {
+  if (!isCloud) return;
+  const durable = operations.filter((operation) => !operation.generated);
+  if (!durable.length && !pendingAction) return;
+  const batchId = makeId("sync");
+  pendingSyncOperations.push(...durable.map((operation) => ({ ...operation, row: operation.row ? { ...operation.row } : operation.row, pending_batch_id: batchId, retry_count: 0, last_error: null })));
+  if (pendingAction) {
+    pendingSyncOperations.push({
+      action: "remote_action",
+      table: "pending_action",
+      id: makeId("pending-action"),
+      pending_action: { ...pendingAction },
+      pending_batch_id: batchId,
+      retry_count: 0,
+      last_error: null,
+    });
+  }
+  saveLocal();
+}
+
+async function runPendingAction(action) {
+  if (!action || typeof action !== "object") throw new Error("保存待ち操作を確認してください");
+  if (action.kind === "finalize_project") return Api.finalizeProject(action.project_id);
+  if (action.kind === "reopen_project") return Api.reopenProject(action.project_id);
+  if (action.kind === "import_csv") return Api.importCsv(action.project_id, action.payload);
+  if (action.kind === "import_receipt") return Api.importReceipt(action.project_id, action.payload);
+  if (action.kind === "import_notification") return Api.importNotification(action.project_id, action.payload);
+  if (action.kind === "reconcile_import") return Api.reconcileImport(action.import_id, action.payload);
+  throw new Error("保存待ち操作を確認してください");
+}
+
+async function pendingActionAlreadyApplied(action) {
+  if (!action || typeof action !== "object" || typeof Api.getProject !== "function" || !action.project_id) return false;
+  try {
+    const graph = await Api.getProject(action.project_id);
+    const project = graph?.projects?.find((row) => row.id === action.project_id);
+    if (action.kind === "finalize_project") return Boolean(project?.finalized_at);
+    if (action.kind === "reopen_project") return project?.finalized_at === null || project?.finalized_at === undefined;
+    if (action.kind !== "reconcile_import") return false;
+    const record = graph?.import_records?.find((row) => row.id === action.import_id);
+    if (!record) return false;
+    if (action.payload?.action === "link") {
+      return record.source_status === "linked" && record.transaction_id === action.payload.transaction_id;
+    }
+    if (action.payload?.action === "reject") return record.source_status === "rejected";
+    if (action.payload?.action === "create") {
+      return record.source_status === "linked" && record.transaction_id === action.payload.new_transaction_id;
+    }
+  } catch {
+    return false;
+  }
+  return false;
+}
+
+function remoteRowMatchesOperation(row, operation) {
+  const ignored = new Set(["created_at", "updated_at"]);
+  const changedFields = Object.keys(operation.row || {}).filter((field) => {
+    if (ignored.has(field)) return false;
+    if (!operation.previous || !Object.prototype.hasOwnProperty.call(operation.previous, field)) return true;
+    return operation.previous[field] !== operation.row[field];
+  });
+  return changedFields.every((field) => {
+    const expected = operation.row[field];
+    const actual = row[field];
+    return actual === expected || (actual == null && expected == null);
+  });
+}
+
+async function remoteOperationAlreadyApplied(operation) {
+  if (typeof Api.getProject !== "function") return false;
+  const projectId = projectIdForOperation(operation);
+  if (!projectId) return false;
+  let graph;
+  try {
+    graph = await Api.getProject(projectId);
+  } catch (error) {
+    return operation.action === "delete" && operation.table === "projects" && Number(error?.status) === 404;
+  }
+  const rows = Array.isArray(graph?.[operation.table]) ? graph[operation.table] : [];
+  const row = rows.find((candidate) => candidate.id === operation.id);
+  if (operation.action === "delete") return !row;
+  if (operation.action === "create") return Boolean(row);
+  return Boolean(row) && remoteRowMatchesOperation(row, operation);
+}
+
+async function sendPendingSyncOperations(operations) {
+  const operation = operations[0];
+  if (!operation) return [];
+  let completed = [operation];
+  try {
+    if (operation.table === "pending_action") {
+      try {
+        await runPendingAction(operation.pending_action);
+      } catch (error) {
+        if (!await pendingActionAlreadyApplied(operation.pending_action)) throw error;
+      }
+      return completed;
+    }
+    if (operation.action === "create" && operation.table === "projects" && operation.row.project_type === "household") {
+      const memberOperation = operations.find((entry) => entry.action === "create"
+        && entry.table === "project_members"
+        && entry.row.project_id === operation.id
+        && entry.row.role === "owner");
+      if (memberOperation) {
+        completed = [operation, memberOperation];
+        try {
+          await syncOperation({ ...operation, initialMember: memberOperation.row });
+        } catch (error) {
+          const graph = await Api.getProject?.(operation.id);
+          const projectExists = Array.isArray(graph?.projects) && graph.projects.some((row) => row.id === operation.id);
+          const memberExists = Array.isArray(graph?.project_members) && graph.project_members.some((row) => row.id === memberOperation.id);
+          if (!projectExists || !memberExists) throw error;
+        }
+        return completed;
+      }
+    }
+    if (operation.table === "item_allocations") {
+      const transactionItemId = itemId(operation.row);
+      completed = operations.filter((entry) => entry.table === "item_allocations" && itemId(entry.row) === transactionItemId);
+      const item = state.transaction_items.find((row) => row.id === transactionItemId);
+      if (item && !generatedTransactionForItem(item)) {
+        try {
+          await Api.replaceItemAllocations(transactionItemId, allocationsFor(transactionItemId));
+        } catch (error) {
+          const applied = await Promise.all(completed.map((entry) => remoteOperationAlreadyApplied(entry)));
+          if (!applied.every(Boolean)) throw error;
+        }
+      }
+      return completed;
+    }
+    try {
+      await syncOperation(operation);
+    } catch (error) {
+      if (!await remoteOperationAlreadyApplied(operation)) throw error;
+    }
+    return completed;
+  } catch (error) {
+    error.pending_operations = completed;
+    throw error;
+  }
+}
+
+function removePendingSyncOperations(operations) {
+  const completed = new Set(operations);
+  pendingSyncOperations = pendingSyncOperations.filter((operation) => !completed.has(operation));
+  saveLocal();
+}
+
+async function flushPendingSyncOperations() {
+  if (!isCloud || !pendingSyncOperations.length) return true;
+  savingCount += 1;
+  renderStatus();
+  try {
+    while (pendingSyncOperations.length) {
+      const batchId = pendingSyncOperations[0].pending_batch_id || pendingSyncOperations[0].id;
+      const batch = pendingSyncOperations.filter((operation) => (operation.pending_batch_id || operation.id) === batchId);
+      try {
+        const completed = await sendPendingSyncOperations(batch);
+        removePendingSyncOperations(completed);
+      } catch (error) {
+        const failed = Array.isArray(error?.pending_operations) && error.pending_operations.length
+          ? error.pending_operations
+          : [batch[0]];
+        for (const operation of failed) {
+          operation.retry_count = Number(operation.retry_count || 0) + 1;
+          operation.last_error = String(error?.code || error?.message || "sync_failed").slice(0, 160);
+        }
+        saveLocal();
+        toast(`クラウドへの保存に失敗しました: ${error.message}`);
+        return false;
+      }
+    }
+    return true;
+  } finally {
+    savingCount -= 1;
+    renderStatus();
+  }
+}
+
+function applyPendingSyncOperations(source) {
+  const next = cloneState(source);
+  for (const operation of pendingSyncOperations) {
+    if (!STATE_KEYS.includes(operation.table)) continue;
+    const rows = next[operation.table];
+    const index = rows.findIndex((row) => row.id === operation.id);
+    if (operation.action === "delete") {
+      if (index >= 0) rows.splice(index, 1);
+      continue;
+    }
+    if (!operation.row || typeof operation.row !== "object") continue;
+    if (index >= 0) rows[index] = { ...rows[index], ...operation.row };
+    else rows.push({ ...operation.row });
+  }
+  return next;
 }
 
 function commitState(next, message, options = {}) {
@@ -558,7 +905,8 @@ function commitState(next, message, options = {}) {
   if (options.render !== false) render();
   if (message) toast(message);
   const remoteOperations = typeof options.remoteFilter === "function" ? operations.filter(options.remoteFilter) : operations;
-  const queuedSync = remoteSyncQueue.then(() => syncOperations(remoteOperations, options.remoteAction || null));
+  queueSyncOperations(remoteOperations, options.pendingAction || null);
+  const queuedSync = remoteSyncQueue.then(() => flushPendingSyncOperations());
   remoteSyncQueue = queuedSync.catch(() => {});
   return queuedSync;
 }
@@ -636,8 +984,9 @@ function typeLabel(project) {
 }
 
 function shell(content) {
+  const accountDeletionNotice = ui.accountDeletionMessage ? `<span class="save-status">${esc(ui.accountDeletionMessage)}</span>` : "";
   const account = cloudSession.status === "authenticated"
-    ? `<span class="save-status">${esc(cloudSession.user?.name || cloudSession.user?.email || "ログイン中")}</span><button class="text-button" type="button" data-google-logout>ログアウト</button>`
+    ? `${accountDeletionNotice}<span class="save-status">${esc(cloudSession.user?.name || cloudSession.user?.email || "ログイン中")}</span><button class="text-button" type="button" data-google-logout>ログアウト</button><button class="text-button danger-text" type="button" data-delete-account>${ui.accountDeletionFailed ? "アカウント削除を再試行" : "アカウントを削除"}</button>`
     : cloudSession.status === "unauthenticated"
       ? `<button class="small-button" type="button" data-google-login>Googleでログイン</button>`
       : cloudSession.status === "error"
@@ -713,7 +1062,7 @@ function renderCalendarEntryForm(project) {
 
 function renderHouseholdCalendar() {
   const transactions = calendarTransactions();
-  const monthTransactions = transactions.filter((transaction) => String(transaction.occurred_at).slice(0, 7) === ui.calendarMonth);
+  const monthTransactions = transactions.filter((transaction) => dateValue(transaction.occurred_at).slice(0, 7) === ui.calendarMonth);
   const byDay = new Map();
   for (const transaction of monthTransactions) {
     const day = dateValue(transaction.occurred_at);
@@ -767,7 +1116,7 @@ function renderOcrBox(target) {
   const receipt = ui.ocr[target];
   if (!receipt) return "";
   const items = receipt.items.length ? `<div class="ocr-preview"><div class="inline-heading"><strong>品目</strong><span>${receipt.items.length}件</span></div>${receipt.items.map((item, index) => `<div class="ocr-item"><input class="input" data-ocr-name="${target}:${index}" value="${esc(item.name)}" aria-label="品目名"><input class="input amount-input" type="number" inputmode="numeric" min="0" data-ocr-amount="${target}:${index}" value="${integer(item.amount)}" aria-label="品目金額"><button class="icon-button quiet" type="button" data-remove-ocr="${target}:${index}" aria-label="品目を削除">×</button></div>`).join("")}</div>` : "";
-  return `<div class="receipt-control"><div class="file-actions"><label class="file-button"><input type="file" accept="image/jpeg,image/png,image/webp,image/heic,image/heif" data-receipt-target="${target}"><span>画像を選ぶ</span></label><label class="file-button secondary-button"><input type="file" accept="image/*" capture="environment" data-receipt-target="${target}"><span>撮影する</span></label></div><div class="field-message ${esc(receipt.type)}" aria-live="polite">${esc(receipt.status)}</div>${items}</div>`;
+  return `<div class="receipt-control"><div class="file-actions"><label class="file-button"><input type="file" accept="image/jpeg,image/png,image/webp" data-receipt-target="${target}"><span>画像を選ぶ</span></label><label class="file-button secondary-button"><input type="file" accept="image/jpeg,image/png,image/webp" capture="environment" data-receipt-target="${target}"><span>撮影する</span></label></div><div class="field-message ${esc(receipt.type)}" aria-live="polite">${esc(receipt.status)}</div><small>JPEG、PNG、WebP・5MB以下</small>${items}</div>`;
 }
 
 function renderCreateDialog() {
@@ -902,7 +1251,23 @@ function renderSplitSettlement(project) {
   const finalize = project.finalized_at
     ? `<button class="button secondary-button" type="button" data-reopen-project="${esc(project.id)}">再開</button>`
     : `<button class="button primary-button" type="button" data-finalize-project="${esc(project.id)}" ${validation.valid ? "" : "disabled"}>確定</button>`;
-  return `<section aria-labelledby="settlement-title"><div class="section-heading"><div><h2 id="settlement-title">精算</h2><span>${transactionsFor(project.id).length}件</span></div></div>${validation.valid ? "" : `<div class="notice error-notice">金額が一致していない取引が ${validation.transactions.filter((row) => !row.valid).length}件あります</div>`}<div class="summary-grid"><div class="summary-cell"><span>取引合計</span><strong>${esc(yen(calculation.total_burden))}</strong></div><div class="summary-cell"><span>参加者</span><strong>${calculation.members.length}人</strong></div></div><section class="settlement-section"><div class="inline-heading"><h3>支払い</h3><span>${calculation.transfers.length}件</span></div><div class="transfer-list">${transfers}</div></section><section class="settlement-section"><div class="inline-heading"><h3>内訳</h3></div><div class="balance-list">${balances}</div></section><section class="settlement-section"><div class="inline-heading"><h3>家計簿連携</h3></div><div class="link-summary">${links || `<div class="empty-state compact-empty">参加者はいません</div>`}</div></section><div class="settlement-actions">${finalize}<button class="button secondary-button" type="button" data-share-project="${esc(project.id)}">共有リンク</button></div><div id="share-box" class="share-box"></div><button class="text-button danger-text" type="button" data-delete-project="${esc(project.id)}">プロジェクトを削除</button></section>`;
+  return `<section aria-labelledby="settlement-title"><div class="section-heading"><div><h2 id="settlement-title">精算</h2><span>${transactionsFor(project.id).length}件</span></div></div>${validation.valid ? "" : `<div class="notice error-notice">金額が一致していない取引が ${validation.transactions.filter((row) => !row.valid).length}件あります</div>`}<div class="summary-grid"><div class="summary-cell"><span>取引合計</span><strong>${esc(yen(calculation.total_burden))}</strong></div><div class="summary-cell"><span>参加者</span><strong>${calculation.members.length}人</strong></div></div><section class="settlement-section"><div class="inline-heading"><h3>支払い</h3><span>${calculation.transfers.length}件</span></div><div class="transfer-list">${transfers}</div></section><section class="settlement-section"><div class="inline-heading"><h3>内訳</h3></div><div class="balance-list">${balances}</div></section><section class="settlement-section"><div class="inline-heading"><h3>家計簿連携</h3></div><div class="link-summary">${links || `<div class="empty-state compact-empty">参加者はいません</div>`}</div></section><div class="settlement-actions">${finalize}<button class="button secondary-button" type="button" data-show-share-project="${esc(project.id)}">共有リンク</button></div>${renderShareControls(project)}<button class="text-button danger-text" type="button" data-delete-project="${esc(project.id)}">プロジェクトを削除</button></section>`;
+}
+
+function sharedProjectAccess(projectId) {
+  return shareTokensByProject.get(projectId) || null;
+}
+
+function renderShareControls(project) {
+  const access = sharedProjectAccess(project.id);
+  if (access) return `<div class="notice">共有リンクから開いています。権限は${access.role === "editor" ? "編集" : "閲覧"}です。</div>`;
+  if (ui.share.projectId !== project.id) return "";
+  const shares = ui.share.shares.filter((share) => share.active);
+  const rows = shares.length
+    ? shares.map((share) => `<div class="review-row"><div class="review-row-value"><strong>${share.role === "editor" ? "編集" : "閲覧"}</strong><span>${share.expires_at ? `${esc(formatDate(share.expires_at, true))}まで` : "期限なし"}</span></div><button class="small-button danger-button" type="button" data-revoke-share="${esc(share.id)}" data-share-project-id="${esc(project.id)}">失効</button></div>`).join("")
+    : `<div class="empty-state compact-empty">有効な共有リンクはありません</div>`;
+  const url = ui.share.lastUrl ? `<div class="share-url"><span>${esc(ui.share.lastUrl)}</span><button class="small-button" type="button" data-copy-share="${esc(ui.share.lastUrl)}">コピー</button></div>` : "";
+  return `<section id="share-box" class="share-box"><div class="inline-heading"><h3>共有リンク</h3><button class="small-button" type="button" data-refresh-shares="${esc(project.id)}">更新</button></div><form class="form-stack" data-share-form="${esc(project.id)}"><div class="field-grid"><label class="field">権限<select name="role"><option value="viewer">閲覧</option><option value="editor" selected>編集</option></select></label><label class="field">期限<input class="input" name="expires_at" type="datetime-local"></label></div><label class="check-control"><input name="rotate" type="checkbox" checked><span>発行済みのリンクを失効する</span></label><button class="button secondary-button" type="submit">共有リンクを発行</button></form>${url}<div class="review-list">${rows}</div>${shares.length ? `<button class="text-button danger-text" type="button" data-revoke-all-shares="${esc(project.id)}">有効なリンクをすべて失効</button>` : ""}</section>`;
 }
 
 function renderHouseholdProject(project) {
@@ -921,7 +1286,7 @@ function renderHouseholdTransactions(project) {
   const members = membersFor(project.id, true);
   const selectedMonth = ui.householdMonth;
   const transactions = transactionsFor(project.id)
-    .filter((row) => !selectedMonth || String(row.occurred_at).slice(0, 7) === selectedMonth)
+    .filter((row) => !selectedMonth || dateValue(row.occurred_at).slice(0, 7) === selectedMonth)
     .sort((left, right) => String(right.occurred_at).localeCompare(String(left.occurred_at)));
   const form = ui.showHouseholdForm ? `<form id="add-household-transaction-form" class="form-panel form-stack"><div class="form-panel-head"><h3>手入力</h3><button class="icon-button" type="button" data-close-household-form aria-label="閉じる">×</button></div><div class="field"><label for="household-merchant">店名</label><input id="household-merchant" class="input" name="merchant_name" placeholder="店名" required></div><div class="field-grid"><div class="field"><label for="household-amount">金額</label><input id="household-amount" class="input" name="paid_amount" type="number" inputmode="numeric" step="1" required><small>返金はマイナスで入力</small></div><div class="field"><label for="household-date">日付</label><input id="household-date" class="input" name="occurred_at" type="date" value="${today()}" required></div></div><div class="field-grid"><div class="field"><label for="household-category">分類</label><input id="household-category" class="input" name="category" placeholder="食費"></div><div class="field"><label for="household-method">支払方法</label><select id="household-method" name="payment_method">${paymentMethodOptions()}</select></div></div><div class="field-grid"><div class="field"><label for="household-payer">記録者</label><select id="household-payer" name="payer_member_id" required>${memberOptions(project.id, members[0]?.id, true)}</select></div><div class="field"><label for="household-status">状態</label><select id="household-status" name="status"><option value="confirmed">確定</option><option value="provisional">仮</option></select></div></div><div class="field"><label for="household-note">メモ</label><textarea id="household-note" class="textarea" name="note" rows="2"></textarea></div><button class="button household-button" type="submit">追加</button></form>` : `<button class="button household-button section-action" type="button" data-show-household-form>手入力</button>`;
   return `<section aria-labelledby="household-transactions-title"><div class="section-heading filter-heading"><div><h2 id="household-transactions-title">取引</h2><span>${transactions.length}件</span></div><label class="month-filter"><span>月</span><input type="month" value="${esc(selectedMonth)}" data-household-month></label></div>${form}<div class="transaction-list">${transactions.length ? transactions.map(renderTransactionRow).join("") : `<div class="empty-state">取引はありません</div>`}</div></section>`;
@@ -936,24 +1301,47 @@ function renderCsvPreview() {
 
 function renderImportReview(project, projectIds = new Set([project.id]), includeGmail = true) {
   const records = state.import_records
-    .filter((row) => projectIds.has(row.project_id) && ["received", "parsed", "review"].includes(row.source_status))
+    .filter((row) => projectIds.has(row.project_id) && ["received", "parsed", "review", "error"].includes(row.source_status))
     .sort((left, right) => String(right.created_at).localeCompare(String(left.created_at)));
   const gmail = includeGmail ? renderGmailImport(project) : "";
   if (!records.length) return `${gmail}<div class="empty-state compact-empty">確認待ちはありません</div>`;
   return gmail + records.map((record) => {
     const transactions = transactionsFor(record.project_id).filter((row) => !["cancelled", "refunded"].includes(row.status));
-    return `<div class="review-row"><div class="review-row-head"><span class="source-type">${esc(SOURCE_TYPES[record.source_type] || record.source_type)}</span><span>${esc(formatDate(record.occurred_at_raw || record.created_at))}</span></div><div class="review-row-value"><strong>${esc(record.merchant_raw || "店名未設定")}</strong><strong>${esc(yen(record.paid_amount_raw ?? record.gross_amount_raw))}</strong></div><div class="review-actions"><button class="small-button household-small" type="button" data-create-from-import="${esc(record.id)}">取引にする</button><select data-import-link-select="${esc(record.id)}" aria-label="既存の取引"><option value="">既存の取引</option>${transactions.map((transaction) => `<option value="${esc(transaction.id)}">${esc(dateValue(transaction.occurred_at))} ${esc(transaction.merchant_name)} ${esc(yen(transaction.paid_amount))}</option>`).join("")}</select><button class="small-button" type="button" data-link-import="${esc(record.id)}">紐付け</button><button class="icon-button quiet" type="button" data-reject-import="${esc(record.id)}" aria-label="却下">×</button></div></div>`;
+    const dateMissing = !normalizedDate(record.occurred_at_raw);
+    const dateControl = dateMissing
+      ? `<form class="review-actions" data-import-date-form="${esc(record.id)}"><label>取引日<input class="input" name="occurred_at_raw" type="date" required></label><button class="small-button" type="submit">日付を保存</button></form>`
+      : "";
+    const actions = dateMissing
+      ? `<span>取引日を確認してください</span>`
+      : `<button class="small-button household-small" type="button" data-create-from-import="${esc(record.id)}">取引にする</button><select data-import-link-select="${esc(record.id)}" aria-label="既存の取引"><option value="">既存の取引</option>${transactions.map((transaction) => `<option value="${esc(transaction.id)}">${esc(dateValue(transaction.occurred_at))} ${esc(transaction.merchant_name)} ${esc(yen(transaction.paid_amount))}</option>`).join("")}</select><button class="small-button" type="button" data-link-import="${esc(record.id)}">紐付け</button>`;
+    return `<div class="review-row"><div class="review-row-head"><span class="source-type">${esc(SOURCE_TYPES[record.source_type] || record.source_type)}</span><span>${dateMissing ? "取引日を確認してください" : esc(formatDate(record.occurred_at_raw))}</span></div><div class="review-row-value"><strong>${esc(record.merchant_raw || "店名未設定")}</strong><strong>${esc(yen(record.paid_amount_raw ?? record.gross_amount_raw))}</strong></div>${dateControl}<div class="review-actions">${actions}<button class="icon-button quiet" type="button" data-reject-import="${esc(record.id)}" aria-label="却下">×</button></div></div>`;
   }).join("");
 }
 
 function renderHouseholdImports(project, projectIds = new Set([project.id])) {
   const includeGmail = primaryHouseholdProject()?.id === project.id;
-  return `<section aria-labelledby="imports-title"><div class="section-heading"><div><h2 id="imports-title">取込</h2><span>${state.import_records.filter((row) => projectIds.has(row.project_id)).length}件</span></div></div><div class="import-tools"><section class="import-section"><div class="inline-heading"><h3>レシート</h3></div><div class="file-actions"><label class="file-button household-file"><input type="file" accept="image/jpeg,image/png,image/webp,image/heic,image/heif" data-household-receipt="${esc(project.id)}"><span>画像を選ぶ</span></label><label class="file-button secondary-button"><input type="file" accept="image/*" capture="environment" data-household-receipt="${esc(project.id)}"><span>撮影する</span></label></div></section><section class="import-section"><div class="inline-heading"><h3>CSV</h3></div><div class="csv-controls"><select data-csv-source aria-label="CSVの種類"><option value="">自動判定</option><option value="card_csv" ${ui.csvSourceType === "card_csv" ? "selected" : ""}>カード</option><option value="paypay_csv" ${ui.csvSourceType === "paypay_csv" ? "selected" : ""}>PayPay</option><option value="bank_csv" ${ui.csvSourceType === "bank_csv" ? "selected" : ""}>銀行</option><option value="manual" ${ui.csvSourceType === "manual" ? "selected" : ""}>その他</option></select><label class="file-button household-file"><input type="file" accept=".csv,text/csv" data-csv-file="${esc(project.id)}"><span>CSVを選ぶ</span></label></div>${renderCsvPreview()}</section><section class="import-section"><div class="inline-heading"><h3>通知</h3></div><form id="notification-import-form" class="form-stack"><textarea class="textarea" name="raw_text" rows="4" placeholder="通知本文" required></textarea><button class="button secondary-button" type="submit">確認へ追加</button></form></section></div><section class="review-section" aria-labelledby="review-title"><div class="inline-heading"><h3 id="review-title">確認待ち</h3></div><div class="review-list">${renderImportReview(project, projectIds, includeGmail)}</div></section></section>`;
+  const receipt = `<section class="import-section"><div class="inline-heading"><h3>レシート</h3></div><div class="file-actions"><label class="file-button household-file"><input type="file" accept="image/jpeg,image/png,image/webp" data-household-receipt="${esc(project.id)}"><span>画像を選ぶ</span></label><label class="file-button secondary-button"><input type="file" accept="image/jpeg,image/png,image/webp" capture="environment" data-household-receipt="${esc(project.id)}"><span>撮影する</span></label></div><small>JPEG、PNG、WebP・5MB以下</small></section>`;
+  const csv = `<section class="import-section"><div class="inline-heading"><h3>CSV</h3></div><div class="csv-controls"><select data-csv-source aria-label="CSVの種類"><option value="">自動判定</option><option value="card_csv" ${ui.csvSourceType === "card_csv" ? "selected" : ""}>カード</option><option value="paypay_csv" ${ui.csvSourceType === "paypay_csv" ? "selected" : ""}>PayPay</option><option value="bank_csv" ${ui.csvSourceType === "bank_csv" ? "selected" : ""}>銀行</option><option value="manual" ${ui.csvSourceType === "manual" ? "selected" : ""}>その他</option></select><label class="file-button household-file"><input type="file" accept=".csv,text/csv" data-csv-file="${esc(project.id)}"><span>CSVを選ぶ</span></label></div>${renderCsvPreview()}</section>`;
+  const notification = `<section class="import-section"><div class="inline-heading"><h3>通知</h3></div><form id="notification-import-form" class="form-stack"><textarea class="textarea" name="raw_text" rows="4" placeholder="通知本文" required></textarea><button class="button secondary-button" type="submit">確認へ追加</button></form></section>`;
+  return `<section aria-labelledby="imports-title"><div class="section-heading"><div><h2 id="imports-title">取込</h2><span>${state.import_records.filter((row) => projectIds.has(row.project_id)).length}件</span></div></div><div class="import-tools">${receipt}${csv}${notification}</div><section class="review-section" aria-labelledby="review-title"><div class="inline-heading"><h3 id="review-title">確認待ち</h3></div><div class="review-list">${renderImportReview(project, projectIds, includeGmail)}</div></section></section>`;
+}
+
+function renderLocalReceiptTrial() {
+  const result = ui.localReceipt;
+  const details = result
+    ? `<div class="review-row-value"><strong>${esc(result.store_name || "店名を確認してください")}</strong><span>${esc(result.paid_at || "購入日を確認してください")}</span><strong>${esc(result.total_amount == null ? "金額を確認してください" : yen(result.total_amount))}</strong></div>`
+    : "";
+  return `<section class="import-section"><div class="inline-heading"><h3>レシートの読取り</h3></div><p>ローカル確認用です。読取結果は保存されません。</p><div class="file-actions"><label class="file-button household-file"><input type="file" accept="image/jpeg,image/png,image/webp" data-local-receipt><span>画像を選ぶ</span></label><label class="file-button secondary-button"><input type="file" accept="image/jpeg,image/png,image/webp" capture="environment" data-local-receipt><span>撮影する</span></label></div><small>JPEG、PNG、WebP・5MB以下</small>${details}</section>`;
 }
 
 function renderCalendarImports() {
   const project = primaryHouseholdProject();
-  if (!project) return `<section class="calendar-section" aria-labelledby="home-heading"><div class="page-heading"><h1 id="home-heading">家計簿</h1></div>${renderCalendarTabs()}<div class="empty-state">取込記録はありません</div></section>`;
+  if (!project) {
+    const content = localOcrProxy()
+      ? renderLocalReceiptTrial()
+      : `<div class="empty-state">レシートを保存するには、Googleでログインして家計簿を作成してください</div>`;
+    return `<section class="calendar-section" aria-labelledby="home-heading"><div class="page-heading"><h1 id="home-heading">家計簿</h1></div>${renderCalendarTabs()}${content}</section>`;
+  }
   const projectIds = new Set([project.id]);
   return `<section class="calendar-section" aria-labelledby="home-heading"><div class="page-heading"><h1 id="home-heading">家計簿</h1></div>${renderCalendarTabs()}${renderHouseholdImports(project, projectIds)}</section>`;
 }
@@ -966,7 +1354,7 @@ function householdSummaryGroups(projectId) {
   const categories = new Map();
   const payments = new Map();
   for (const transaction of included) {
-    const month = String(transaction.occurred_at).slice(0, 7) || "未設定";
+    const month = dateValue(transaction.occurred_at).slice(0, 7) || "未設定";
     const category = transaction.category || "未分類";
     monthly.set(month, (monthly.get(month) || 0) + integer(transaction.paid_amount));
     categories.set(category, (categories.get(category) || 0) + integer(transaction.paid_amount));
@@ -1272,7 +1660,7 @@ function renderGmailImport(project) {
   const candidates = gmailUi.candidates.filter((row) => !["ignored", "imported", "parse_error"].includes(row.status)).map((row) => {
     const complete = String(row.merchant_name || "").trim() && Number.isSafeInteger(row.amount) && row.amount !== 0 && row.occurred_at;
     const incompleteNotice = complete ? "" : "<span>金額と店名を入力してください</span>";
-    return `<form class="review-row" data-gmail-candidate-form="${esc(row.id)}"><div class="review-row-head"><span>${esc(row.provider || "gmail")}</span><span>${row.duplicate_warning ? "同額・前後7日の候補あり" : ""}</span></div><div class="field-grid"><input class="input" name="merchant_name" value="${esc(row.merchant_name || "")}" aria-label="店名"><input class="input" name="amount" type="number" value="${row.amount ?? ""}" aria-label="金額"><input class="input" name="occurred_at" type="datetime-local" value="${esc(row.occurred_at ? row.occurred_at.slice(0, 16) : "")}" aria-label="日時"></div><div class="review-actions">${incompleteNotice}<button class="small-button" type="submit">編集を保存</button><button class="small-button" type="button" data-gmail-ignore="${esc(row.id)}">無視</button><button class="small-button household-small" type="button" data-gmail-import="${esc(row.id)}" ${complete ? "" : "disabled"}>家計簿へ登録</button></div></form>`;
+    return `<form class="review-row" data-gmail-candidate-form="${esc(row.id)}"><div class="review-row-head"><span>${esc(GMAIL_PROVIDER_NAMES[row.provider] || row.provider || "Gmail")}</span><span>${row.duplicate_warning ? "同額・前後7日の候補あり" : ""}</span></div><div class="field-grid"><input class="input" name="merchant_name" value="${esc(row.merchant_name || "")}" aria-label="店名"><input class="input" name="amount" type="number" value="${row.amount ?? ""}" aria-label="金額"><input class="input" name="occurred_at" type="datetime-local" value="${esc(gmailDateTimeInputValue(row.occurred_at))}" aria-label="日時"></div><div class="review-actions">${incompleteNotice}<button class="small-button" type="submit">編集を保存</button><button class="small-button" type="button" data-gmail-ignore="${esc(row.id)}">無視</button><button class="small-button household-small" type="button" data-gmail-import="${esc(row.id)}" ${complete ? "" : "disabled"}>家計簿へ登録</button></div></form>`;
   }).join("");
   return `<section class="import-section"><div class="inline-heading"><h3>Gmail支払い通知</h3><button class="button secondary-button" type="button" data-gmail-connect>Gmailを接続</button></div>${connections || `<div class="empty-state compact-empty">Gmail接続はありません</div>`}${candidates}</section>`;
 }
@@ -1532,6 +1920,12 @@ function updateTransaction(project, transaction, form) {
   row.note = String(data.get("note") || "").trim() || null;
   row.updated_at = now();
   if (project.project_type === "split") {
+    const terminal = row.status === "cancelled" || row.status === "refunded" && row.entry_type !== "refund";
+    for (const payment of next.transaction_payments.filter((value) => transactionId(value) === row.id)) {
+      if (terminal) payment.payment_status = row.status;
+      else if (["cancelled", "refunded"].includes(payment.payment_status)) payment.payment_status = row.status === "provisional" ? "provisional" : "confirmed";
+      payment.updated_at = row.updated_at;
+    }
     reconcileSplitItems(next, project.id, row.id);
     next = synchronizeSplit(next, project.id);
   } else {
@@ -1620,6 +2014,7 @@ async function refreshCloudProject(projectId, shouldRender = true) {
   if (!isCloud || typeof Api.getProject !== "function") return;
   const graph = await Api.getProject(projectId);
   state = Storage.mergeProjectGraph(state, graph);
+  state = applyPendingSyncOperations(state);
   saveLocal();
   if (shouldRender) render();
 }
@@ -1630,7 +2025,7 @@ async function refreshCloudCalendar(shouldRender = true) {
   const projectIds = project ? [project.id] : [];
   const results = await Promise.allSettled(projectIds.map((projectId) => Api.getProject(projectId)));
   const graphs = results.filter((result) => result.status === "fulfilled").map((result) => result.value);
-  for (const graph of graphs) state = Storage.mergeProjectGraph(state, graph);
+  for (const graph of graphs) state = applyPendingSyncOperations(Storage.mergeProjectGraph(state, graph));
   if (graphs.length) saveLocal();
   if (projectIds.length && graphs.length === 0) throw results.find((result) => result.status === "rejected")?.reason || new Error("家計簿を読み込めませんでした");
   if (shouldRender) render();
@@ -1663,10 +2058,7 @@ function finalizeSplitProject(project) {
     next = Household.finalizeProjectState(next, project.id, { now: now(), split: Split });
     commitState(next, "割り勘を確定しました", {
       remoteFilter: (operation) => !operation.generated && !(operation.table === "projects" && operation.id === project.id),
-      remoteAction: async () => {
-        await Api.finalizeProject(project.id);
-        await refreshCloudProject(project.id);
-      },
+      pendingAction: { kind: "finalize_project", project_id: project.id },
     });
   } catch (error) {
     toast(error.message || "確定できませんでした");
@@ -1678,10 +2070,7 @@ function reopenSplitProject(project) {
     const next = Household.reopenProjectState(state, project.id, { now: now() });
     commitState(next, "割り勘を再開しました", {
       remoteFilter: (operation) => !(operation.table === "projects" && operation.id === project.id),
-      remoteAction: async () => {
-        await Api.reopenProject(project.id);
-        await refreshCloudProject(project.id);
-      },
+      pendingAction: { kind: "reopen_project", project_id: project.id },
     });
   } catch (error) {
     toast(error.message || "再開できませんでした");
@@ -1718,33 +2107,66 @@ function removeProjectFromState(project) {
   return next;
 }
 
-function deleteProject(project) {
+async function deleteProject(project) {
+  if (isCloud && typeof Api.deleteProject === "function") {
+    await remoteSyncQueue;
+    if (!await flushPendingSyncOperations()) return;
+    try {
+      await Api.deleteProject(project.id);
+    } catch (error) {
+      toast(`削除できませんでした: ${error.message}`);
+      return;
+    }
+  }
   const next = removeProjectFromState(project);
   ui.selectedTransactionId = null;
   commitState(next, project.project_type === "split" ? "プロジェクトを削除しました" : "家計簿データを削除しました", {
     render: false,
-    remoteFilter: (operation) => operation.table === "projects" && operation.action === "delete" && operation.id === project.id,
+    remoteFilter: () => false,
   });
   location.hash = "#/";
 }
 
-async function shareProject(projectId) {
+async function refreshProjectShares(projectId) {
+  if (!isCloud || typeof Api.listProjectShares !== "function") return;
+  const result = await Api.listProjectShares(projectId);
+  if (ui.share.projectId === projectId) ui.share.shares = Array.isArray(result?.shares) ? result.shares : [];
+}
+
+async function shareProject(projectId, values = {}) {
   if (!isCloud || typeof Api.createProjectShare !== "function") {
     toast("共有リンクはクラウド接続時に作成できます");
     return;
   }
   try {
-    const result = await Api.createProjectShare(projectId);
+    const expiresAt = values.expires_at ? gmailDateTimeToUtc(values.expires_at) : null;
+    const result = await Api.createProjectShare(projectId, {
+      role: values.role === "viewer" ? "viewer" : "editor",
+      expires_at: expiresAt,
+      rotate: Boolean(values.rotate),
+    });
     const token = result?.token || result?.share?.token || result?.project?.share_token;
     if (!token) throw new Error("共有情報を受け取れませんでした");
     const url = `${location.origin}${location.pathname}#/join/${encodeURIComponent(token)}`;
-    const box = document.querySelector("#share-box");
-    if (box) box.innerHTML = `<div class="share-url"><span>${esc(url)}</span><button class="small-button" type="button" data-copy-share="${esc(url)}">コピー</button></div>`;
+    ui.share.projectId = projectId;
+    ui.share.lastUrl = url;
+    await refreshProjectShares(projectId);
+    render();
     await navigator.clipboard?.writeText(url);
     toast("共有リンクをコピーしました");
   } catch (error) {
     toast(`共有リンクを作成できませんでした: ${error.message}`);
   }
+}
+
+async function revokeProjectShare(projectId, shareId = null) {
+  if (!isCloud) return;
+  if (shareId) await Api.revokeProjectShare(projectId, shareId);
+  else await Api.revokeAllProjectShares(projectId);
+  ui.share.lastUrl = "";
+  await refreshProjectShares(projectId);
+  render();
+  toast("共有リンクを失効しました");
 }
 
 function stableHash(value) {
@@ -1831,13 +2253,14 @@ function addCsvImports(project) {
   ui.csvPreview = null;
   commitState(next, records.length ? `${records.length}件を確認へ追加しました` : "同じ取引は追加しませんでした", {
     remoteFilter: (operation) => operation.table !== "import_records",
-    remoteAction: async () => {
-      await Api.importCsv(project.id, {
+    pendingAction: {
+      kind: "import_csv",
+      project_id: project.id,
+      payload: {
         csv_text: preview.text,
         profile: sourceProfile(preview.sourceType),
         options: { source_type: preview.sourceType },
-      });
-      await refreshCloudProject(project.id);
+      },
     },
   });
 }
@@ -1855,13 +2278,18 @@ function importRecordFromReceipt(projectId, result) {
     merchant_normalized: normalizeMerchant(result.store_name || "レシート"),
     gross_amount_raw: integer(result.total_amount),
     paid_amount_raw: integer(result.total_amount),
-    occurred_at_raw: result.occurred_at || today(),
+    occurred_at_raw: receiptOccurredAt(result),
     settled_at_raw: null,
     payment_method_raw: result.payment_method || null,
     external_transaction_id: null,
     image_url: null,
     raw_text: result.raw_text || null,
-    raw_payload: JSON.stringify({ items: result.items || [], notes: result.notes || null }),
+    raw_payload: JSON.stringify({
+      items: result.items || [],
+      notes: result.notes || null,
+      paid_at: result.paid_at || null,
+      paid_time: result.paid_time || null,
+    }),
     parse_confidence: Number.isFinite(result.confidence) ? result.confidence : null,
     parser_version: result.model || "receipt-ocr",
     match_score: null,
@@ -1878,19 +2306,25 @@ function addReceiptImport(project, result) {
   touchProject(next, project.id);
   commitState(next, "レシートを確認へ追加しました", {
     remoteFilter: (operation) => operation.table !== "import_records",
-    remoteAction: async () => {
-      await Api.importReceipt(project.id, {
+    pendingAction: {
+      kind: "import_receipt",
+      project_id: project.id,
+      payload: {
         id: record.id,
         source_record_id: record.source_record_id,
         merchant_raw: record.merchant_raw,
         paid_amount_raw: record.paid_amount_raw,
         gross_amount_raw: record.gross_amount_raw,
         occurred_at_raw: record.occurred_at_raw,
-        raw_payload: { items: result.items || [], notes: result.notes || null },
+        raw_payload: {
+          items: result.items || [],
+          notes: result.notes || null,
+          paid_at: result.paid_at || null,
+          paid_time: result.paid_time || null,
+        },
         parse_confidence: record.parse_confidence,
         parser_version: record.parser_version,
-      });
-      await refreshCloudProject(project.id);
+      },
     },
   });
 }
@@ -1940,8 +2374,10 @@ function addNotificationImport(project, rawText) {
   touchProject(next, project.id);
   commitState(next, "通知を確認へ追加しました", {
     remoteFilter: (operation) => operation.table !== "import_records",
-    remoteAction: async () => {
-      await Api.importNotification(project.id, {
+    pendingAction: {
+      kind: "import_notification",
+      project_id: project.id,
+      payload: {
         id: record.id,
         source_record_id: record.source_record_id,
         merchant_raw: record.merchant_raw,
@@ -1950,8 +2386,7 @@ function addNotificationImport(project, rawText) {
         raw_text: rawText,
         parse_confidence: record.parse_confidence,
         parser_version: record.parser_version,
-      });
-      await refreshCloudProject(project.id);
+      },
     },
   });
 }
@@ -1965,13 +2400,17 @@ function paymentMethodFromImport(record) {
 }
 
 function createFromImport(project, record) {
+  if (!record.occurred_at_raw || !normalizedDate(record.occurred_at_raw)) {
+    toast("取引日を確認してから取引にしてください");
+    return;
+  }
   const transactionIdValue = makeId("txn");
   let next = Household.createManualHouseholdTransaction(state, project.id, {
     id: transactionIdValue,
     merchant_name: record.merchant_raw || "取込取引",
     paid_amount: integer(record.paid_amount_raw ?? record.gross_amount_raw),
     gross_amount: integer(record.gross_amount_raw ?? record.paid_amount_raw),
-    occurred_at: record.occurred_at_raw || today(),
+    occurred_at: record.occurred_at_raw,
     payment_method: paymentMethodFromImport(record),
     status: "provisional",
   }, { now: now() });
@@ -1984,10 +2423,7 @@ function createFromImport(project, record) {
   ui.householdTab = "transactions";
   commitState(next, "仮の取引を作成しました", {
     remoteFilter: () => false,
-    remoteAction: async () => {
-      await Api.reconcileImport(record.id, { action: "create", new_transaction_id: transactionIdValue });
-      await refreshCloudProject(project.id);
-    },
+    pendingAction: { kind: "reconcile_import", project_id: project.id, import_id: record.id, payload: { action: "create", new_transaction_id: transactionIdValue } },
   });
 }
 
@@ -2004,10 +2440,7 @@ function linkImport(project, record, transactionIdValue) {
   touchProject(next, project.id);
   commitState(next, "取引へ紐付けました", {
     remoteFilter: () => false,
-    remoteAction: async () => {
-      await Api.reconcileImport(record.id, { action: "link", transaction_id: transactionIdValue });
-      await refreshCloudProject(project.id);
-    },
+    pendingAction: { kind: "reconcile_import", project_id: project.id, import_id: record.id, payload: { action: "link", transaction_id: transactionIdValue } },
   });
 }
 
@@ -2019,19 +2452,17 @@ function rejectImport(project, record) {
   touchProject(next, project.id);
   commitState(next, "取込候補を却下しました", {
     remoteFilter: () => false,
-    remoteAction: async () => {
-      await Api.reconcileImport(record.id, { action: "reject" });
-      await refreshCloudProject(project.id);
-    },
+    pendingAction: { kind: "reconcile_import", project_id: project.id, import_id: record.id, payload: { action: "reject" } },
   });
 }
 
-async function readReceiptFile(file, projectId) {
+async function readReceiptFile(file, projectId = null) {
   Imports.validateImageFile(file);
   const imageDataUrl = await Imports.readImageAsDataUrl(file);
-  const payload = { image_data_url: imageDataUrl, project_id: projectId };
-  const shareToken = shareTokensByProject.get(projectId);
-  if (shareToken) payload.share_token = shareToken;
+  const payload = { image_data_url: imageDataUrl };
+  if (typeof projectId === "string" && projectId) payload.project_id = projectId;
+  const shareAccess = shareTokensByProject.get(projectId);
+  if (shareAccess?.token) payload.share_token = shareAccess.token;
   if (typeof Api.readReceipt === "function") return Api.readReceipt(payload);
   return requestApi("/api/ocr-receipt", { method: "POST", json: payload });
 }
@@ -2076,33 +2507,48 @@ async function handleSplitReceipt(input) {
   render();
   try {
     const project = target === "createSplit" ? currentProject() || primaryHouseholdProject() : currentProject();
-    if (!project) throw new Error("プロジェクトを選択してください");
-    const result = await readReceiptFile(input.files[0], project.id);
+    if (!project && !localOcrProxy()) throw new Error("レシートを読み取るには、割り勘を作成してからお店を追加してください");
+    const result = await readReceiptFile(input.files[0], project?.id || null);
     receipt.items = (result.items || []).map((item) => ({ name: String(item.name || "").trim(), amount: integer(item.amount) })).filter((item) => item.name && item.amount > 0);
     receipt.status = `${receipt.items.length}件を読み取りました`;
     receipt.type = "success";
     const scope = target === "createSplit" ? "createSplit" : "split";
     if (result.store_name) ui.drafts[scope].store = result.store_name;
     if (result.total_amount) ui.drafts[scope].amount = String(integer(result.total_amount));
+    const occurredAt = receiptOccurredAt(result);
+    if (occurredAt) ui.drafts[scope].occurred_at = dateValue(occurredAt);
+    else receipt.status = `${receipt.items.length}件を読み取りました。取引日は確認してください`;
     render();
     toast("レシートを読み取りました");
   } catch (error) {
-    receipt.status = error.message || "読み取れませんでした";
+    receipt.status = receiptOcrErrorMessage(error);
     receipt.type = "error";
     render();
-    toast("レシートを読み取れませんでした");
+    toast(receipt.status);
   }
 }
 
 async function handleHouseholdReceipt(input) {
   const project = projectById(input.dataset.householdReceipt);
-  if (!project || !input.files?.[0]) return;
+  if (!input.files?.[0]) return;
+  if (!project) {
+    if (!localOcrProxy() || input.dataset.localReceipt === undefined) return;
+    toast("レシートを読み取っています");
+    try {
+      ui.localReceipt = await readReceiptFile(input.files[0]);
+      render();
+      toast("レシートを読み取りました");
+    } catch (error) {
+      toast(receiptOcrErrorMessage(error));
+    }
+    return;
+  }
   toast("レシートを読み取っています");
   try {
     const result = await readReceiptFile(input.files[0], project.id);
     addReceiptImport(project, result);
   } catch (error) {
-    toast(error.message || "レシートを読み取れませんでした");
+    toast(receiptOcrErrorMessage(error));
   }
 }
 
@@ -2141,12 +2587,61 @@ function addDraftName() {
 function render() {
   const root = document.querySelector("#app");
   if (root) root.innerHTML = currentProject() ? renderProject() : renderHome();
+  applySharedProjectPresentation(root);
   renderGmailProgress();
   renderGmailCandidateControls();
 }
 
+function updateImportReviewDate(record, value) {
+  const occurredAt = normalizedDate(value);
+  if (!occurredAt) {
+    toast("取引日を確認してください");
+    return;
+  }
+  const next = cloneState();
+  const row = next.import_records.find((entry) => entry.id === record.id);
+  if (!row) return;
+  row.occurred_at_raw = occurredAt;
+  if (row.source_status === "error") row.source_status = "review";
+  row.updated_at = now();
+  touchProject(next, row.project_id);
+  commitState(next, "取引日を保存しました");
+}
+
+function applySharedProjectPresentation(root) {
+  const project = currentProject();
+  const access = project ? sharedProjectAccess(project.id) : null;
+  if (!root || !access) return;
+  for (const element of root.querySelectorAll("[data-delete-project],[data-show-share-project]")) element.hidden = true;
+  if (access.role === "editor") return;
+  const readableButton = (button) => button.dataset.home !== undefined
+    || button.dataset.projectTab !== undefined
+    || button.dataset.openTransaction !== undefined
+    || button.dataset.closeTransaction !== undefined
+    || button.dataset.openOriginProject !== undefined;
+  for (const form of root.querySelectorAll("form")) form.hidden = true;
+  for (const control of root.querySelectorAll("input, select, textarea")) control.disabled = true;
+  for (const button of root.querySelectorAll("button")) {
+    if (!readableButton(button)) button.hidden = true;
+  }
+}
+
 function mergeProjectSummaries(rows) {
   const next = cloneState();
+  const incomingIds = new Set(rows.map((row) => row.id));
+  const pendingProjectIds = new Set(pendingSyncOperations
+    .filter((operation) => operation.table === "projects" && operation.action === "create")
+    .map((operation) => operation.row?.id || operation.id));
+  const retainedProjectIds = new Set([...incomingIds, ...pendingProjectIds]);
+  next.projects = next.projects.filter((row) => retainedProjectIds.has(row.id));
+  const retainedTransactionIds = new Set(next.transactions.filter((row) => retainedProjectIds.has(row.project_id)).map((row) => row.id));
+  const retainedItemIds = new Set(next.transaction_items.filter((row) => retainedTransactionIds.has(transactionId(row))).map((row) => row.id));
+  next.project_members = next.project_members.filter((row) => retainedProjectIds.has(row.project_id));
+  next.transactions = next.transactions.filter((row) => retainedTransactionIds.has(row.id));
+  next.transaction_payments = next.transaction_payments.filter((row) => retainedTransactionIds.has(transactionId(row)));
+  next.transaction_items = next.transaction_items.filter((row) => retainedTransactionIds.has(transactionId(row)));
+  next.item_allocations = next.item_allocations.filter((row) => retainedItemIds.has(itemId(row)));
+  next.import_records = next.import_records.filter((row) => retainedProjectIds.has(row.project_id));
   const localById = new Map(next.projects.map((row) => [row.id, row]));
   for (const row of rows) {
     const existing = localById.get(row.id);
@@ -2179,14 +2674,26 @@ async function bootCloud() {
     if (!session?.authenticated) {
       isCloud = false;
       cloudSession = { status: "unauthenticated", user: null };
+      cloudCacheUserId = null;
+      pendingSyncOperations = [];
+      Storage.clearLegacyState?.();
+      state = Storage.loadGuestState ? Storage.loadGuestState() : Storage.loadState();
       return;
     }
     cloudSession = { status: "authenticated", user: session.user || null };
+    cloudCacheUserId = session.user?.id || null;
+    Storage.clearLegacyState?.();
+    state = cloudCacheUserId ? Storage.loadCloudState(cloudCacheUserId) : Storage.createEmptyState();
+    pendingSyncOperations = cloudCacheUserId ? Storage.loadPendingSyncOperations(cloudCacheUserId) : [];
     const result = await Api.listProjects();
     isCloud = true;
     mergeProjectSummaries(Array.isArray(result) ? result : result.projects || []);
+    await flushPendingSyncOperations();
   } catch (error) {
     isCloud = false;
+    cloudCacheUserId = null;
+    pendingSyncOperations = [];
+    state = Storage.loadGuestState ? Storage.loadGuestState() : Storage.loadState();
     cloudSession = error?.status === 401
       ? { status: "unauthenticated", user: null }
       : { status: "error", user: null };
@@ -2208,8 +2715,41 @@ async function logoutGoogle() {
   gmailUi.candidates = [];
   ui.householdSummaries = {};
   shareTokensByProject.clear();
-  state = Storage.loadState();
+  Api.setShareToken?.(null);
+  cloudCacheUserId = null;
+  pendingSyncOperations = [];
+  Storage.clearLegacyState?.();
+  state = Storage.loadGuestState ? Storage.loadGuestState() : Storage.loadState();
   render();
+}
+
+async function deleteAccountFromScreen() {
+  const userId = cloudCacheUserId;
+  try {
+    await Api.deleteAccount();
+    if (userId) Storage.clearCloudState?.(userId);
+    isCloud = false;
+    cloudSession = { status: "unauthenticated", user: null };
+    remoteSyncQueue = Promise.resolve();
+    cloudCacheUserId = null;
+    pendingSyncOperations = [];
+    gmailUi.connections = [];
+    gmailUi.candidates = [];
+    shareTokensByProject.clear();
+    Api.setShareToken?.(null);
+    ui.accountDeletionFailed = false;
+    ui.accountDeletionMessage = "";
+    state = Storage.loadGuestState ? Storage.loadGuestState() : Storage.loadState();
+    render();
+    toast("アカウントとクラウド保存データを削除しました");
+  } catch (error) {
+    ui.accountDeletionFailed = true;
+    ui.accountDeletionMessage = error?.code === "gmail_revocation_failed"
+      ? "Gmail認可の取消に失敗しました。アカウント削除を再試行できます。"
+      : "アカウント削除に失敗しました。アカウント削除を再試行できます。";
+    render();
+    throw error;
+  }
 }
 
 async function joinSharedProject(token) {
@@ -2217,9 +2757,11 @@ async function joinSharedProject(token) {
   const graph = await Api.getSharedProject(token);
   isCloud = true;
   state = Storage.mergeProjectGraph(state, graph);
-  saveLocal();
   const projectId = graph.projects?.[0]?.id;
-  if (graph.share?.role === "editor" && graph.share?.token && projectId) shareTokensByProject.set(projectId, graph.share.token);
+  if (graph.share?.token && projectId) {
+    shareTokensByProject.set(projectId, { token: graph.share.token, role: graph.share.role || "viewer" });
+    Api.setShareToken?.(graph.share.token);
+  }
   if (!projectId) throw new Error("共有プロジェクトが見つかりません");
   location.hash = `#/p/${encodeURIComponent(projectId)}`;
 }
@@ -2247,7 +2789,16 @@ async function route() {
     try {
       await remoteSyncQueue;
       if (projectId) {
-        await refreshCloudProject(projectId, false);
+        const shareAccess = shareTokensByProject.get(projectId);
+        if (shareAccess?.token) {
+          Api.setShareToken?.(shareAccess.token);
+          const graph = await Api.getSharedProject(shareAccess.token);
+          state = Storage.mergeProjectGraph(state, graph);
+          state = applyPendingSyncOperations(state);
+        } else {
+          Api.setShareToken?.(null);
+          await refreshCloudProject(projectId, false);
+        }
         if (projectById(projectId)?.project_type !== "split" && ui.householdTab === "summary") {
           await refreshCloudSummary(projectId, false);
         }
@@ -2289,8 +2840,15 @@ document.addEventListener("submit", async (event) => {
   try {
     if (form.dataset.gmailCandidateForm) {
       const values = Object.fromEntries(new FormData(form));
-      await Api.updateGmailCandidate(form.dataset.gmailCandidateForm, { merchant_name: values.merchant_name, amount: values.amount === "" ? null : Number(values.amount), occurred_at: values.occurred_at ? new Date(values.occurred_at).toISOString() : null, status: "ready" });
+      await Api.updateGmailCandidate(form.dataset.gmailCandidateForm, { merchant_name: values.merchant_name, amount: values.amount === "" ? null : Number(values.amount), occurred_at: gmailDateTimeToUtc(values.occurred_at), status: "ready" });
       await refreshGmailImport();
+    } else if (form.dataset.shareForm) {
+      const values = Object.fromEntries(new FormData(form));
+      values.rotate = form.querySelector("[name=rotate]")?.checked === true;
+      await shareProject(form.dataset.shareForm, values);
+    } else if (form.dataset.importDateForm) {
+      const record = state.import_records.find((row) => row.id === form.dataset.importDateForm);
+      if (record) updateImportReviewDate(record, new FormData(form).get("occurred_at_raw"));
     } else if (form.id === "calendar-entry-form") addCalendarTransaction(form);
     else if (form.id === "create-split-form") await createSplitProject(form);
     else if (form.id === "create-household-form") await createHouseholdProject(form);
@@ -2327,6 +2885,11 @@ document.addEventListener("click", async (event) => {
     if (button.dataset.googleLogout !== undefined) {
       await logoutGoogle();
       toast("ログアウトしました");
+      return;
+    }
+    if (button.dataset.deleteAccount !== undefined) {
+      if (!confirm("アカウント、クラウド保存データ、Gmail接続を削除します。所有している共有プロジェクトは削除後も残ります。Google認可の取消に失敗した場合は、この操作を再試行してください。続けますか？")) return;
+      await deleteAccountFromScreen();
       return;
     }
     if (button.dataset.gmailConnect !== undefined) {
@@ -2548,8 +3111,24 @@ document.addEventListener("click", async (event) => {
     reopenSplitProject(project);
     return;
   }
-  if (button.dataset.shareProject) {
-    await shareProject(button.dataset.shareProject);
+  if (button.dataset.showShareProject) {
+    ui.share.projectId = button.dataset.showShareProject;
+    ui.share.lastUrl = "";
+    await refreshProjectShares(ui.share.projectId);
+    render();
+    return;
+  }
+  if (button.dataset.refreshShares) {
+    await refreshProjectShares(button.dataset.refreshShares);
+    render();
+    return;
+  }
+  if (button.dataset.revokeShare && button.dataset.shareProjectId && confirm("この共有リンクを失効しますか？")) {
+    await revokeProjectShare(button.dataset.shareProjectId, button.dataset.revokeShare);
+    return;
+  }
+  if (button.dataset.revokeAllShares && confirm("有効な共有リンクをすべて失効しますか？")) {
+    await revokeProjectShare(button.dataset.revokeAllShares);
     return;
   }
   if (button.dataset.copyShare) {
@@ -2557,8 +3136,11 @@ document.addEventListener("click", async (event) => {
     toast("共有リンクをコピーしました");
     return;
   }
-  if (button.dataset.deleteProject && project && confirm(project.project_type === "split" ? "このプロジェクトを削除しますか？" : "この家計簿データを削除しますか？")) {
-    deleteProject(project);
+  const deleteProjectMessage = project?.project_type === "split"
+    ? "このプロジェクトを削除しますか？"
+    : "この家計簿データを削除しますか？ Gmail接続がある場合は、Google認可の取消後に削除します。取消に失敗した場合は家計簿を残し、削除操作を再試行できます。";
+  if (button.dataset.deleteProject && project && confirm(deleteProjectMessage)) {
+    await deleteProject(project);
     return;
   }
   if (button.dataset.importCsv !== undefined && project) {
@@ -2605,6 +3187,7 @@ document.addEventListener("change", (event) => {
   if (scope && field && ui.drafts[scope]) ui.drafts[scope][field] = target.value;
   if (target.dataset.receiptTarget) void handleSplitReceipt(target);
   if (target.dataset.householdReceipt) void handleHouseholdReceipt(target);
+  if (target.dataset.localReceipt !== undefined) void handleHouseholdReceipt(target);
   if (target.dataset.csvFile) void handleCsvFile(target);
   if (target.dataset.csvSource !== undefined) {
     ui.csvSourceType = target.value;
@@ -2631,6 +3214,9 @@ document.addEventListener("keydown", (event) => {
 });
 
 window.addEventListener("hashchange", () => void route());
+window.addEventListener("online", () => {
+  remoteSyncQueue = remoteSyncQueue.then(() => flushPendingSyncOperations()).catch(() => {});
+});
 
 if (!location.hash) location.hash = "#/";
 render();
@@ -2649,7 +3235,7 @@ if ("serviceWorker" in navigator) {
     }
   } else {
     window.addEventListener("load", () => {
-      navigator.serviceWorker.register("/service-worker.js").catch(() => {});
+      navigator.serviceWorker.register("/service-worker.js?v=20260730-multi-card").catch(() => {});
     });
   }
 }

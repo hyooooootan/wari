@@ -6,14 +6,14 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=/opt/wari
+EnvironmentFile=-/etc/wari-receipt-ocr.env
 Environment=OCR_BACKEND=tesseract_ollama
-Environment=OCR_HOST=0.0.0.0
+Environment=OCR_HOST=127.0.0.1
 Environment=PORT=4190
-Environment=OCR_CORS_ORIGIN=*
 Environment=OLLAMA_BASE_URL=http://127.0.0.1:11434
 Environment=OLLAMA_MODEL=qwen2.5:3b
 Environment=TESSERACT_LANG=jpn+eng
-Environment=TESSERACT_TIMEOUT=30
+Environment=TESSERACT_TIMEOUT=20
 Environment=TESSERACT_MAX_SIDE=1800
 Environment=OMP_THREAD_LIMIT=2
 ExecStart=/opt/wari/services/receipt_ocr/.venv/bin/python -m services.receipt_ocr.api

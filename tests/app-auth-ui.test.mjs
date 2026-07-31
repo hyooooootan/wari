@@ -30,7 +30,8 @@ test("認可先への遷移とログアウト後の端末状態を処理する",
   assert.match(source, /location\.assign\(result\.url\)/);
   assert.match(source, /await Api\.logout\(\)/);
   assert.match(source, /cloudSession = \{ status: "unauthenticated", user: null \}/);
-  assert.match(source, /state = Storage\.loadState\(\)/);
+  assert.match(source, /Storage\.clearLegacyState\?\.\(\)/);
+  assert.match(source, /state = Storage\.loadGuestState \? Storage\.loadGuestState\(\) : Storage\.loadState\(\)/);
 });
 
 test("起動時はセッションを先に調べ、401と他の障害を分ける", () => {
@@ -91,13 +92,15 @@ test("Gmail sync paginates sequentially to 1000 items without exposing page toke
   assert.doesNotMatch(source, /toast\([^\n]*pageToken/);
 });
 
-test("Gmail sync refreshes candidates after every page and shows SMBC progress", () => {
+test("Gmail sync refreshes candidates after every page and shows supported providers", () => {
   assert.match(source, /const gmailSyncProgress = new Map\(\)/);
   assert.match(source, /await refreshGmailImport\(false\);\s*render\(\);\s*renderGmailProgress\(\);/);
   assert.match(source, /Gmail同期中\\n確認済み:/);
   assert.match(source, /新規候補: \$\{progress\.candidate_count\}件/);
   assert.match(source, /除外: \$\{progress\.ignored_count\}件/);
-  assert.match(source, /取込対象: 三井住友カード/);
+  assert.match(source, /GMAIL_SUPPORTED_PROVIDERS = "三井住友カード、楽天カード、JCB"/);
+  assert.match(source, /取込対象: \$\{GMAIL_SUPPORTED_PROVIDERS\}/);
+  assert.match(source, /GMAIL_PROVIDER_NAMES\[row\.provider\]/);
   assert.match(source, /同期完了: 検索\$\{totals\.listed_count\}件、新規候補\$\{totals\.candidate_count\}件、重複\$\{totals\.duplicate_count\}件、除外\$\{totals\.ignored_count\}件/);
 });
 
@@ -113,4 +116,65 @@ test("Gmail candidates expose date range selection and bulk actions", () => {
   assert.match(source, /bulkGmailCandidates\("ignore"\)/);
   assert.match(source, /gmailUi\.from_date/);
   assert.match(source, /gmailUi\.to_date/);
+});
+
+test("Gmail candidate edits preserve the entered local date and time", () => {
+  assert.match(source, /function gmailDateTimeInputValue\(value\)/);
+  assert.match(source, /timeZone: JAPAN_TIME_ZONE/);
+  assert.match(source, /function gmailDateTimeToUtc\(value\)/);
+  assert.match(source, /new Date\(`\$\{match\[1\]\}T\$\{match\[2\]\}:\$\{match\[3\]\}:00\+09:00`\)/);
+  assert.match(source, /occurred_at: gmailDateTimeToUtc\(values\.occurred_at\)/);
+  assert.match(source, /gmailDateTimeInputValue\(row\.occurred_at\)/);
+});
+
+test("cloud changes are retained per user until each queued operation has completed", () => {
+  assert.match(source, /Storage\.loadCloudState\(cloudCacheUserId\)/);
+  assert.match(source, /Storage\.loadPendingSyncOperations\(cloudCacheUserId\)/);
+  assert.match(source, /const projectIdByTransaction = new Map\(/);
+  assert.match(source, /project_id: operationProjectId\(table, row\)/);
+  assert.match(source, /function queueSyncOperations\(operations, pendingAction = null\)/);
+  assert.match(source, /async function flushPendingSyncOperations\(\)/);
+  assert.match(source, /removePendingSyncOperations\(completed\)/);
+  assert.match(source, /window\.addEventListener\("online", \(\) => \{/);
+  assert.match(source, /async function pendingActionAlreadyApplied\(action\)/);
+  assert.match(source, /async function remoteOperationAlreadyApplied\(operation\)/);
+  assert.match(source, /if \(operation\.action === "delete"\) return !row;/);
+  assert.match(source, /remoteRowMatchesOperation\(row, operation\)/);
+  assert.match(source, /Promise\.all\(completed\.map\(\(entry\) => remoteOperationAlreadyApplied\(entry\)\)\)/);
+  assert.match(source, /pendingAction: \{ kind: "reconcile_import", project_id: project\.id/);
+});
+
+test("shared project links preserve viewer restrictions and owner revocation controls", () => {
+  assert.match(source, /Api\.setShareToken\?\.\(graph\.share\.token\)/);
+  assert.match(source, /role === "viewer"/);
+  assert.match(source, /Api\.listProjectShares\(projectId\)/);
+  assert.match(source, /Api\.revokeProjectShare\(projectId, shareId\)/);
+  assert.match(source, /Api\.revokeAllProjectShares\(projectId\)/);
+});
+
+test("receipt dates use recognized Japan time and retain a correction path when absent", () => {
+  assert.match(source, /function receiptOccurredAt\(result\)/);
+  assert.match(source, /paid_time/);
+  assert.match(source, /if \(!paidAt\) return null;/);
+  assert.match(source, /\["received", "parsed", "review", "error"\]\.includes\(row\.source_status\)/);
+  assert.match(source, /取引日は確認してください/);
+  assert.match(source, /if \(!record\.occurred_at_raw \|\| !normalizedDate\(record\.occurred_at_raw\)\)/);
+});
+
+test("OCR接続障害を利用者向けの説明へ変換する", () => {
+  assert.match(source, /function receiptOcrErrorMessage\(error\)/);
+  assert.match(source, /error\?\.code === "ocr_upstream_unavailable"/);
+  assert.match(source, /error\?\.code === "ocr_timeout"/);
+  assert.match(source, /error\?\.code === "remote_ocr_unauthorized"/);
+  assert.match(source, /receipt\.status = receiptOcrErrorMessage\(error\)/);
+});
+
+test("account deletion removes the current user cache after the server succeeds and leaves retry available on failure", () => {
+  assert.match(source, /async function deleteAccountFromScreen\(\)/);
+  assert.match(source, /await Api\.deleteAccount\(\);[\s\S]*Storage\.clearCloudState\?\.\(userId\)/);
+  assert.match(source, /ui\.accountDeletionFailed = true;/);
+  assert.match(source, /error\?\.code === "gmail_revocation_failed"/);
+  assert.match(source, /Gmail認可の取消に失敗しました。アカウント削除を再試行できます。/);
+  assert.match(source, /accountDeletionNotice/);
+  assert.match(source, /data-delete-account/);
 });

@@ -223,6 +223,49 @@ test("project CRUD creates a household owner and enforces share expiry", async (
   assert.deepEqual(householdFinalize.body, { error: "project_not_split" });
 });
 
+test("editor share tokens permit mutations while viewer tokens remain read-only and links can be revoked", async (t) => {
+  const db = new D1Database();
+  t.after(() => db.close());
+  await createProject(db, { id: "shared", name: "Shared", project_type: "split" });
+
+  const editor = await request(db, "POST", "/api/projects/shared/share", { role: "editor" });
+  const viewer = await request(db, "POST", "/api/projects/shared/share", { role: "viewer" });
+  assert.equal(editor.response.status, 200);
+  assert.equal(viewer.response.status, 200);
+
+  const anonymousEditor = await request(db, "POST", "/api/projects/shared/members", {
+    id: "editor-member",
+    display_name: "Editor",
+  }, { auth: false }, { headers: { authorization: `Bearer ${editor.body.token}` } });
+  assert.equal(anonymousEditor.response.status, 201);
+
+  const otherSession = await createTestSession(db, "other-user");
+  const signedInEditor = await request(db, "POST", "/api/projects/shared/members", {
+    id: "signed-in-editor-member",
+    display_name: "Signed-in editor",
+  }, {}, { session: otherSession, headers: { authorization: `Bearer ${editor.body.token}` } });
+  assert.equal(signedInEditor.response.status, 201);
+
+  const blockedViewer = await request(db, "POST", "/api/projects/shared/members", {
+    id: "viewer-member",
+    display_name: "Viewer",
+  }, { auth: false }, { headers: { authorization: `Bearer ${viewer.body.token}` } });
+  assert.equal(blockedViewer.response.status, 404);
+
+  const shares = await request(db, "GET", "/api/projects/shared/shares");
+  assert.equal(shares.response.status, 200);
+  assert.deepEqual(shares.body.shares.map((row) => row.role).sort(), ["editor", "viewer"]);
+  const editorShareId = shares.body.shares.find((row) => row.role === "editor").id;
+  const revoked = await request(db, "DELETE", `/api/projects/shared/shares/${editorShareId}`);
+  assert.equal(revoked.response.status, 200);
+  assert.equal((await request(db, "GET", `/api/share/${encodeURIComponent(editor.body.token)}`, undefined, { auth: false })).response.status, 404);
+
+  const revokedAll = await request(db, "DELETE", "/api/projects/shared/shares");
+  assert.equal(revokedAll.response.status, 200);
+  assert.equal(revokedAll.body.shares.every((row) => row.active === false), true);
+  assert.equal((await request(db, "GET", `/api/share/${encodeURIComponent(viewer.body.token)}`, undefined, { auth: false })).response.status, 404);
+});
+
 test("household creation rolls back project and member when the batch fails", async (t) => {
   const db=new D1Database();t.after(()=>db.close());
   db.failBatchAt=1;
@@ -575,6 +618,87 @@ test("account deletion can retry revocation and leaves no connection ciphertext"
   assert.deepEqual({ ...connection }, { refresh_token_ciphertext: "", refresh_token_iv: "", status: "disconnected" });
 });
 
+test("deleting a household revokes Gmail first, retains the project on failure, and removes the connection on retry", async (t) => {
+  const db = new D1Database();
+  t.after(() => db.close());
+  await testSession(db);
+  const householdId = insertTestHousehold(db);
+  const key = btoa(String.fromCharCode(...new Uint8Array(32).fill(9)));
+  const encrypted = await encryptRefreshToken({ GMAIL_TOKEN_KEY_CURRENT_GENERATION: "1", GMAIL_TOKEN_KEY_V1: key }, "project-delete-connection", "test-user", "refresh-token");
+  const now = "2026-07-12T00:00:00.000Z";
+  db.database.prepare(`INSERT INTO gmail_connections (id,user_id,household_project_id,gmail_email,refresh_token_ciphertext,refresh_token_iv,key_generation,aad_version,status,created_at,updated_at)
+    VALUES (?,?,?,?,?,?,?,1,'active',?,?)`).run("project-delete-connection", "test-user", householdId, "mail@example.test", encrypted.ciphertext, encrypted.iv, encrypted.key_generation, now, now);
+  let revokeAttempts = 0;
+  const env = { GMAIL_TOKEN_KEY_CURRENT_GENERATION: "1", GMAIL_TOKEN_KEY_V1: key, GMAIL_FETCH: async () => {
+    revokeAttempts += 1;
+    return revokeAttempts === 1 ? Response.json({ error: "server_error" }, { status: 500 }) : new Response(null, { status: 200 });
+  } };
+
+  const failed = await request(db, "DELETE", `/api/projects/${householdId}`, undefined, env);
+  assert.equal(failed.response.status, 502);
+  assert.equal(db.database.prepare("SELECT COUNT(*) AS n FROM projects WHERE id=?").get(householdId).n, 1);
+  const waiting = db.database.prepare("SELECT status,refresh_token_ciphertext FROM gmail_connections WHERE id=?").get("project-delete-connection");
+  assert.equal(waiting.status, "disconnecting");
+  assert.equal(waiting.refresh_token_ciphertext, encrypted.ciphertext);
+
+  const completed = await request(db, "DELETE", `/api/projects/${householdId}`, undefined, env);
+  assert.equal(completed.response.status, 200);
+  assert.equal(revokeAttempts, 2);
+  assert.equal(db.database.prepare("SELECT COUNT(*) AS n FROM projects WHERE id=?").get(householdId).n, 0);
+  assert.equal(db.database.prepare("SELECT COUNT(*) AS n FROM gmail_connections WHERE id=?").get("project-delete-connection").n, 0);
+});
+
+test("terminal split transactions update payment status and do not block finalization", async (t) => {
+  const db = new D1Database();
+  t.after(() => db.close());
+  await createProject(db, { id: "terminal-split", name: "Terminal", project_type: "split" });
+  const invalidRefund = await request(db, "POST", "/api/projects/terminal-split/transactions", {
+    id: "invalid-positive-refund",
+    merchant_name: "Store",
+    gross_amount: 100,
+    paid_amount: 100,
+    occurred_at: "2026-07-12T12:00:00+09:00",
+    status: "refunded",
+    entry_type: "refund",
+  });
+  assert.equal(invalidRefund.response.status, 400);
+  assert.deepEqual(invalidRefund.body, { error: "invalid_refund_amount" });
+  await request(db, "POST", "/api/projects/terminal-split/members", { id: "terminal-member", display_name: "Member" });
+  await request(db, "POST", "/api/projects/terminal-split/transactions", {
+    id: "terminal-transaction",
+    merchant_name: "Store",
+    gross_amount: 100,
+    paid_amount: 100,
+    occurred_at: "2026-07-12T12:00:00+09:00",
+    status: "confirmed",
+  });
+  await request(db, "POST", "/api/transactions/terminal-transaction/payments", {
+    id: "terminal-payment",
+    payer_member_id: "terminal-member",
+    amount: 100,
+  });
+  await request(db, "POST", "/api/transactions/terminal-transaction/items", { id: "terminal-item", name: "Item", amount: 100 });
+  await request(db, "PUT", "/api/items/terminal-item/allocations", {
+    allocations: [{ id: "terminal-allocation", project_member_id: "terminal-member", allocated_amount: 100 }],
+  });
+
+  const cancelled = await request(db, "PATCH", "/api/transactions/terminal-transaction", { status: "cancelled" });
+  assert.equal(cancelled.response.status, 200);
+  assert.equal(db.database.prepare("SELECT payment_status FROM transaction_payments WHERE id=?").get("terminal-payment").payment_status, "cancelled");
+  const finalizedCancelled = await request(db, "POST", "/api/projects/terminal-split/finalize");
+  assert.equal(finalizedCancelled.response.status, 200);
+  assert.equal(finalizedCancelled.body.validation.valid, true);
+
+  assert.equal((await request(db, "POST", "/api/projects/terminal-split/reopen")).response.status, 200);
+  assert.equal((await request(db, "PATCH", "/api/transactions/terminal-transaction", { status: "confirmed" })).response.status, 200);
+  const refunded = await request(db, "PATCH", "/api/transactions/terminal-transaction", { status: "refunded" });
+  assert.equal(refunded.response.status, 200);
+  assert.equal(db.database.prepare("SELECT payment_status FROM transaction_payments WHERE id=?").get("terminal-payment").payment_status, "refunded");
+  const finalizedRefunded = await request(db, "POST", "/api/projects/terminal-split/finalize");
+  assert.equal(finalizedRefunded.response.status, 200);
+  assert.equal(finalizedRefunded.body.validation.valid, true);
+});
+
 test("row CRUD stays project-scoped and household records follow finalize and reopen", async (t) => {
   const db = new D1Database();
   t.after(() => db.close());
@@ -708,6 +832,24 @@ test("row CRUD stays project-scoped and household records follow finalize and re
   assert.equal(generatedAfterDelete.origin_project_id, null);
 });
 
+test("monthly summaries group timestamps at the Japan time-zone boundary", async (t) => {
+  const db = new D1Database();
+  t.after(() => db.close());
+  await createProject(db, { id: "jst-ledger", name: "JST", project_type: "household" });
+  const transaction = await request(db, "POST", "/api/projects/jst-ledger/transactions", {
+    id: "jst-midnight",
+    merchant_name: "Store",
+    gross_amount: 100,
+    paid_amount: 100,
+    occurred_at: "2026-06-30T15:30:00.000Z",
+    status: "confirmed",
+  });
+  assert.equal(transaction.response.status, 201);
+  const summaries = await request(db, "GET", "/api/projects/jst-ledger/summaries");
+  assert.equal(summaries.response.status, 200);
+  assert.deepEqual(summaries.body.by_month, [{ month: "2026-07", transaction_count: 1, total_amount: 100 }]);
+});
+
 test("referenced members are deactivated while unreferenced members are removed", async (t) => {
   const db = new D1Database();
   t.after(() => db.close());
@@ -747,11 +889,24 @@ test("receipt, notification, CSV, and reconciliation routes persist scoped impor
     source_record_id: "receipt-1",
     merchant_name: "青果店",
     paid_amount: 500,
-    occurred_at: "2026-07-01T10:00:00+09:00",
     confidence: 0.9,
   });
   assert.equal(receipt.response.status, 201);
   assert.equal(receipt.body.import.source_type, "receipt");
+  assert.equal(receipt.body.import.source_status, "error");
+
+  const correctedReceiptDate = await request(db, "PATCH", `/api/imports/${receipt.body.import.id}`, {
+    occurred_at_raw: "2026-07-04T18:45:00+09:00",
+  });
+  assert.equal(correctedReceiptDate.response.status, 200);
+  assert.equal(correctedReceiptDate.body.import.occurred_at_raw, "2026-07-04T18:45:00+09:00");
+  assert.equal(correctedReceiptDate.body.import.source_status, "review");
+
+  const invalidReceiptDate = await request(db, "PATCH", `/api/imports/${receipt.body.import.id}`, {
+    occurred_at_raw: "not-a-date",
+  });
+  assert.equal(invalidReceiptDate.response.status, 400);
+  assert.deepEqual(invalidReceiptDate.body, { error: "invalid_field", field: "occurred_at_raw" });
 
   const notification = await request(db, "POST", "/api/projects/ledger/imports/notification", {
     message_id: "message-1",
@@ -868,6 +1023,41 @@ test("method, field, integer, scope, and OCR errors expose restrained responses"
   assert.deepEqual(noKey.body, { error: "missing_api_key" });
 });
 
+test("OpenAI OCR requests and returns a recognized receipt time", async (t) => {
+  const db = new D1Database();
+  const originalFetch = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+    db.close();
+  });
+  await createProject(db, { id: "ocr-time", name: "OCR", project_type: "household" });
+  let outbound;
+  globalThis.fetch = async (_url, options) => {
+    outbound = JSON.parse(options.body);
+    return Response.json({
+      model: "test-ocr",
+      output_text: JSON.stringify({
+        store_name: "Store",
+        total_amount: 1200,
+        paid_at: "2026-07-12",
+        paid_time: "18:45",
+        items: [],
+        confidence: 0.9,
+        notes: "",
+      }),
+    });
+  };
+  const result = await request(db, "POST", "/api/ocr-receipt", {
+    project_id: "ocr-time",
+    image_data_url: "data:image/png;base64,AA==",
+  }, { OCR_BACKEND: "openai", OPENAI_API_KEY: "test-key" });
+  assert.equal(result.response.status, 200);
+  assert.equal(result.body.paid_time, "18:45");
+  const schema = outbound.text.format.schema;
+  assert.deepEqual(schema.properties.paid_time, { type: ["string", "null"] });
+  assert.equal(schema.required.includes("paid_time"), true);
+});
+
 test("OCR upstream failures are restrained and time out", async (t) => {
   const db = new D1Database();
   const originalFetch = globalThis.fetch;
@@ -897,6 +1087,75 @@ test("OCR upstream failures are restrained and time out", async (t) => {
   });
   assert.equal(timedOut.response.status, 504);
   assert.deepEqual(timedOut.body, { error: "ocr_timeout" });
+});
+
+test("OCR health distinguishes missing configuration, remote readiness, and a connection failure", async (t) => {
+  const originalFetch = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  const missingRemote = await request(null, "GET", "/api/ocr-health", undefined, {
+    OCR_BACKEND: "remote",
+    RECEIPT_OCR_SHARED_SECRET: "shared-secret",
+  });
+  assert.equal(missingRemote.response.status, 503);
+  assert.deepEqual(missingRemote.body, {
+    backend: "remote",
+    configured: false,
+    reachable: false,
+    ready: false,
+    errors: ["missing_receipt_ocr_api_url"],
+  });
+
+  const insecureRemote = await request(null, "GET", "/api/ocr-health", undefined, {
+    OCR_BACKEND: "remote",
+    RECEIPT_OCR_API_URL: "http://ocr.example.test",
+    RECEIPT_OCR_SHARED_SECRET: "shared-secret",
+  });
+  assert.equal(insecureRemote.response.status, 503);
+  assert.deepEqual(insecureRemote.body.errors, ["invalid_receipt_ocr_api_url"]);
+
+  globalThis.fetch = async () => Response.json({ ok: true, tesseract_ollama: { ready: true } });
+  const readyRemote = await request(null, "GET", "/api/ocr-health", undefined, {
+    OCR_BACKEND: "tesseract_ollama",
+    RECEIPT_OCR_API_URL: "https://ocr.example.test",
+    RECEIPT_OCR_SHARED_SECRET: "shared-secret",
+  });
+  assert.equal(readyRemote.response.status, 200);
+  assert.deepEqual(readyRemote.body, {
+    backend: "tesseract_ollama",
+    configured: true,
+    reachable: true,
+    ready: true,
+    errors: [],
+  });
+  assert.doesNotMatch(JSON.stringify(readyRemote.body), /ocr\.example\.test|shared-secret/);
+
+  globalThis.fetch = async () => Response.json({ ok: true, tesseract_ollama: { ready: false } });
+  const notReady = await request(null, "GET", "/api/ocr-health", undefined, {
+    OCR_BACKEND: "remote",
+    RECEIPT_OCR_API_URL: "https://ocr.example.test",
+    RECEIPT_OCR_SHARED_SECRET: "shared-secret",
+  });
+  assert.equal(notReady.response.status, 503);
+  assert.deepEqual(notReady.body.errors, ["remote_ocr_not_ready"]);
+  assert.equal(notReady.body.reachable, true);
+
+  globalThis.fetch = async () => {
+    throw new TypeError("connection refused");
+  };
+  const unavailable = await request(null, "GET", "/api/ocr-health", undefined, {
+    OCR_BACKEND: "remote",
+    RECEIPT_OCR_API_URL: "https://ocr.example.test",
+    RECEIPT_OCR_SHARED_SECRET: "shared-secret",
+  });
+  assert.equal(unavailable.response.status, 502);
+  assert.deepEqual(unavailable.body.errors, ["ocr_upstream_unavailable"]);
+  assert.equal(unavailable.body.reachable, false);
+
+  const invalidMethod = await request(null, "POST", "/api/ocr-health", {});
+  assert.equal(invalidMethod.response.status, 405);
 });
 
 test("remote OCR requires shared authentication and forwards the bearer header", async (t) => {

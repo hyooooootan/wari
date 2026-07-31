@@ -40,7 +40,7 @@ test("calendar entry keeps the selected local day and month in sync", () => {
 
   assert.match(
     dateSource,
-    /date\.getTime\(\) - date\.getTimezoneOffset\(\) \* 60_000\)\.toISOString\(\)\.slice\(0, 10\)/,
+    /japanDateParts\(new Date\(\)\)\.date/,
   );
   assert.match(entrySource, /occurred_at: data\.get\("occurred_at"\) \|\| ui\.calendarDay/);
   assert.match(entrySource, /ui\.calendarDay = String\(data\.get\("occurred_at"\) \|\| ui\.calendarDay\)/);

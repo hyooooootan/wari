@@ -130,6 +130,8 @@ RECEIPT_OCR_SHARED_SECRET=<CloudflareとOracleへ同じ秘密値を登録>
 OCR_TIMEOUT_MS=60000
 ```
 
+`GET /api/ocr-health` は秘密値や接続先URLを返さず、OCR中継の設定状態とOracleの`/health`への到達状態を返す。`missing_receipt_ocr_api_url` はPagesの接続先設定不足、`ocr_upstream_unavailable` はOracle公開先への接続不可、`remote_ocr_not_ready` はOracle上のOCR準備未完了を示す。
+
 `RECEIPT_OCR_API_URL` には `/api/ocr-receipt` を含めない。
 
 ## Oracle A1で実行する手順

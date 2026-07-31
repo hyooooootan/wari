@@ -17,8 +17,13 @@ export async function grantProjectRole(db, projectId, userId, role, timestamp = 
 
 export async function requireProjectRole(db, user, projectId, requiredRole = "viewer") {
   const access = await projectRole(db, user, projectId);
-  if (!access || ROLE_LEVELS[access.role] < ROLE_LEVELS[requiredRole]) throw new ApiError(404, "not_found");
-  return access;
+  if (access && ROLE_LEVELS[access.role] >= ROLE_LEVELS[requiredRole]) return access;
+  if (user?.share_token) {
+    const sharedAccess = await requireProjectShareRole(db, projectId, user.share_token, requiredRole);
+    user.shared_link = true;
+    return sharedAccess;
+  }
+  throw new ApiError(404, "not_found");
 }
 
 export async function requireProjectShareRole(db, projectId, token, requiredRole = "viewer") {
@@ -50,7 +55,7 @@ export async function requireProjectShareRole(db, projectId, token, requiredRole
 }
 
 export async function projectRole(db, user, projectId) {
-  if (!user) return null;
+  if (!user?.id) return null;
   const row = await db.prepare(`SELECT
       projects.id AS project_id,
       CASE WHEN projects.project_type = 'household' THEN 'owner' ELSE roles.role END AS role

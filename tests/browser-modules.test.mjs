@@ -147,14 +147,37 @@ test("画像を検査してData URLへ変換する", async () => {
   };
   assert.equal(WariImports.validateImageFile(file), file);
   assert.equal(await WariImports.readImageAsDataUrl(file), "data:image/jpeg;base64,/9j/2Q==");
+  assert.equal(WariImports.validateImageFile({ ...file, name: "receipt.webp", type: "image/webp" }).type, "image/webp");
+  assert.equal(WariImports.validateImageFile({ ...file, name: "receipt.png", type: "" }).name, "receipt.png");
   assert.throws(
     () => WariImports.validateImageFile({ ...file, type: "text/plain" }),
     (error) => error.code === "unsupported_image_type",
   );
   assert.throws(
+    () => WariImports.validateImageFile({ ...file, name: "receipt.heic", type: "image/heic" }),
+    (error) => error.code === "unsupported_image_type",
+  );
+  assert.equal(WariImports.validateImageFile({ ...file, size: WariImports.MAX_IMAGE_BYTES }).size, WariImports.MAX_IMAGE_BYTES);
+  assert.throws(
     () => WariImports.validateImageFile({ ...file, size: WariImports.MAX_IMAGE_BYTES + 1 }),
     (error) => error.code === "image_too_large",
   );
+});
+
+test("shared-project API requests attach the bearer token without replacing an explicit authorization header", async () => {
+  const calls = [];
+  const client = WariApi.createFetchClient({
+    baseUrl: "/api",
+    fetch: async (url, options) => {
+      calls.push({ url, options });
+      return Response.json({ ok: true });
+    },
+  });
+  client.setShareToken("shared-editor-token");
+  await client.request("/projects/shared/members", { method: "POST", json: { display_name: "Member" } });
+  await client.request("/projects/shared", { headers: { authorization: "Bearer explicit-token" } });
+  assert.equal(calls[0].options.headers.get("authorization"), "Bearer shared-editor-token");
+  assert.equal(calls[1].options.headers.get("authorization"), "Bearer explicit-token");
 });
 
 test("CSVをUTF-8の後にShift_JISで復号する", () => {

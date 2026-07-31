@@ -54,7 +54,14 @@ function transactionStatus(row) {
   return String(row?.status ?? "").toLowerCase();
 }
 
+function activeTransaction(row) {
+  const status = transactionStatus(row);
+  if (status === "cancelled") return false;
+  return status !== "refunded" || transactionType(row) === "refund";
+}
+
 function activePayment(row, transaction) {
+  if (!activeTransaction(transaction)) return false;
   const status = String(row?.payment_status ?? "confirmed").toLowerCase();
   if (status === "cancelled") return false;
   return status !== "refunded" || transactionType(transaction) === "refund";
@@ -109,7 +116,7 @@ function calculateSettlements(balances) {
 function calculateSplit(state, requestedProjectId) {
   const projectId = resolveProjectId(state, requestedProjectId);
   const members = asArray(state?.project_members).filter((row) => projectId === null || row.project_id === projectId);
-  const transactions = asArray(state?.transactions).filter((row) => projectId === null || row.project_id === projectId);
+  const transactions = asArray(state?.transactions).filter((row) => (projectId === null || row.project_id === projectId) && activeTransaction(row));
   const transactionsById = new Map(transactions.map((row) => [row.id, row]));
   const transactionIds = new Set(transactions.map((row) => row.id));
   const items = rowsForProject(state?.transaction_items, projectId, transactionIds, transactionId);
@@ -196,8 +203,9 @@ function validateProjectTransactions(state, requestedProjectId) {
   const projectId = resolveProjectId(state, requestedProjectId);
   const members = asArray(state?.project_members).filter((row) => projectId === null || row.project_id === projectId);
   const memberIds = new Set(members.map((row) => row.id));
-  const transactions = asArray(state?.transactions).filter((row) => projectId === null || row.project_id === projectId);
-  const transactionIds = new Set(transactions.map((row) => row.id));
+  const allTransactions = asArray(state?.transactions).filter((row) => projectId === null || row.project_id === projectId);
+  const transactions = allTransactions.filter(activeTransaction);
+  const transactionIds = new Set(allTransactions.map((row) => row.id));
   const allPayments = rowsForProject(state?.transaction_payments, projectId, transactionIds, transactionId);
   const allItems = rowsForProject(state?.transaction_items, projectId, transactionIds, transactionId);
   const allItemIds = new Set(allItems.map((row) => row.id));

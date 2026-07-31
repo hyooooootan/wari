@@ -1,11 +1,8 @@
-const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
+const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
 const IMAGE_MIME_TYPES = Object.freeze([
   "image/jpeg",
   "image/png",
   "image/webp",
-  "image/gif",
-  "image/heic",
-  "image/heif",
 ]);
 const CSV_SOURCE_TYPES = Object.freeze(["card_csv", "paypay_csv", "bank_csv", "manual"]);
 
@@ -23,9 +20,6 @@ function extensionMimeType(name) {
   if (extension === "jpg" || extension === "jpeg") return "image/jpeg";
   if (extension === "png") return "image/png";
   if (extension === "webp") return "image/webp";
-  if (extension === "gif") return "image/gif";
-  if (extension === "heic") return "image/heic";
-  if (extension === "heif") return "image/heif";
   return "";
 }
 
@@ -38,7 +32,7 @@ function validateImageFile(file, options = {}) {
     : IMAGE_MIME_TYPES;
   const mimeType = String(file.type || extensionMimeType(file.name)).toLowerCase();
   if (!allowedTypes.includes(mimeType)) {
-    throw new ImportFileError("unsupported_image_type", "JPEG、PNG、WebP、GIF、HEICの画像を選択してください", { mimeType });
+    throw new ImportFileError("unsupported_image_type", "JPEG、PNG、WebPの画像を選択してください", { mimeType });
   }
   const size = Number(file.size);
   if (!Number.isFinite(size) || size < 0) {

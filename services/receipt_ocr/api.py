@@ -12,18 +12,23 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 
-HOST = os.environ.get("OCR_HOST", "0.0.0.0")
+HOST = os.environ.get("OCR_HOST", "127.0.0.1")
 PORT = int(os.environ.get("PORT", os.environ.get("OCR_PORT", "4190")))
-MAX_BODY_SIZE = int(os.environ.get("OCR_MAX_BODY_SIZE", str(10 * 1024 * 1024)))
+MAX_IMAGE_BYTES = 5 * 1024 * 1024
+MAX_BODY_SIZE = int(os.environ.get("OCR_MAX_BODY_SIZE", str(8 * 1024 * 1024)))
+IMAGE_MIME_TYPES = {"image/jpeg", "image/png", "image/webp"}
 OCR_BACKEND = os.environ.get("OCR_BACKEND", "gemini").lower()
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 GEMINI_OCR_MODEL = os.environ.get("GEMINI_OCR_MODEL", "gemini-2.5-flash")
 RECEIPT_OCR_SHARED_SECRET = os.environ.get("RECEIPT_OCR_SHARED_SECRET", "")
+ALLOW_IMAGE_PATH = os.environ.get("OCR_ALLOW_IMAGE_PATH", "").lower() in {"1", "true", "yes"}
 
 
 class ReceiptOcrHandler(BaseHTTPRequestHandler):
     def end_headers(self):
-        self.send_header("Access-Control-Allow-Origin", os.environ.get("OCR_CORS_ORIGIN", "*"))
+        cors_origin = os.environ.get("OCR_CORS_ORIGIN", "")
+        if cors_origin:
+            self.send_header("Access-Control-Allow-Origin", cors_origin)
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "content-type")
         super().end_headers()
@@ -35,7 +40,8 @@ class ReceiptOcrHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = urlparse(self.path).path
         if path == "/health":
-            self.send_json(200, public_health_payload())
+            payload = public_health_payload()
+            self.send_json(200 if payload["ok"] else 503, payload)
             return
         if path == "/":
             self.send_json(
@@ -65,10 +71,9 @@ class ReceiptOcrHandler(BaseHTTPRequestHandler):
             result.pop("ocr_lines", None)
             self.send_json(200, result)
         except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")
-            self.send_json(502, {"error": "ocr_provider_error", "message": detail[:1000]})
-        except Exception as exc:
-            self.send_json(400, {"error": "ocr_failed", "message": str(exc)})
+            self.send_json(502, {"error": "ocr_provider_error"})
+        except Exception:
+            self.send_json(400, {"error": "ocr_failed"})
 
     def read_ocr_request(self):
         length = int(self.headers.get("Content-Length", "0"))
@@ -83,19 +88,24 @@ class ReceiptOcrHandler(BaseHTTPRequestHandler):
         if content_type.startswith("application/json"):
             payload = json.loads(body.decode("utf-8"))
             if payload.get("image_data_url"):
+                validate_image_data_url(payload["image_data_url"])
                 return read_receipt_from_data_url(payload["image_data_url"])
             if payload.get("image_path"):
+                if not ALLOW_IMAGE_PATH:
+                    raise ValueError("image_path input is disabled")
                 return read_receipt_from_path(Path(payload["image_path"]))
             raise ValueError("JSON must include image_path or image_data_url")
 
         if content_type.startswith("multipart/form-data"):
             image_bytes, media_type, suffix = parse_multipart_image(body, content_type)
+            validate_image_bytes(image_bytes, media_type)
             if use_gemini_backend():
                 return read_receipt_from_data_url(to_data_url_from_bytes(image_bytes, media_type))
             return read_temp_image(image_bytes, suffix)
 
         if content_type.startswith("image/") or content_type == "application/octet-stream":
             suffix = suffix_from_content_type(content_type)
+            validate_image_bytes(body, content_type)
             if use_gemini_backend():
                 return read_receipt_from_data_url(to_data_url_from_bytes(body, content_type))
             return read_temp_image(body, suffix)
@@ -135,14 +145,37 @@ def public_health_payload():
         details = tesseract_ollama_health()
         tesseract = details.get("tesseract", {})
         ollama = details.get("ollama", {})
+        ready = bool(tesseract.get("available") and tesseract.get("configured_langs_available") and ollama.get("available") and ollama.get("model_present"))
+        payload["ok"] = ready
         payload["tesseract_ollama"] = {
-            "ready": bool(tesseract.get("available") and tesseract.get("configured_langs_available") and ollama.get("available") and ollama.get("model_present")),
+            "ready": ready,
             "tesseract_available": bool(tesseract.get("available")),
             "languages_available": bool(tesseract.get("configured_langs_available")),
             "ollama_available": bool(ollama.get("available")),
             "model_available": bool(ollama.get("model_present")),
         }
     return payload
+
+
+def validate_image_bytes(image_bytes, media_type):
+    if media_type.lower().split(";", 1)[0] not in IMAGE_MIME_TYPES:
+        raise ValueError("JPEG、PNG、WebPの画像を指定してください")
+    if not image_bytes or len(image_bytes) > MAX_IMAGE_BYTES:
+        raise ValueError("画像は5MB以下にしてください")
+
+
+def validate_image_data_url(image_data_url):
+    if not isinstance(image_data_url, str):
+        raise ValueError("画像データの形式が不正です")
+    header, separator, encoded = image_data_url.partition(",")
+    if not separator or ";base64" not in header:
+        raise ValueError("画像データの形式が不正です")
+    media_type = header.removeprefix("data:").split(";", 1)[0]
+    try:
+        image_bytes = base64.b64decode(encoded, validate=True)
+    except ValueError as exc:
+        raise ValueError("画像データの形式が不正です") from exc
+    validate_image_bytes(image_bytes, media_type)
 
 
 def parse_multipart_image(body, content_type):

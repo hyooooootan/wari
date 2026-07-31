@@ -1,7 +1,7 @@
 import { ApiError, json, readJson } from "./responses.js";
 
-const IMAGE_TYPES = new Set(["image/jpeg", "image/png", "image/webp", "image/gif", "image/heic", "image/heif"]);
-const DEFAULT_MAX_IMAGE_BYTES = 10 * 1024 * 1024;
+const IMAGE_TYPES = new Set(["image/jpeg", "image/png", "image/webp"]);
+const DEFAULT_MAX_IMAGE_BYTES = 5 * 1024 * 1024;
 const DEFAULT_TIMEOUT_MS = 60_000;
 
 export async function handleReceiptOcr(request, env, payload = null) {
@@ -22,6 +22,48 @@ export async function handleReceiptOcr(request, env, payload = null) {
     return json({ error: "missing_api_key" }, 503);
   }
   return json({ error: "unsupported_ocr_backend" }, 400);
+}
+
+export async function receiptOcrHealth(env = {}) {
+  const backend = String(env.OCR_BACKEND || "auto").toLowerCase();
+  if (backend === "remote" || backend === "tesseract_ollama") return remoteOcrHealth(backend, env);
+  if (backend === "openai") return env.OPENAI_API_KEY
+    ? { status: 200, body: { backend, configured: true, ready: true, errors: [] } }
+    : { status: 503, body: { backend, configured: false, ready: false, errors: ["missing_api_key"] } };
+  if (backend === "gemini") return env.GEMINI_API_KEY
+    ? { status: 200, body: { backend, configured: true, ready: true, errors: [] } }
+    : { status: 503, body: { backend, configured: false, ready: false, errors: ["missing_api_key"] } };
+  if (backend === "auto") {
+    if (env.OPENAI_API_KEY) return { status: 200, body: { backend, selected_backend: "openai", configured: true, ready: true, errors: [] } };
+    if (env.GEMINI_API_KEY) return { status: 200, body: { backend, selected_backend: "gemini", configured: true, ready: true, errors: [] } };
+    return { status: 503, body: { backend, configured: false, ready: false, errors: ["missing_api_key"] } };
+  }
+  return { status: 503, body: { backend, configured: false, ready: false, errors: ["unsupported_ocr_backend"] } };
+}
+
+async function remoteOcrHealth(backend, env) {
+  const sharedSecret = String(env.RECEIPT_OCR_SHARED_SECRET || "");
+  const baseUrl = String(env.RECEIPT_OCR_API_URL || env.OCR_API_URL || "").replace(/\/+$/, "");
+  const errors = [];
+  if (!sharedSecret) errors.push("missing_receipt_ocr_shared_secret");
+  if (!baseUrl) errors.push("missing_receipt_ocr_api_url");
+  else if (!validRemoteOcrUrl(baseUrl)) errors.push("invalid_receipt_ocr_api_url");
+  if (errors.length) return { status: 503, body: { backend, configured: false, reachable: false, ready: false, errors } };
+  try {
+    const { response, data } = await timedJsonFetch(new URL(`${baseUrl}/health`), { method: "GET" }, env);
+    if (!response.ok) return { status: 502, body: { backend, configured: true, reachable: true, ready: false, errors: ["remote_ocr_health_unavailable"] } };
+    if (!data || typeof data !== "object" || Array.isArray(data)) {
+      return { status: 502, body: { backend, configured: true, reachable: true, ready: false, errors: ["invalid_remote_ocr_health"] } };
+    }
+    const ready = data.ok === true && data.tesseract_ollama?.ready !== false;
+    return ready
+      ? { status: 200, body: { backend, configured: true, reachable: true, ready: true, errors: [] } }
+      : { status: 503, body: { backend, configured: true, reachable: true, ready: false, errors: ["remote_ocr_not_ready"] } };
+  } catch (error) {
+    const status = error instanceof ApiError ? error.status : 502;
+    const code = error instanceof ApiError ? error.code : "ocr_upstream_unavailable";
+    return { status, body: { backend, configured: true, reachable: false, ready: false, errors: [code] } };
+  }
 }
 
 export function parseImageDataUrl(value, maximumBytes = DEFAULT_MAX_IMAGE_BYTES) {
@@ -57,7 +99,7 @@ async function readReceiptWithRemoteOcr(imageDataUrl, env) {
   } catch {
     return json({ error: "invalid_receipt_ocr_api_url" }, 503);
   }
-  if (url.protocol !== "https:" && url.protocol !== "http:") return json({ error: "invalid_receipt_ocr_api_url" }, 503);
+  if (!validRemoteOcrUrl(url)) return json({ error: "invalid_receipt_ocr_api_url" }, 503);
   const { response: remoteRes, data } = await timedJsonFetch(
     url,
     {
@@ -74,6 +116,15 @@ async function readReceiptWithRemoteOcr(imageDataUrl, env) {
   if (!remoteRes.ok) return json({ error: "remote_ocr_error" }, 502);
   if (!data || typeof data !== "object" || Array.isArray(data)) return json({ error: "invalid_remote_ocr_response" }, 502);
   return json(data);
+}
+
+function validRemoteOcrUrl(value) {
+  try {
+    const url = value instanceof URL ? value : new URL(value);
+    return url.protocol === "https:";
+  } catch {
+    return false;
+  }
 }
 
 async function readReceiptWithOpenAI(imageDataUrl, env) {
@@ -189,11 +240,12 @@ function receiptSchema(gemini) {
       store_name: nullableString,
       total_amount: nullableInteger,
       paid_at: nullableString,
+      paid_time: nullableString,
       items: { type: "array", items: itemSchema },
       confidence: { type: "number" },
       notes: { type: "string" },
     },
-    required: ["store_name", "total_amount", "paid_at", "items", "confidence", "notes"],
+    required: ["store_name", "total_amount", "paid_at", "paid_time", "items", "confidence", "notes"],
   };
   if (gemini) {
     delete schema.additionalProperties;
@@ -218,7 +270,7 @@ function parseOcrOutput(value) {
 
 function maxImageBytes(env) {
   const value = Number(env.OCR_MAX_IMAGE_BYTES);
-  return Number.isSafeInteger(value) && value >= 1_024 && value <= 25 * 1024 * 1024 ? value : DEFAULT_MAX_IMAGE_BYTES;
+  return Number.isSafeInteger(value) && value >= 1_024 && value <= DEFAULT_MAX_IMAGE_BYTES ? value : DEFAULT_MAX_IMAGE_BYTES;
 }
 
 function timeoutMs(env) {

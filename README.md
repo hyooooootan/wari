@@ -25,7 +25,7 @@
 
 - 常設カレンダーでの日別支出表示と支出追加
 - 家計簿の月別・費目別・支払方法別集計
-- Gmail支払い通知の期間指定、候補確認・修正、複数選択、一括登録・破棄
+- 三井住友カード、楽天カード、JCBのGmail支払い通知について、期間指定、候補確認・修正、複数選択、一括登録・破棄
 - レシート、カードCSV、PayPay CSV、銀行CSV、解析済み通知の取込と照合
 - クレジットカード返金など、負数取引の返金表示と集計
 - 割り勘プロジェクトの作成、参加者・支払い・品目・負担額の管理
@@ -85,13 +85,23 @@ projects
 
 ## ローカル確認
 
-静的画面を確認する場合は次を実行します。
+画面の配置と端末内保存を確認する場合は次を実行します。
 
 ```powershell
 python server.py
 ```
 
 ブラウザで `http://127.0.0.1:4181` を開きます。D1 が使えない場合も、データは `localStorage` に保存されます。
+
+レシートOCRも確認する場合は、Python 3.10以上、Tesseract、Ollamaを用意してから依存関係を導入します。
+
+```powershell
+python -m pip install -r services/receipt_ocr/requirements.txt
+python -m services.receipt_ocr.check_env
+python server.py
+```
+
+`http://127.0.0.1:4181/api/ocr-health` が `ok: true` を返すことを確認してから、画面の「取込」で画像を選びます。ローカルOCRの入力はJPEG、PNG、WebPで、復号前の画像は5MB以下です。依存関係が不足している場合、OCR要求は設定不足として503を返します。画面表示の確認とOCRの確認は別に行えます。
 
 自動試験と、Pages Functions・D1 を含む確認には次を実行します。
 

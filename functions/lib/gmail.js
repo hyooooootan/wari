@@ -2,12 +2,13 @@ import { ApiError } from "./responses.js";
 import { cookieHeader, clearCookieHeader, parseCookies } from "./auth.js";
 import { randomToken, sha256Hex } from "./crypto.js";
 import { extractGmailText } from "./gmail-mime.js";
-import { parsePaymentNotification } from "./gmail-parsers.js";
+import { parseTrustedGmailPaymentNotification } from "./gmail-parsers.js";
 import { normalizeDate, normalizeMerchantName, normalizePaymentMethod } from "./normalization.js";
 
 const STATE_COOKIE = "wari_gmail_oauth";
 const STATE_TTL_MS = 10 * 60 * 1000;
 const DAYS = new Set([7, 30, 90]);
+const PAYMENT_SENDER_QUERY = '(from:statement@vpass.ne.jp OR (from:mail.rakuten-card.co.jp subject:"カード利用のお知らせ") OR (from:qa.jcb.co.jp subject:"JCBカード／ショッピングご利用のお知らせ"))';
 const encoder = new TextEncoder();
 
 export async function startGmailOAuth(db, env, request, user) {
@@ -121,6 +122,20 @@ export async function disconnectAllGmail(db, env, user) {
   return { failed };
 }
 
+export async function disconnectProjectGmail(db, env, user, projectId) {
+  const rows = await db.prepare(`SELECT c.* FROM gmail_connections c
+    WHERE c.user_id = ? AND c.household_project_id = ? AND c.status <> 'disconnected'`).bind(user.id, projectId).all();
+  for (const connection of rows.results || []) {
+    await disconnectGmail(db, env, user, connection.id);
+  }
+  const removed = await db.prepare(`DELETE FROM gmail_connections
+    WHERE user_id = ? AND household_project_id = ? AND status = 'disconnected'`).bind(user.id, projectId).run();
+  return {
+    disconnected_count: (rows.results || []).length,
+    removed_count: Number(removed?.meta?.changes || 0),
+  };
+}
+
 export async function retryGmailRevocations(db, env, input = {}) {
   const limit = Number.isInteger(input.limit) && input.limit > 0 ? Math.min(input.limit, 100) : 25;
   let completed = 0;
@@ -187,9 +202,9 @@ export async function syncGmail(db, env, user, connectionId, input = {}) {
     const token = await googleForm(env, "https://oauth2.googleapis.com/token", { client_id:env.GMAIL_CLIENT_ID,client_secret:env.GMAIL_CLIENT_SECRET,refresh_token:refresh,grant_type:"refresh_token" });
     const searchUrl = new URL("https://gmail.googleapis.com/gmail/v1/users/me/messages");
     searchUrl.searchParams.set("maxResults", String(batchSize));
-    searchUrl.searchParams.set("q", `after:${queryAfter} from:statement@vpass.ne.jp -subject:"一定金額到達のお知らせ"`);
+    searchUrl.searchParams.set("q", gmailPaymentSearchQuery(queryAfter));
     if (pageToken) searchUrl.searchParams.set("pageToken", pageToken);
-    if (dateRange) searchUrl.searchParams.set("q", `after:${queryAfter} before:${queryBefore} from:statement@vpass.ne.jp -subject:"一定金額到達のお知らせ"`);
+    if (dateRange) searchUrl.searchParams.set("q", gmailPaymentSearchQuery(queryAfter, queryBefore));
     const listing = await googleJson(env, searchUrl.toString(), token.access_token);
     const messages=(listing.messages||[]).slice(0,batchSize); listed=messages.length;
     nextPageToken = typeof listing.nextPageToken === "string" && listing.nextPageToken ? listing.nextPageToken : null;
@@ -201,7 +216,7 @@ export async function syncGmail(db, env, user, connectionId, input = {}) {
         const message=await googleJson(env,`https://gmail.googleapis.com/gmail/v1/users/me/messages/${encodeURIComponent(item.id)}?format=full`,token.access_token);
         const headers=Object.fromEntries((message.payload?.headers||[]).map(h=>[String(h.name).toLowerCase(),h.value]));
         const receivedAt=parseInternalDate(message.internalDate)||parseHeaderDate(headers.date);
-        const parsed=parsePaymentNotification(extractGmailText(message.payload),{...headers,received_at:receivedAt}); const messageRowId=exists?.id||crypto.randomUUID(); const candidateId=parsed.parse_status === "parse_error" ? null : crypto.randomUUID();
+        const parsed=parseTrustedGmailPaymentNotification(extractGmailText(message.payload),{...headers,received_at:receivedAt}); const messageRowId=exists?.id||crypto.randomUUID(); const candidateId=parsed.parse_status === "parse_error" ? null : crypto.randomUUID();
         const warning=parsed.amount!==null&&parsed.occurred_at?await duplicateWarning(db,user.id,parsed.amount,parsed.occurred_at):0;
         const now=new Date().toISOString();
         pending.push({ exists: Boolean(exists), messageRowId, candidateId, gmailMessageId:item.id, parsed,
@@ -252,6 +267,11 @@ export async function syncGmail(db, env, user, connectionId, input = {}) {
   const run = await db.prepare("SELECT * FROM gmail_sync_runs WHERE id=?").bind(runId).first();
   const hasMore = status === "completed" && Boolean(nextPageToken);
   return { run, next_page_token: hasMore ? nextPageToken : null, query_after: queryAfter, query_before: queryBefore, has_more: hasMore, listed_count: listed, processed_count: processed, candidate_count: candidates, duplicate_count: duplicates, ignored_count: ignored, error_count: errors };
+}
+
+export function gmailPaymentSearchQuery(after, before = null) {
+  const range = before == null ? `after:${after}` : `after:${after} before:${before}`;
+  return `${range} ${PAYMENT_SENDER_QUERY} -subject:"一定金額到達のお知らせ"`;
 }
 
 function resolveDateRange(fromDate, toDate) {

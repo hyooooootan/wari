@@ -13,7 +13,7 @@ POST /api/ocr-receipt
 - `multipart/form-data` field `image` or `file`
 - raw `image/*` request body
 - JSON `{ "image_data_url": "data:image/..." }`
-- JSON `{ "image_path": "/path/to/image" }` for local testing
+- JSON `{ "image_path": "/path/to/image" }` when `OCR_ALLOW_IMAGE_PATH=true` is set in a non-public maintenance environment
 
 ## Tesseract + Ollama backend
 
@@ -32,6 +32,7 @@ python -m services.receipt_ocr.api
 
 The API calls Ollama only through `127.0.0.1:11434`. Do not expose Ollama directly to the internet.
 `POST /ocr` and `POST /api/ocr-receipt` require `Authorization: Bearer <RECEIPT_OCR_SHARED_SECRET>`. Keep the value identical to the Cloudflare Secret and do not print or commit it.
+The Wari Cloudflare relay accepts JPEG, PNG, and WebP images up to 5MB before decoding. Bind this service to `127.0.0.1` and publish it through an HTTPS reverse proxy or Cloudflare Tunnel.
 
 Required system packages:
 
@@ -54,6 +55,7 @@ OLLAMA_BASE_URL=http://127.0.0.1:11434
 OLLAMA_MODEL=qwen2.5:3b
 OLLAMA_TIMEOUT=25
 RECEIPT_OCR_SHARED_SECRET=<Cloudflareと同じ秘密値>
+OCR_ALLOW_IMAGE_PATH=false
 ```
 
 Environment check:

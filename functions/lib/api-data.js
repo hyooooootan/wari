@@ -231,18 +231,7 @@ export async function createProjectShare(db, projectId, input = {}, user = null)
         WHERE project_id = ? AND revoked_at IS NULL`).bind(timestamp, timestamp, id),
     );
   }
-  let token = null;
-  if (!rotate) {
-    const activeShare = await db.prepare(`SELECT * FROM project_shares
-      WHERE project_id = ?
-        AND role = ?
-        AND revoked_at IS NULL
-        AND ((expires_at IS NULL AND ? IS NULL) OR expires_at = ?)
-      ORDER BY created_at DESC
-      LIMIT 1`).bind(id, role, expiresAt, expiresAt).first();
-    if (activeShare) token = null;
-  }
-  token = token || makeToken();
+  const token = makeToken();
   statements.push(
     db.prepare(`INSERT INTO project_shares (
       id, project_id, token_hash, role, expires_at, revoked_at, created_by_user_id, created_at, updated_at
@@ -264,6 +253,47 @@ export async function createProjectShare(db, projectId, input = {}, user = null)
   );
   await db.batch(statements);
   return { project_id: id, token, role, expires_at: expiresAt };
+}
+
+export async function listProjectShares(db, projectId) {
+  const id = pathId(projectId);
+  await requireProject(db, id);
+  const timestamp = now();
+  const rows = await all(db.prepare(`SELECT id, project_id, role, expires_at, revoked_at, created_at, updated_at
+    FROM project_shares
+    WHERE project_id = ?
+    ORDER BY CASE WHEN revoked_at IS NULL AND (expires_at IS NULL OR expires_at > ?) THEN 0 ELSE 1 END,
+      created_at DESC, id DESC`).bind(id, timestamp));
+  return {
+    project_id: id,
+    shares: rows.map((row) => ({
+      ...row,
+      active: row.revoked_at === null && (row.expires_at === null || row.expires_at > timestamp),
+    })),
+  };
+}
+
+export async function revokeProjectShares(db, projectId, shareId = null) {
+  const id = pathId(projectId);
+  await requireProject(db, id);
+  const timestamp = now();
+  const statements = [];
+  if (shareId === null) {
+    statements.push(db.prepare(`UPDATE project_shares
+      SET revoked_at = COALESCE(revoked_at, ?), updated_at = ?
+      WHERE project_id = ? AND revoked_at IS NULL`).bind(timestamp, timestamp, id));
+    statements.push(db.prepare(`UPDATE projects
+      SET share_token = NULL, share_expires_at = NULL, updated_at = ?
+      WHERE id = ?`).bind(timestamp, id));
+  } else {
+    const share = await db.prepare("SELECT id FROM project_shares WHERE id = ? AND project_id = ?").bind(pathId(shareId), id).first();
+    if (!share) throw new ApiError(404, "not_found");
+    statements.push(db.prepare(`UPDATE project_shares
+      SET revoked_at = COALESCE(revoked_at, ?), updated_at = ?
+      WHERE id = ? AND project_id = ?`).bind(timestamp, timestamp, share.id, id));
+  }
+  await db.batch(statements);
+  return listProjectShares(db, id);
 }
 
 export async function getSharedProject(db, tokenValue) {
@@ -518,6 +548,7 @@ export async function createTransaction(db, projectId, input) {
     created_at: timestamp,
     updated_at: timestamp,
   };
+  assertRefundAmounts(transaction.entry_type, transaction.gross_amount, transaction.paid_amount);
   await db.prepare(`INSERT INTO transactions (
     id, project_id, merchant_name, merchant_normalized, gross_amount, paid_amount, discount_amount, point_amount,
     category, status, occurred_at, settled_at, note, entry_type, origin_project_id, origin_transaction_id,
@@ -585,23 +616,55 @@ export async function updateTransaction(db, transactionId, input) {
   await requireWritableProject(db, transaction.project_id);
   const assignments = [];
   const bindings = [];
+  let nextStatus = transaction.status;
+  let nextEntryType = transaction.entry_type;
+  let nextGrossAmount = transaction.gross_amount;
+  let nextPaidAmount = transaction.paid_amount;
   if (has(input, "merchant_name")) {
     const merchantName = requiredString(input, "merchant_name", 1, 300);
     addAssignment(assignments, bindings, "merchant_name", merchantName);
     addAssignment(assignments, bindings, "merchant_normalized", normalizeMerchant(merchantName).slice(0, 300));
   }
-  if (has(input, "gross_amount")) addAssignment(assignments, bindings, "gross_amount", requiredInteger(input, "gross_amount"));
-  if (has(input, "paid_amount")) addAssignment(assignments, bindings, "paid_amount", requiredInteger(input, "paid_amount"));
+  if (has(input, "gross_amount")) {
+    nextGrossAmount = requiredInteger(input, "gross_amount");
+    addAssignment(assignments, bindings, "gross_amount", nextGrossAmount);
+  }
+  if (has(input, "paid_amount")) {
+    nextPaidAmount = requiredInteger(input, "paid_amount");
+    addAssignment(assignments, bindings, "paid_amount", nextPaidAmount);
+  }
   if (has(input, "discount_amount")) addAssignment(assignments, bindings, "discount_amount", requiredNonNegativeInteger(input, "discount_amount"));
   if (has(input, "point_amount")) addAssignment(assignments, bindings, "point_amount", requiredNonNegativeInteger(input, "point_amount"));
   if (has(input, "category")) addAssignment(assignments, bindings, "category", nullableString(input, "category", 120));
-  if (has(input, "status")) addAssignment(assignments, bindings, "status", requiredEnum(input, "status", TRANSACTION_STATUSES));
+  if (has(input, "status")) {
+    nextStatus = requiredEnum(input, "status", TRANSACTION_STATUSES);
+    addAssignment(assignments, bindings, "status", nextStatus);
+  }
   if (has(input, "occurred_at")) addAssignment(assignments, bindings, "occurred_at", requiredDate(input, "occurred_at"));
   if (has(input, "settled_at")) addAssignment(assignments, bindings, "settled_at", nullableDate(input, "settled_at"));
   if (has(input, "note")) addAssignment(assignments, bindings, "note", nullableString(input, "note", 4_000));
-  if (has(input, "entry_type")) addAssignment(assignments, bindings, "entry_type", requiredEnum(input, "entry_type", ENTRY_TYPES));
-  addAssignment(assignments, bindings, "updated_at", now());
-  await db.prepare(`UPDATE transactions SET ${assignments.join(", ")} WHERE id = ? AND project_id = ?`).bind(...bindings, id, transaction.project_id).run();
+  if (has(input, "entry_type")) {
+    nextEntryType = requiredEnum(input, "entry_type", ENTRY_TYPES);
+    addAssignment(assignments, bindings, "entry_type", nextEntryType);
+  }
+  assertRefundAmounts(nextEntryType, nextGrossAmount, nextPaidAmount);
+  const timestamp = now();
+  addAssignment(assignments, bindings, "updated_at", timestamp);
+  const statements = [db.prepare(`UPDATE transactions SET ${assignments.join(", ")} WHERE id = ? AND project_id = ?`).bind(...bindings, id, transaction.project_id)];
+  if (has(input, "status") || has(input, "entry_type")) {
+    const terminal = nextStatus === "cancelled" || nextStatus === "refunded" && nextEntryType !== "refund";
+    if (terminal) {
+      statements.push(db.prepare(`UPDATE transaction_payments SET payment_status = ?, updated_at = ? WHERE transaction_id = ?`).bind(nextStatus, timestamp, id));
+    } else {
+      const paymentStatus = nextStatus === "provisional" ? "provisional" : "confirmed";
+      statements.push(db.prepare(`UPDATE transaction_payments SET payment_status = ?, updated_at = ?
+        WHERE transaction_id = ? AND payment_status IN ('cancelled', 'refunded')`).bind(paymentStatus, timestamp, id));
+    }
+  }
+  if (statements.length > 1 && typeof db.batch === "function") await db.batch(statements);
+  else {
+    for (const statement of statements) await statement.run();
+  }
   return { transaction: await db.prepare("SELECT * FROM transactions WHERE id = ?").bind(id).first() };
 }
 
@@ -872,12 +935,12 @@ export async function getProjectSummaries(db, projectId) {
       ORDER BY total_amount DESC, category`).bind(id),
   );
   const byMonth = await all(
-    db.prepare(`SELECT substr(occurred_at, 1, 7) AS month, COUNT(*) AS transaction_count, COALESCE(SUM(paid_amount), 0) AS total_amount
+    db.prepare(`SELECT strftime('%Y-%m', occurred_at, '+9 hours') AS month, COUNT(*) AS transaction_count, COALESCE(SUM(paid_amount), 0) AS total_amount
       FROM transactions
       WHERE project_id = ?
         AND (status IN ('confirmed', 'corrected') OR (status = 'refunded' AND entry_type = 'refund'))
         AND entry_type IN ('purchase', 'split_expense', 'refund', 'adjustment')
-      GROUP BY substr(occurred_at, 1, 7)
+      GROUP BY strftime('%Y-%m', occurred_at, '+9 hours')
       ORDER BY month DESC`).bind(id),
   );
   const byPaymentMethod = await all(
@@ -1302,6 +1365,12 @@ function nullableDate(input, field) {
 
 function optionalNullableDate(input, field, fallback) {
   return has(input, field) ? nullableDate(input, field) : fallback;
+}
+
+function assertRefundAmounts(entryType, grossAmount, paidAmount) {
+  if (entryType === "refund" && (Number(grossAmount) > 0 || Number(paidAmount) > 0)) {
+    throw new ApiError(400, "invalid_refund_amount");
+  }
 }
 
 function dateValue(value, field) {

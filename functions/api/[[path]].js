@@ -2,6 +2,8 @@ import {
   createProject,
   createProjectMember,
   createProjectShare,
+  listProjectShares,
+  revokeProjectShares,
   createTransaction,
   createTransactionItem,
   createTransactionPayment,
@@ -65,11 +67,13 @@ import {
   createReceiptImport,
   listImports,
   reconcileImport,
+  updateImportReviewDate,
 } from "../lib/imports.js";
-import { handleReceiptOcr } from "../lib/ocr.js";
+import { handleReceiptOcr, receiptOcrHealth } from "../lib/ocr.js";
 import {
   disconnectGmail,
   disconnectAllGmail,
+  disconnectProjectGmail,
   bulkCandidateAction,
   finishGmailOAuth,
   importCandidate,
@@ -92,10 +96,13 @@ const GMAIL_REVOCATION_RETRY_LIMIT = 25;
 
 export async function onRequest(context) {
   const request = context.request;
-  try {
-    const url = new URL(request.url);
-    const path = requestPath(url.pathname);
-    const db = context.env?.DB;
+    try {
+      const url = new URL(request.url);
+      const path = requestPath(url.pathname);
+      if (path[0] === "ocr-health" && path.length === 1) {
+        return withSecurityHeaders(await dispatchReceiptOcrHealth(request, context.env || {}));
+      }
+      const db = context.env?.DB;
     if (!db) throw new ApiError(500, "missing_d1_binding");
     if (path.length === 3 && path[0] === "admin" && path[1] === "gmail-revocations" && path[2] === "retry") {
       return withSecurityHeaders(await dispatchGmailRevocationRetry(request, db, context.env || {}, url));
@@ -109,6 +116,12 @@ export async function onRequest(context) {
   } catch (error) {
     return withSecurityHeaders(errorResponse(error));
   }
+}
+
+async function dispatchReceiptOcrHealth(request, env) {
+  if (request.method !== "GET") return methodNotAllowed(["GET"]);
+  const result = await receiptOcrHealth(env);
+  return json(result.body, result.status);
 }
 
 async function dispatchGmailRevocationRetry(request, db, env, url) {
@@ -166,18 +179,27 @@ async function dispatch(request, db, env, url, path) {
   if (path[0] === "share" && path.length === 2) {
     return invoke(request, ["GET"], async () => json(await getSharedProject(db, path[1])));
   }
-  const user = await requireUser(db, request);
-  assertCsrf(request, user);
-  if (path[0] === "gmail") return dispatchGmail(request, db, env, url, path, user);
+  const sessionUser = await getSessionUser(db, request);
+  const shareToken = bearerToken(request);
+  const user = sessionUser
+    ? { ...sessionUser, ...(shareToken ? { share_token: shareToken } : {}) }
+    : shareToken ? { share_token: shareToken, shared_link: true } : null;
+  if (!user) throw new ApiError(401, "authentication_required");
+  if (sessionUser) assertCsrf(request, sessionUser);
+  if (path[0] === "gmail") {
+    if (!sessionUser) throw new ApiError(401, "authentication_required");
+    return dispatchGmail(request, db, env, url, path, sessionUser);
+  }
   if (path[0] === "household-sync-jobs" && path.length === 3 && path[2] === "retry") {
+    if (!sessionUser) throw new ApiError(401, "authentication_required");
     return invoke(request, ["POST"], async () => {
       assertOrigin(request, env, { requireOrigin: true, requireJson: true });
       assertAllowedBody(await readJson(request), new Set());
-      const result = await retryHouseholdSyncJob(db, path[1], user);
+      const result = await retryHouseholdSyncJob(db, path[1], sessionUser);
       return json(result, result.status === "not_found" ? 404 : 200);
     });
   }
-  if (path[0] === "projects") return dispatchProjects(request, db, url, path, user);
+  if (path[0] === "projects") return dispatchProjects(request, db, env, url, path, user);
   if ((path[0] === "project-members" || path[0] === "members") && path.length >= 2) {
     return dispatchMember(request, db, path, user);
   }
@@ -194,6 +216,22 @@ async function dispatch(request, db, env, url, path) {
     return invoke(request, ["POST"], async () => {
       await requireProjectRole(db, user, await projectIdForImport(db, path[1]), "editor");
       return handleReconcile(request, db, path[1], user);
+    });
+  }
+  if (path[0] === "imports" && path.length === 2 && request.method === "PATCH") {
+    return invoke(request, ["PATCH"], async () => {
+      const projectId = await projectIdForImport(db, path[1]);
+      await requireProjectRole(db, user, projectId, "editor");
+      const body = await readJson(request);
+      assertAllowedBody(body, new Set(["occurred_at_raw"]));
+      if (typeof body.occurred_at_raw !== "string" || !Number.isFinite(Date.parse(body.occurred_at_raw))) {
+        throw new ApiError(400, "invalid_field", { field: "occurred_at_raw" });
+      }
+      const result = await updateImportReviewDate(db, projectId, path[1], body.occurred_at_raw);
+      const synchronization = await synchronizeMutation(db, {
+        sourceProjectId: projectId, syncScope: "project", reason: "import_date_updated", user,
+      });
+      return json({ ...result, synchronization });
     });
   }
   return json({ error: "not_found" }, 404);
@@ -313,8 +351,14 @@ async function dispatchGmail(request, db, env, url, path, user) {
   return json({ error: "not_found" }, 404);
 }
 
-async function dispatchProjects(request, db, url, path, user) {
+async function synchronizeMutation(db, input) {
+  if (input.user?.shared_link) return { status: "skipped", reason: "shared_link" };
+  return synchronizeHouseholdMutation(db, input);
+}
+
+async function dispatchProjects(request, db, env, url, path, user) {
   if (path.length === 1) {
+    if (user?.shared_link) throw new ApiError(404, "not_found");
     if (request.method === "GET") return json(await listProjectsForUser(db, user));
     if (request.method === "POST") {
       const result = await createProject(db, await readJson(request), user);
@@ -333,7 +377,7 @@ async function dispatchProjects(request, db, url, path, user) {
     if (request.method === "PATCH") {
       await requireProjectRole(db, user, projectId, "editor");
       const result = await updateProject(db, projectId, await readJson(request));
-      const synchronization = await synchronizeHouseholdMutation(db, {
+      const synchronization = await synchronizeMutation(db, {
         sourceProjectId: projectId,
         syncScope: result.project.project_type === "split" ? "project" : "cancel_project",
         reason: "project_updated",
@@ -343,6 +387,8 @@ async function dispatchProjects(request, db, url, path, user) {
     }
     if (request.method === "DELETE") {
       await requireProjectRole(db, user, projectId, "owner");
+      const project = await requireProject(db, projectId);
+      if (project.project_type === "household") await disconnectProjectGmail(db, env, user, projectId);
       await cancelGeneratedForSource(db, projectId, undefined, { user });
       return json(await deleteProject(db, projectId));
     }
@@ -353,6 +399,22 @@ async function dispatchProjects(request, db, url, path, user) {
       await requireProjectRole(db, user, projectId, "owner");
       return json(await createProjectShare(db, projectId, await readOptionalJson(request), user));
     });
+  }
+  if (path[2] === "shares" && path.length === 3) {
+    if (request.method === "GET") {
+      await requireProjectRole(db, user, projectId, "owner");
+      return json(await listProjectShares(db, projectId));
+    }
+    if (request.method === "DELETE") {
+      await requireProjectRole(db, user, projectId, "owner");
+      return json(await revokeProjectShares(db, projectId));
+    }
+    return methodNotAllowed(["GET", "DELETE"]);
+  }
+  if (path[2] === "shares" && path.length === 4) {
+    if (request.method !== "DELETE") return methodNotAllowed(["DELETE"]);
+    await requireProjectRole(db, user, projectId, "owner");
+    return json(await revokeProjectShares(db, projectId, path[3]));
   }
   if (path[2] === "members") return dispatchProjectMembers(request, db, url, path, user);
   if (path[2] === "transactions") return dispatchProjectTransactions(request, db, url, path, user);
@@ -397,7 +459,7 @@ async function dispatchProjectMembers(request, db, url, path, user) {
     if (request.method === "PATCH") {
       await requireProjectRole(db, user, projectId, "editor");
       const result = await updateProjectMember(db, path[3], await readJson(request), projectId);
-      const synchronization = await synchronizeHouseholdMutation(db, {
+      const synchronization = await synchronizeMutation(db, {
         sourceProjectId: projectId, syncScope: "project", reason: "member_updated", user,
       });
       return json({ ...result, synchronization });
@@ -405,7 +467,7 @@ async function dispatchProjectMembers(request, db, url, path, user) {
     if (request.method === "DELETE") {
       await requireProjectRole(db, user, projectId, "editor");
       const result = await deleteProjectMember(db, path[3], projectId);
-      const synchronization = await synchronizeHouseholdMutation(db, {
+      const synchronization = await synchronizeMutation(db, {
         sourceProjectId: projectId, syncScope: "project", reason: "member_deleted", user,
       });
       return json({ ...result, synchronization });
@@ -421,7 +483,7 @@ async function dispatchMember(request, db, path, user) {
     if (request.method === "PATCH") {
       await requireProjectRole(db, user, await projectIdForMember(db, memberId), "editor");
       const result = await updateProjectMember(db, memberId, await readJson(request));
-      const synchronization = await synchronizeHouseholdMutation(db, {
+      const synchronization = await synchronizeMutation(db, {
         sourceProjectId: result.project_member.project_id, syncScope: "project", reason: "member_updated", user,
       });
       return json({ ...result, synchronization });
@@ -430,7 +492,7 @@ async function dispatchMember(request, db, path, user) {
       await requireProjectRole(db, user, await projectIdForMember(db, memberId), "editor");
       const member = await memberProject(db, memberId);
       const result = await deleteProjectMember(db, memberId);
-      const synchronization = await synchronizeHouseholdMutation(db, {
+      const synchronization = await synchronizeMutation(db, {
         sourceProjectId: member.project_id, syncScope: "project", reason: "member_deleted", user,
       });
       return json({ ...result, synchronization });
@@ -445,7 +507,7 @@ async function dispatchMember(request, db, path, user) {
         await requireProjectRole(db, user, input.household_project_id, "editor");
       }
       const result = await updateMemberHouseholdLink(db, memberId, input);
-      const synchronization = await synchronizeHouseholdMutation(db, {
+      const synchronization = await synchronizeMutation(db, {
         sourceProjectId: result.project_member.project_id, syncScope: "project", reason: "household_link_updated", user,
       });
       return json({ ...result, synchronization });
@@ -464,7 +526,7 @@ async function dispatchProjectTransactions(request, db, url, path, user) {
     if (request.method === "POST") {
       await requireProjectRole(db, user, projectId, "editor");
       const result = await createTransaction(db, projectId, await readJson(request));
-      const synchronization = await synchronizeHouseholdMutation(db, {
+      const synchronization = await synchronizeMutation(db, {
         sourceProjectId: projectId, sourceTransactionId: result.transaction.id,
         syncScope: "transaction", reason: "transaction_created", user,
       });
@@ -490,7 +552,7 @@ async function dispatchTransaction(request, db, path, user) {
     if (request.method === "PATCH") {
       await requireProjectRole(db, user, await projectIdForTransaction(db, transactionId), "editor");
       const result = await updateTransaction(db, transactionId, await readJson(request));
-      const synchronization = await synchronizeHouseholdMutation(db, {
+      const synchronization = await synchronizeMutation(db, {
         sourceProjectId: result.transaction.project_id, sourceTransactionId: transactionId,
         syncScope: "transaction", reason: "transaction_updated", user,
       });
@@ -499,7 +561,7 @@ async function dispatchTransaction(request, db, path, user) {
     if (request.method === "DELETE") {
       await requireProjectRole(db, user, await projectIdForTransaction(db, transactionId), "editor");
       const result = await deleteTransaction(db, transactionId);
-      const synchronization = await synchronizeHouseholdMutation(db, {
+      const synchronization = await synchronizeMutation(db, {
         sourceProjectId: result.project_id, sourceTransactionId: transactionId,
         syncScope: "transaction", reason: "transaction_deleted", user,
       });
@@ -524,7 +586,7 @@ async function dispatchTransaction(request, db, path, user) {
       return invoke(request, ["POST"], async () => {
         await requireProjectRole(db, user, await projectIdForTransaction(db, transactionId), "editor");
         const result = await createTransactionItem(db, transactionId, await readJson(request));
-        const synchronization = await synchronizeHouseholdMutation(db, {
+        const synchronization = await synchronizeMutation(db, {
           sourceProjectId: result.project_id, sourceTransactionId: transactionId,
           syncScope: "transaction", reason: "item_created", user,
         });
@@ -561,7 +623,7 @@ async function dispatchItem(request, db, path, user) {
     if (request.method === "PATCH") {
       await requireProjectRole(db, user, await projectIdForItem(db, itemId), "editor");
       const result = await updateTransactionItem(db, itemId, await readJson(request));
-      const synchronization = await synchronizeHouseholdMutation(db, {
+      const synchronization = await synchronizeMutation(db, {
         sourceProjectId: result.project_id, sourceTransactionId: result.transaction_item.transaction_id,
         syncScope: "transaction", reason: "item_updated", user,
       });
@@ -570,7 +632,7 @@ async function dispatchItem(request, db, path, user) {
     if (request.method === "DELETE") {
       await requireProjectRole(db, user, await projectIdForItem(db, itemId), "editor");
       const result = await deleteTransactionItem(db, itemId);
-      const synchronization = await synchronizeHouseholdMutation(db, {
+      const synchronization = await synchronizeMutation(db, {
         sourceProjectId: result.project_id, sourceTransactionId: result.transaction_id,
         syncScope: "transaction", reason: "item_deleted", user,
       });
@@ -586,7 +648,7 @@ async function replaceAllocations(request, db, itemId, user) {
   return invoke(request, ["PUT"], async () => {
     await requireProjectRole(db, user, await projectIdForItem(db, itemId), "editor");
     const result = await replaceItemAllocations(db, itemId, await readJson(request));
-    const synchronization = await synchronizeHouseholdMutation(db, {
+    const synchronization = await synchronizeMutation(db, {
       sourceProjectId: result.project_id, sourceTransactionId: result.transaction_id,
       syncScope: "transaction", reason: "allocations_replaced", user,
     });
@@ -621,7 +683,7 @@ async function dispatchProjectImports(request, db, url, path, user) {
         ? await importCall(() => createReceiptImport(db, projectId, body))
         : await importCall(() => createNotificationImport(db, projectId, body));
     }
-    const synchronization = await synchronizeHouseholdMutation(db, {
+    const synchronization = await synchronizeMutation(db, {
       sourceProjectId: projectId, syncScope: "project", reason: "imports_created", user,
     });
     return json({ ...result, synchronization }, 201);
@@ -652,7 +714,7 @@ async function handleReconcile(request, db, importId, user) {
     }
   }
   const result = await reconcileImport(db, record.project_id, importId, body);
-  const synchronization = await synchronizeHouseholdMutation(db, {
+  const synchronization = await synchronizeMutation(db, {
     sourceProjectId: record.project_id, syncScope: "project", reason: "import_reconciled", user,
   });
   return json({ ...result, synchronization });
@@ -664,7 +726,7 @@ async function finalizeProject(db, projectId, user) {
   const validation = await validateSplitProject(db, project.id);
   if (!validation.valid) throw new ApiError(422, "invalid_project", { validation });
   const result = await markProjectFinalized(db, project.id);
-  const synchronization = await synchronizeHouseholdMutation(db, {
+  const synchronization = await synchronizeMutation(db, {
     sourceProjectId: project.id, syncScope: "project", reason: "project_finalized", user,
   });
   return json({ ...result, validation, synchronization });
@@ -674,7 +736,7 @@ async function reopenProject(db, projectId, user) {
   const project = await requireProject(db, projectId);
   if (project.project_type !== "split") throw new ApiError(409, "project_not_split");
   const result = await markProjectReopened(db, projectId);
-  const synchronization = await synchronizeHouseholdMutation(db, {
+  const synchronization = await synchronizeMutation(db, {
     sourceProjectId: projectId, syncScope: "project", reason: "project_reopened", user,
   });
   return json({ ...result, synchronization });

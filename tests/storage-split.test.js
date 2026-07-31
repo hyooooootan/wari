@@ -8,6 +8,14 @@ const {
   migrateLegacyData,
   loadState,
   saveState,
+  loadGuestState,
+  saveGuestState,
+  clearLegacyState,
+  loadCloudState,
+  saveCloudState,
+  loadPendingSyncOperations,
+  savePendingSyncOperations,
+  clearCloudState,
   mergeProjectGraph,
 } = require("../public/modules/storage.js");
 const {
@@ -209,6 +217,40 @@ test("loadState writes v3 through injected storage and retains the legacy key", 
   assert.equal(storage.getItem(LEGACY_STORAGE_KEY), legacyText);
 });
 
+test("cloud and guest storage keep each signed-in user's cached state and retry queue separate", () => {
+  const storage = new MemoryStorage({
+    [STORAGE_KEY]: JSON.stringify(legacyFixture()),
+    [LEGACY_STORAGE_KEY]: JSON.stringify(legacyFixture()),
+  });
+  const alice = createEmptyState();
+  alice.projects.push({ id: "alice-project", name: "Alice" });
+  const bob = createEmptyState();
+  bob.projects.push({ id: "bob-project", name: "Bob" });
+  const guest = createEmptyState();
+  guest.projects.push({ id: "guest-project", name: "Guest" });
+
+  saveCloudState("alice@example.test", alice, storage);
+  saveCloudState("bob@example.test", bob, storage);
+  saveGuestState(guest, storage);
+  savePendingSyncOperations("alice@example.test", [{ id: "retry-alice", table: "projects", action: "create", row: alice.projects[0] }], storage);
+  savePendingSyncOperations("bob@example.test", [{ id: "retry-bob", table: "projects", action: "create", row: bob.projects[0] }], storage);
+
+  assert.deepEqual(loadCloudState("alice@example.test", storage).projects.map((row) => row.id), ["alice-project"]);
+  assert.deepEqual(loadCloudState("bob@example.test", storage).projects.map((row) => row.id), ["bob-project"]);
+  assert.deepEqual(loadGuestState(storage).projects.map((row) => row.id), ["guest-project"]);
+  assert.deepEqual(loadPendingSyncOperations("alice@example.test", storage).map((row) => row.id), ["retry-alice"]);
+  assert.deepEqual(loadPendingSyncOperations("bob@example.test", storage).map((row) => row.id), ["retry-bob"]);
+
+  clearCloudState("alice@example.test", storage);
+  clearLegacyState(storage);
+  assert.deepEqual(loadCloudState("alice@example.test", storage), createEmptyState());
+  assert.deepEqual(loadPendingSyncOperations("alice@example.test", storage), []);
+  assert.deepEqual(loadCloudState("bob@example.test", storage).projects.map((row) => row.id), ["bob-project"]);
+  assert.deepEqual(loadGuestState(storage).projects.map((row) => row.id), ["guest-project"]);
+  assert.equal(storage.getItem(STORAGE_KEY), null);
+  assert.equal(storage.getItem(LEGACY_STORAGE_KEY), null);
+});
+
 test("mergeProjectGraph replaces one graph and preserves other projects", () => {
   const state = createEmptyState();
   state.projects.push({ id: "p1", name: "Old" }, { id: "p2", name: "Keep" });
@@ -272,6 +314,24 @@ test("calculateSplit derives burdens, advances, balances, and deterministic sett
   assert.equal(validation.errors.includes("payment_amount_not_integer"), true);
   assert.equal(validation.errors.includes("item_allocation_total_mismatch"), true);
   assert.equal(validation.errors.includes("allocation_total_mismatch"), true);
+});
+
+test("cancelled and normal refunded transactions are excluded from split balances and validation", () => {
+  const state = migrateLegacyData(legacyFixture());
+  const cancelled = structuredClone(state);
+  const cancelledTransaction = cancelled.transactions.find((row) => row.id === "e1");
+  cancelledTransaction.status = "cancelled";
+  for (const payment of cancelled.transaction_payments.filter((row) => row.transaction_id === "e1")) payment.payment_status = "cancelled";
+  assert.equal(calculateSplit(cancelled, "p1").advances.a, 0);
+  assert.equal(validateProjectTransactions(cancelled, "p1").valid, true);
+
+  const refunded = structuredClone(state);
+  const refundedTransaction = refunded.transactions.find((row) => row.id === "e1");
+  refundedTransaction.status = "refunded";
+  refundedTransaction.entry_type = "purchase";
+  for (const payment of refunded.transaction_payments.filter((row) => row.transaction_id === "e1")) payment.payment_status = "refunded";
+  assert.equal(calculateSplit(refunded, "p1").advances.a, 0);
+  assert.equal(validateProjectTransactions(refunded, "p1").valid, true);
 });
 
 test("aggregateHousehold counts each confirmed purchase or split expense once", () => {

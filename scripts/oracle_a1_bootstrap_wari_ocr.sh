@@ -73,15 +73,22 @@ fi
 if ! grep -q "TESSERACT_THRESHOLD" "$SERVICE_FILE"; then
   sed -i "/Environment=TESSERACT_MAX_SIDE=/a Environment=TESSERACT_THRESHOLD=auto" "$SERVICE_FILE"
 fi
+ENV_FILE="/etc/wari-receipt-ocr.env"
+if [ ! -e "$ENV_FILE" ]; then
+  install -o root -g root -m 0600 /dev/null "$ENV_FILE"
+else
+  chown root:root "$ENV_FILE"
+  chmod 0600 "$ENV_FILE"
+fi
 
 systemctl daemon-reload
 systemctl enable --now "$OCR_SERVICE_NAME"
 
 echo "[$(date -Is)] Verifying OCR service"
 sleep 5
-curl -fsS http://127.0.0.1:4190/health || true
-tesseract --list-langs || true
-ollama list || true
+curl -fsS http://127.0.0.1:4190/health
+tesseract --list-langs
+ollama list
 
 cat > /opt/wari-ocr-bootstrap-status.txt <<STATUS
 completed_at=$(date -Is)
