@@ -727,7 +727,6 @@ async function runPendingAction(action) {
   if (!action || typeof action !== "object") throw new Error("保存待ち操作を確認してください");
   if (action.kind === "finalize_project") return Api.finalizeProject(action.project_id);
   if (action.kind === "reopen_project") return Api.reopenProject(action.project_id);
-  if (action.kind === "import_csv") return Api.importCsv(action.project_id, action.payload);
   if (action.kind === "import_receipt") return Api.importReceipt(action.project_id, action.payload);
   if (action.kind === "import_notification") return Api.importNotification(action.project_id, action.payload);
   if (action.kind === "reconcile_import") return Api.reconcileImport(action.import_id, action.payload);
@@ -1318,9 +1317,8 @@ function renderHouseholdImports(project, projectIds = new Set([project.id])) {
   const includeGmail = cloudSession.status === "authenticated" && primaryHouseholdProject()?.id === project.id;
   const receiptDisabled = cloudSession.status === "authenticated" ? "" : "disabled";
   const receipt = `<section class="import-section"><div class="inline-heading"><h3>レシート</h3>${cloudSession.status === "authenticated" ? "" : `<button class="small-button" type="button" data-google-login>ログイン</button>`}</div><div class="file-actions"><label class="file-button household-file"><input type="file" accept="image/jpeg,image/png,image/webp,image/heic,image/heif" data-household-receipt="${esc(project.id)}" ${receiptDisabled}><span>画像を選ぶ</span></label><label class="file-button secondary-button"><input type="file" accept="image/*" capture="environment" data-household-receipt="${esc(project.id)}" ${receiptDisabled}><span>撮影する</span></label></div></section>`;
-  const csv = `<section class="import-section"><div class="inline-heading"><h3>CSV</h3></div><div class="csv-controls"><select data-csv-source aria-label="CSVの種類" ${receiptDisabled}><option value="">自動判定</option><option value="card_csv" ${ui.csvSourceType === "card_csv" ? "selected" : ""}>カード</option><option value="paypay_csv" ${ui.csvSourceType === "paypay_csv" ? "selected" : ""}>PayPay</option><option value="bank_csv" ${ui.csvSourceType === "bank_csv" ? "selected" : ""}>銀行</option><option value="manual" ${ui.csvSourceType === "manual" ? "selected" : ""}>その他</option></select><label class="file-button household-file"><input type="file" accept=".csv,text/csv" data-csv-file="${esc(project.id)}" ${receiptDisabled}><span>CSVを選ぶ</span></label></div>${renderCsvPreview()}</section>`;
   const notification = `<section class="import-section"><div class="inline-heading"><h3>通知</h3></div><form id="notification-import-form" class="form-stack"><textarea class="textarea" name="raw_text" rows="4" placeholder="通知本文" required></textarea><button class="button secondary-button" type="submit">確認へ追加</button></form></section>`;
-  return `<section aria-labelledby="imports-title"><div class="section-heading"><div><h2 id="imports-title">取込</h2><span>${state.import_records.filter((row) => projectIds.has(row.project_id)).length}件</span></div></div><div class="import-tools">${receipt}${csv}${notification}</div><section class="review-section" aria-labelledby="review-title"><div class="inline-heading"><h3 id="review-title">確認待ち</h3></div><div class="review-list">${renderImportReview(project, projectIds, includeGmail)}</div></section></section>`;
+  return `<section aria-labelledby="imports-title"><div class="section-heading"><div><h2 id="imports-title">取込</h2><span>${state.import_records.filter((row) => projectIds.has(row.project_id)).length}件</span></div></div><div class="import-tools">${receipt}${notification}</div><section class="review-section" aria-labelledby="review-title"><div class="inline-heading"><h3 id="review-title">確認待ち</h3></div><div class="review-list">${renderImportReview(project, projectIds, includeGmail)}</div></section></section>`;
 }
 
 function renderCalendarImports() {
@@ -2176,80 +2174,6 @@ function normalizeImportedDate(value) {
   const match = text.match(/(20\d{2})\/(\d{1,2})\/(\d{1,2})/u);
   if (!match) return today();
   return `${match[1]}-${match[2].padStart(2, "0")}-${match[3].padStart(2, "0")}`;
-}
-
-function findHeaderIndex(headers, candidates) {
-  const normalized = headers.map((value) => String(value || "").normalize("NFKC").trim().toLowerCase().replace(/\s/gu, ""));
-  return normalized.findIndex((value) => candidates.some((candidate) => value === candidate || value.includes(candidate)));
-}
-
-function csvRecords(projectId, preview) {
-  const [headers = [], ...rows] = preview.rows;
-  const merchantIndex = findHeaderIndex(headers, ["利用店名", "加盟店", "店舗", "店名", "摘要", "内容", "merchant", "description"]);
-  const amountIndex = findHeaderIndex(headers, ["利用金額", "支払金額", "金額", "amount"]);
-  const dateIndex = findHeaderIndex(headers, ["利用日", "取引日", "日付", "date"]);
-  const externalIndex = findHeaderIndex(headers, ["取引番号", "利用番号", "transactionid", "id"]);
-  const timestamp = now();
-  return rows.filter((row) => row.some((value) => String(value).trim())).map((row, index) => {
-    const rawIdentity = `${preview.name}:${index + 1}:${JSON.stringify(row)}`;
-    const merchant = String(row[merchantIndex >= 0 ? merchantIndex : 0] || "").trim() || "CSV取引";
-    const amount = parseMoney(row[amountIndex >= 0 ? amountIndex : Math.max(row.length - 1, 0)]);
-    return {
-      id: makeId("imp"),
-      project_id: projectId,
-      transaction_id: null,
-      source_type: preview.sourceType,
-      source_record_id: `csv:${stableHash(rawIdentity)}`,
-      source_status: "review",
-      merchant_raw: merchant,
-      merchant_normalized: normalizeMerchant(merchant),
-      gross_amount_raw: amount,
-      paid_amount_raw: amount,
-      occurred_at_raw: normalizeImportedDate(row[dateIndex >= 0 ? dateIndex : 0]),
-      settled_at_raw: null,
-      payment_method_raw: preview.sourceType === "card_csv" ? "credit_card" : preview.sourceType === "paypay_csv" ? "paypay" : preview.sourceType === "bank_csv" ? "bank" : "other",
-      external_transaction_id: externalIndex >= 0 ? String(row[externalIndex] || "").trim() || null : null,
-      image_url: null,
-      raw_text: null,
-      raw_payload: JSON.stringify({ headers, row }),
-      parse_confidence: amount && merchant ? 0.8 : 0.4,
-      parser_version: "wari-ui-csv-1",
-      match_score: null,
-      match_reason_json: null,
-      created_at: timestamp,
-      updated_at: timestamp,
-    };
-  });
-}
-
-function sourceProfile(sourceType) {
-  if (sourceType === "card_csv") return "card";
-  if (sourceType === "paypay_csv") return "paypay";
-  if (sourceType === "bank_csv") return "bank";
-  return "generic";
-}
-
-function addCsvImports(project) {
-  const preview = ui.csvPreview;
-  if (!preview) return;
-  const next = cloneState();
-  const existing = new Set(next.import_records.filter((row) => row.project_id === project.id).map((row) => row.source_record_id).filter(Boolean));
-  const records = csvRecords(project.id, preview).filter((row) => !existing.has(row.source_record_id));
-  next.import_records.push(...records);
-  touchProject(next, project.id);
-  ui.csvPreview = null;
-  commitState(next, records.length ? `${records.length}件を確認へ追加しました` : "同じ取引は追加しませんでした", {
-    remoteFilter: (operation) => operation.table !== "import_records",
-    pendingAction: {
-      kind: "import_csv",
-      project_id: project.id,
-      payload: {
-        csv_text: preview.text,
-        profile: sourceProfile(preview.sourceType),
-        options: { source_type: preview.sourceType },
-      },
-    },
-  });
 }
 
 function importRecordFromReceipt(projectId, result) {
@@ -3162,14 +3086,6 @@ document.addEventListener("change", (event) => {
   if (target.dataset.receiptTarget) void handleSplitReceipt(target);
   if (target.dataset.householdReceipt) void handleHouseholdReceipt(target);
   if (target.dataset.localReceipt !== undefined) void handleHouseholdReceipt(target);
-  if (target.dataset.csvFile) void handleCsvFile(target);
-  if (target.dataset.csvSource !== undefined) {
-    ui.csvSourceType = target.value;
-    if (ui.csvPreview) {
-      ui.csvPreview.sourceType = Imports.selectCsvSourceType(target.value, ui.csvPreview.name, ui.csvPreview.rows.slice(0, 6));
-      render();
-    }
-  }
   if (target.dataset.householdMonth !== undefined) {
     ui.householdMonth = target.value;
     render();
